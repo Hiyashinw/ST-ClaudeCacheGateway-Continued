@@ -11,6 +11,7 @@ import {
     hashCanonical,
     normalizeCachePolicy,
     planCacheBreaks,
+    preprocessAutomaticCacheBreaks,
 } from '../cache-policy.js';
 
 const OFF_POLICY = {
@@ -89,6 +90,151 @@ test('canonical hashing is key-order independent and returns full SHA-256', () =
     assert.equal(canonicalStringify({ b: 2, a: { d: 4, c: 3 } }), '{"a":{"c":3,"d":4},"b":2}');
     assert.equal(hashCanonical({ b: 2, a: 1 }), hashCanonical({ a: 1, b: 2 }));
     assert.match(hashCanonical({ value: 1 }), /^[a-f0-9]{64}$/);
+});
+
+test('automatic preprocessing is disabled by default and never mutates its caller', () => {
+    const input = {
+        model: 'test-model',
+        messages: [
+            { role: 'system', content: 'system' },
+            { role: 'assistant', content: 'assistant' },
+        ],
+    };
+    const original = structuredClone(input);
+    const byDefault = preprocessAutomaticCacheBreaks(input, { protocol: 'openai' });
+    const explicitlyDisabled = preprocessAutomaticCacheBreaks(input, { protocol: 'openai', enabled: false });
+
+    assert.deepEqual(byDefault.body, original);
+    assert.deepEqual(explicitlyDisabled.body, original);
+    assert.notEqual(byDefault.body, input);
+    assert.deepEqual(byDefault.diagnostics, {
+        enabled: false,
+        protocol: 'openai',
+        added: 0,
+        alreadyMarked: 0,
+        unlandable: 0,
+        paths: [],
+    });
+    assert.deepEqual(input, original);
+});
+
+test('OpenAI automatic preprocessing marks only the last system message and every assistant idempotently', () => {
+    const input = {
+        model: 'test-model',
+        messages: [
+            { role: 'system', content: 'old-system' },
+            { role: 'assistant', content: 'assistant-one' },
+            { role: 'system', content: [{ type: 'text', text: 'new-system' }] },
+            { role: 'assistant', content: [{ type: 'text', text: 'assistant-two' }] },
+            { role: 'user', content: 'user' },
+        ],
+    };
+    const original = structuredClone(input);
+    const first = preprocessAutomaticCacheBreaks(input, { protocol: 'openai', enabled: true });
+
+    assert.equal(first.diagnostics.added, 3);
+    assert.equal(first.body.messages[0].content, 'old-system');
+    assert.equal(first.body.messages[1].content, `assistant-one${MARKER}`);
+    assert.deepEqual(first.body.messages[2].content.at(-1), { type: 'text', text: MARKER });
+    assert.deepEqual(first.body.messages[3].content.at(-1), { type: 'text', text: MARKER });
+    assert.deepEqual(first.diagnostics.paths.map(({ path, source, status }) => ({ path, source, status })), [
+        { path: 'messages[2].content', source: 'openai-system', status: 'added' },
+        { path: 'messages[1].content', source: 'assistant', status: 'added' },
+        { path: 'messages[3].content', source: 'assistant', status: 'added' },
+    ]);
+    assert.equal(first.diagnostics.paths[0].markerPath, 'messages[2].content[1]');
+    assert.deepEqual(input, original);
+
+    const second = preprocessAutomaticCacheBreaks(first.body, { protocol: 'openai', enabled: true });
+    assert.equal(second.diagnostics.added, 0);
+    assert.equal(second.diagnostics.alreadyMarked, 3);
+    assert.deepEqual(second.body, first.body);
+});
+
+test('Anthropic automatic markers land on top-level system and non-text assistant blocks', () => {
+    const input = {
+        model: 'claude-test',
+        system: 'anthropic-system',
+        tools: [{
+            name: 'lookup',
+            input_schema: {
+                type: 'object',
+                properties: { arbitrary: { type: 'object' } },
+            },
+        }],
+        messages: [
+            {
+                role: 'assistant',
+                content: [{ type: 'tool_use', id: 'tool-1', name: 'lookup', input: {} }],
+            },
+            { role: 'user', content: 'continue' },
+            { role: 'assistant', content: 'assistant-text' },
+        ],
+    };
+    const automatic = preprocessAutomaticCacheBreaks(input, { protocol: 'anthropic', enabled: true });
+
+    assert.equal(automatic.diagnostics.added, 3);
+    assert.deepEqual(automatic.body.messages[0].content.at(-1), { type: 'text', text: MARKER });
+    assert.equal(automatic.body.messages[1].content, 'continue');
+    assert.equal(automatic.body.messages[2].content, `assistant-text${MARKER}`);
+
+    const plan = planCacheBreaks(automatic.body, { protocol: 'anthropic', policy: OFF_POLICY });
+    const toolUse = plan.body.messages[0].content.find((block) => block.type === 'tool_use');
+    assert.deepEqual(toolUse.cache_control, { type: 'ephemeral' });
+    assert.equal(hasOwnCacheControlDeep(plan.body.tools[0].input_schema), false);
+    assert.equal(JSON.stringify(plan.body).includes(MARKER), false);
+    assert.equal(plan.diagnostics.cacheControlCount, 3);
+});
+
+function hasOwnCacheControlDeep(value) {
+    if (Array.isArray(value)) {
+        return value.some(hasOwnCacheControlDeep);
+    }
+
+    if (!value || typeof value !== 'object') {
+        return false;
+    }
+
+    return Object.prototype.hasOwnProperty.call(value, 'cache_control')
+        || Object.values(value).some(hasOwnCacheControlDeep);
+}
+
+test('automatic preprocessing diagnoses empty or null targets without adding markers', () => {
+    const input = {
+        model: 'test-model',
+        messages: [
+            { role: 'system', content: 'earlier-system' },
+            { role: 'system', content: null },
+            { role: 'assistant', content: '' },
+            { role: 'assistant', content: null },
+            { role: 'assistant', content: [] },
+        ],
+    };
+    const result = preprocessAutomaticCacheBreaks(input, { protocol: 'openai', enabled: true });
+
+    assert.equal(result.diagnostics.added, 0);
+    assert.equal(result.diagnostics.unlandable, 4);
+    assert.equal(result.diagnostics.paths.every((entry) => entry.status === 'unlandable'), true);
+    assert.equal(result.body.messages[0].content, 'earlier-system');
+    assert.equal(JSON.stringify(result.body).includes(MARKER), false);
+});
+
+test('automatic markers still normalize away and obey the final four-point limit', () => {
+    const input = {
+        model: 'test-model',
+        messages: [
+            { role: 'system', content: 'system' },
+            ...Array.from({ length: 5 }, (_, index) => ({ role: 'assistant', content: `assistant-${index}` })),
+        ],
+    };
+    const automatic = preprocessAutomaticCacheBreaks(input, { protocol: 'openai', enabled: true });
+    const plan = planCacheBreaks(automatic.body, { protocol: 'openai', policy: OFF_POLICY });
+
+    assert.equal(automatic.diagnostics.added, 6);
+    assert.equal(plan.diagnostics.candidates.length, 6);
+    assert.equal(plan.diagnostics.cacheControlCount, 4);
+    assert.equal(JSON.stringify(plan.body).includes(MARKER), false);
+    assert.doesNotThrow(() => assertCachePlan(plan.body));
 });
 
 test('legacy mode preserves the first four marker boundaries', () => {

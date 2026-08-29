@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { copyFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -25,6 +25,36 @@ function markerBody(model = 'integration-model', letters = 'ABCDEFG') {
             role: 'user',
             content: [{ type: 'text', text: `${letter}${MARKER}` }],
         })),
+    };
+}
+
+function automaticOpenAiBody(model = 'automatic-openai-model') {
+    return {
+        model,
+        max_tokens: 32,
+        messages: [
+            { role: 'system', content: [{ type: 'text', text: 'System first' }] },
+            { role: 'system', content: [{ type: 'text', text: 'System last' }] },
+            ...[1, 2, 3, 4, 5].flatMap((index) => [
+                { role: 'user', content: [{ type: 'text', text: `U${index}` }] },
+                { role: 'assistant', content: [{ type: 'text', text: `A${index}` }] },
+            ]),
+        ],
+    };
+}
+
+function automaticAnthropicBody(model = 'automatic-anthropic-model') {
+    return {
+        model,
+        max_tokens: 32,
+        system: [
+            { type: 'text', text: 'Native system first' },
+            { type: 'text', text: 'Native system last' },
+        ],
+        messages: [1, 2, 3, 4, 5].flatMap((index) => [
+            { role: 'user', content: [{ type: 'text', text: `N-U${index}` }] },
+            { role: 'assistant', content: [{ type: 'text', text: `N-A${index}` }] },
+        ]),
     };
 }
 
@@ -221,22 +251,33 @@ async function stopChild(child, exitPromise) {
     }
 }
 
-async function startGatewayFixture({ upstreamMode, policy = DEFAULT_POLICY, upstreamExtraJson = {} }) {
+async function startGatewayFixture({
+    upstreamMode,
+    policy = DEFAULT_POLICY,
+    upstreamExtraJson = {},
+    schemaVersion = 3,
+    autoGenerateCacheBreakpoints,
+    captureRequests,
+}) {
     const upstream = await startMockUpstream();
     const temporaryDirectory = await mkdtemp(join(tmpdir(), 'st-cache-gateway-integration-'));
+    const settingsPath = join(temporaryDirectory, 'gateway-settings.json');
     let child = null;
     let exitPromise = Promise.resolve();
+    let closed = false;
 
     try {
         await Promise.all([
             copyFile(join(PROJECT_DIR, 'server.js'), join(temporaryDirectory, 'server.js')),
             copyFile(join(PROJECT_DIR, 'cache-policy.js'), join(temporaryDirectory, 'cache-policy.js')),
             writeFile(join(temporaryDirectory, 'package.json'), '{"type":"module"}\n'),
-            writeFile(join(temporaryDirectory, 'gateway-settings.json'), `${JSON.stringify({
-                schemaVersion: 3,
+            writeFile(settingsPath, `${JSON.stringify({
+                schemaVersion,
                 cacheTranslationEnabled: true,
                 cacheTtl: 'provider-default',
                 ...policy,
+                ...(autoGenerateCacheBreakpoints === undefined ? {} : { autoGenerateCacheBreakpoints }),
+                ...(captureRequests === undefined ? {} : { captureRequests }),
                 activeChannelId: 'integration-upstream',
                 channels: [{
                     id: 'integration-upstream',
@@ -279,22 +320,41 @@ async function startGatewayFixture({ upstreamMode, policy = DEFAULT_POLICY, upst
             CACHE_TTL: 'provider-default',
         });
 
-        child = spawn(process.execPath, ['server.js'], {
-            cwd: temporaryDirectory,
-            env: environment,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            windowsHide: true,
-        });
-        exitPromise = new Promise((resolve) => child.once('exit', resolve));
-        const getOutput = collectProcessOutput(child);
         const baseUrl = `http://127.0.0.1:${port}`;
-        await waitForGateway(baseUrl, child, getOutput);
+
+        const launchGateway = async () => {
+            child = spawn(process.execPath, ['server.js'], {
+                cwd: temporaryDirectory,
+                env: environment,
+                stdio: ['ignore', 'pipe', 'pipe'],
+                windowsHide: true,
+            });
+            exitPromise = new Promise((resolve) => child.once('exit', resolve));
+            const getOutput = collectProcessOutput(child);
+            await waitForGateway(baseUrl, child, getOutput);
+        };
+
+        await launchGateway();
 
         return {
             ...upstream,
             gatewayBaseUrl: baseUrl,
-            async close() {
+            settingsPath,
+            async restart() {
                 await stopChild(child, exitPromise);
+                child = null;
+                exitPromise = Promise.resolve();
+                await launchGateway();
+            },
+            async close() {
+                if (closed) {
+                    return;
+                }
+
+                closed = true;
+                if (child) {
+                    await stopChild(child, exitPromise);
+                }
                 await upstream.close();
                 await rm(temporaryDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
             },
@@ -343,6 +403,89 @@ test('OpenAI inbound -> OpenAI upstream sends the fixed-head final JSON', async 
     assert.equal(request.method, 'POST');
     assert.equal(request.path, '/v1/chat/completions');
     assertFinalUpstreamBody(request);
+});
+
+test('schema 3 settings default automatic cache breaks and request capture to disabled', async (t) => {
+    const fixture = await startGatewayFixture({ upstreamMode: 'openai', schemaVersion: 3 });
+    t.after(() => fixture.close());
+
+    const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.autoGenerateCacheBreakpoints, false);
+    assert.equal(state.captureRequests, false);
+});
+
+test('OpenAI inbound -> OpenAI upstream auto-generates last-system and assistant candidates before H=1 selection', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 4,
+        autoGenerateCacheBreakpoints: true,
+        captureRequests: false,
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', automaticOpenAiBody());
+
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].path, '/v1/chat/completions');
+    assertFinalUpstreamBody(fixture.requests[0], ['System last', 'A3', 'A4', 'A5']);
+});
+
+test('OpenAI inbound -> Anthropic upstream auto-generates candidates on the converted prompt before H=1 selection', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 4,
+        autoGenerateCacheBreakpoints: true,
+        captureRequests: false,
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', automaticOpenAiBody('automatic-converted-model'));
+
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].path, '/v1/messages');
+    assertFinalUpstreamBody(fixture.requests[0], ['System last', 'A3', 'A4', 'A5']);
+});
+
+test('Anthropic native inbound auto-generates system and assistant candidates before H=1 selection', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 4,
+        autoGenerateCacheBreakpoints: true,
+        captureRequests: false,
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/messages', automaticAnthropicBody());
+
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].path, '/v1/messages');
+    assertFinalUpstreamBody(fixture.requests[0], ['Native system last', 'N-A3', 'N-A4', 'N-A5']);
+});
+
+test('request capture setting persists across a gateway restart while captures remain in-memory only', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 4,
+        autoGenerateCacheBreakpoints: false,
+        captureRequests: false,
+    });
+    t.after(() => fixture.close());
+
+    const enabled = await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: true });
+    assert.equal(enabled.captureRequests, true);
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('capture-persistence-model'));
+    const beforeRestart = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(beforeRestart.capturedRequests, 1);
+
+    const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.equal(savedSettings.schemaVersion, 4);
+    assert.equal(savedSettings.captureRequests, true, 'POST /console/capture must persist the setting');
+
+    await fixture.restart();
+    const afterRestart = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(afterRestart.captureRequests, true);
+    assert.equal(afterRestart.capturedRequests, 0, 'captured request bodies must not survive restart');
 });
 
 test('OpenAI inbound -> Anthropic upstream converts before applying the fixed-head policy', async (t) => {

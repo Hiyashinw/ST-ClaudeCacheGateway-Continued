@@ -8,7 +8,7 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "ST Claude Cache Gateway is starting at http://127.0.0.1:8788"
+echo "ST-ClaudeCacheGateway-Continued is starting at http://127.0.0.1:8788"
 echo "Upstream defaults to https://api.pioneer.ai"
 echo
 echo "SillyTavern setup:"

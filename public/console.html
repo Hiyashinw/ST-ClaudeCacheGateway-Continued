@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>ST Claude Cache Gateway 控制台</title>
+<title>ST-ClaudeCacheGateway-Continued 控制台</title>
 <link rel="stylesheet" href="/console.css">
 </head>
 <body>
@@ -28,8 +28,8 @@
         </svg>
       </div>
       <div>
-        <div class="brand-title">Claude Cache</div>
-        <div class="brand-subtitle">缓存块转译网关</div>
+        <div class="brand-title">Claude Cache Continued</div>
+        <div class="brand-subtitle">增强缓存转译网关</div>
       </div>
     </div>
 
@@ -68,7 +68,7 @@
           <p>
             <b>① 查看完整指南</b>。<br>
             <b>② 客户端设置</b>：Base URL 填 <code>http://127.0.0.1:8788/v1</code>。<br>
-            <b>③ 手动缓存标记</b>：在预设中新建条目写入标记 <code>[[CACHE_BREAK]]</code>，并调整到正确的位置。
+            <b>③ 缓存标记</b>：可手动插入 <code>[[CACHE_BREAK]]</code>，也可在缓存策略中开启自动生成。
           </p>
         </div>
         <div class="hero-actions">
@@ -205,6 +205,10 @@
           <div class="set-control"><span class="marker-code">[[CACHE_BREAK]]</span></div>
         </div>
         <div class="set-row">
+          <div class="set-info"><div class="set-title">自动生成缓存断点</div><div class="set-desc">在最终 SYSTEM 末尾及每个 ASSISTANT 消息后预生成 marker，再交给固定头、锚点和四点预算处理。默认关闭；缓存转译关闭时暂停生效。</div></div>
+          <div class="set-control"><label class="switch" aria-label="切换自动生成缓存断点"><input type="checkbox" id="autoGenerateCacheBreakpointsSwitch"><span class="track"></span><span class="thumb"></span></label></div>
+        </div>
+        <div class="set-row">
           <div class="set-info"><div class="set-title">缓存有效期 TTL</div><div class="set-desc">1 小时使用 Claude 原生长缓存窗口；5 分钟表示不发送 ttl，使用供应商默认 ephemeral 窗口。</div></div>
           <div class="set-control"><div class="seg" id="cacheTtlSeg"><button data-ttl="1h">1 小时</button><button data-ttl="">5 分钟</button></div></div>
         </div>
@@ -301,7 +305,7 @@
         <div class="advanced-grid">
           <div class="param-box">
             <div class="param-head"><h4>包含请求头</h4><span>JSON 对象</span></div>
-            <textarea id="upstreamHeaders" spellcheck="false" placeholder='{&#10;  "HTTP-Referer": "https://example.com",&#10;  "X-Title": "ST Claude Cache Gateway"&#10;}'>{}</textarea>
+            <textarea id="upstreamHeaders" spellcheck="false" placeholder='{&#10;  "HTTP-Referer": "https://example.com",&#10;  "X-Title": "ST-ClaudeCacheGateway-Continued"&#10;}'>{}</textarea>
             <div class="button-row"><button id="headersOff">清空包含请求头</button><button id="headersFormat">格式化 JSON</button><button id="headersApply" class="primary">应用包含</button></div>
           </div>
           <div class="param-box">
@@ -403,6 +407,7 @@
         <h3>缓存标记</h3>
         <p>在稳定的大段内容末尾放置 <code>[[CACHE_BREAK]]</code>，网关会移除标记并注入 Claude prompt cache 的 <code>cache_control</code>。</p>
         <ul>
+          <li>开启“自动生成缓存断点”后，网关会在渠道参数合并完成的最终请求中，为 SYSTEM 末尾和每个 ASSISTANT 消息生成候选 marker，再执行原有四点选择。</li>
           <li>适合放在标记前：系统提示词、角色卡、蓝灯世界书、长设定、固定规则。</li>
           <li>适合放在标记后：绿灯世界书、最近聊天、当前输入、短期记忆、会频繁变化的内容。</li>
           <li>Claude 每次请求最多支持 4 个缓存断点；多余标记会被移除但不会注入缓存控制。</li>
@@ -453,7 +458,7 @@
       <section class="guide-section" id="g-advanced">
         <h3>高级配置</h3>
         <ul>
-          <li>包含主体参数：把 JSON 对象深度合并到最终请求体，只在 OpenAI-compatible 上游格式生效。</li>
+          <li>包含主体参数：把 JSON 对象深度合并到最终请求体，同时支持 OpenAI-compatible 和 Anthropic native 上游；请只填写目标协议支持的字段。</li>
           <li>排除主体参数：按字段路径删除请求体字段，例如 <code>stream_options</code> 或 <code>metadata.trace_id</code>。</li>
           <li>包含请求头：添加 / 覆写非密钥 header，例如 <code>HTTP-Referer</code>、<code>X-Title</code>。</li>
           <li>排除请求头：发送上游前删除指定 header，例如 <code>x-real-ip</code>、<code>x-forwarded-for</code>。</li>
@@ -463,7 +468,7 @@
       <section class="guide-section" id="g-diagnostics">
         <h3>诊断</h3>
         <ul>
-          <li>请求诊断默认关闭，开启后只保存在内存里，重启即清空。</li>
+          <li>请求诊断的开关会持久保存；捕获到的请求正文仍只保存在内存中，重启后日志清空，但若开关为开启会继续记录新请求。</li>
           <li>诊断会记录最终请求体，可能包含私密提示词；不要公开导出的诊断 JSON。</li>
           <li>可通过诊断查看最终请求体、全部缓存断点、每个断点的选择原因、Prefix hash、suffix hash 和上游缓存用量。</li>
         </ul>
@@ -473,7 +478,7 @@
         <ul>
           <li><b>Mac 打不开 bat？</b> <code>.bat</code> 只适用于 Windows。macOS / Linux 请用 <code>chmod +x start-gateway.sh</code> 后运行 <code>./start-gateway.sh</code>。</li>
           <li><b>请求 404 或路径不对？</b> 酒馆 Base URL 优先填写 <code>http://127.0.0.1:8788/v1</code>。</li>
-          <li><b>请求日志要一直开吗？</b> 不要。请求诊断只在排查问题时临时开启；平常保持关闭即可。</li>
+          <li><b>请求日志要一直开吗？</b> 不建议。开关会跨重启保持，诊断又会记录最终请求体；排查结束后请主动关闭并清空日志。</li>
           <li><b>缓存没命中？</b> 确认蓝灯世界书在 <code>[[CACHE_BREAK]]</code> 之前、绿灯世界书在它之后；必要时开启 Prefix 锁定排查前缀漂移。</li>
           <li><b>使用数据库会影响缓存吗？</b> 数据库本身不影响缓存，官方渠道验证正常；若数据库蓝灯条目会随填表更新，请把全局注入位置改到缓存点后面，例如角色后、系统。</li>
           <li><b>上游不支持 1h TTL？</b> 在“缓存策略”里切回默认窗口。</li>

@@ -1,6 +1,8 @@
-# ST Claude Cache Gateway 使用指南
+# ST-ClaudeCacheGateway-Continued 使用指南
 
-ST Claude Cache Gateway 是一个面向 SillyTavern / 酒馆的本地 Claude 缓存网关。它接收 OpenAI-compatible 聊天补全请求，在发送给上游前处理 `[[CACHE_BREAK]]`、Claude prompt cache、Prefix 锁定、渠道 Profile 和高级参数。
+**ST-ClaudeCacheGateway-Continued** 是基于原项目 [ST-ClaudeCacheGateway](https://github.com/shanye5593/ST-ClaudeCacheGateway) 的继续开发版。它是一个面向 SillyTavern / 酒馆的本地 Claude 缓存网关，接收 OpenAI-compatible 或 Anthropic native 请求，并在发送给上游前处理 `[[CACHE_BREAK]]`、Claude prompt cache、Prefix 锁定、渠道 Profile 和高级参数。
+
+本项目新增的断点保留和轮换策略，目标是在长上下文持续增长时减少稳定缓存边界的无谓移动，从而更容易提高缓存命中率；实际命中情况仍取决于模型、供应商以及缓存点之前的内容是否完全稳定。
 
 默认监听：
 
@@ -21,7 +23,7 @@ API Key: 你的上游供应商 API Key
 
 - 接收 OpenAI-compatible `POST /v1/chat/completions` 请求。
 - 默认使用 Pioneer 的 OpenAI-compatible 上游格式，也可切换为 Anthropic native `/v1/messages`。
-- 支持 `[[CACHE_BREAK]]` 手动缓存标记。
+- 支持 `[[CACHE_BREAK]]` 手动缓存标记，以及 SYSTEM 末尾 / 每个 ASSISTANT 消息后的自动断点预处理。
 - 支持 Claude `cache_control` 注入，最多 4 个缓存断点。
 - 支持固定头缓存点，以及单锚点 / 滚动锚点保留策略。
 - 支持 1 小时缓存 TTL 或供应商默认缓存窗口。
@@ -30,8 +32,17 @@ API Key: 你的上游供应商 API Key
 - 支持多渠道 Profile：Pioneer、OpenRouter、Anthropic、Vertex、Bedrock、自定义渠道。
 - 支持 OpenRouter 供应商锁定和自定义供应商名。
 - 支持高级配置：包含 / 排除主体参数，包含 / 排除请求头。
-- 支持内存诊断日志，不持久化私密请求记录。
+- 支持请求诊断；诊断开关会持久化，捕获的请求正文只保存在内存中。
 - 默认只绑定 `127.0.0.1`，适合本机使用。
+
+## 相对原项目优势
+
+- **固定头缓存点**：可始终保留最前面的 0–4 个候选断点，避免候选持续增长时稳定头部断点被上游四点上限挤掉。
+- **稳定 Seed（初始锚点）**：新上下文先确定本次真正发送的最多四点，再把排除固定头后的第一个 marker 候选作为 Seed；后缀增长时继续复用该稳定边界，而不是把首次最后一个尾点固定下来。
+- **渐进滚动锚点**：达到配置的逻辑内容块间隔后逐次晋升新锚点，并用新旧锚点短暂重叠完成轮换；每次成功请求最多晋升一个，失败请求不会推进状态。
+- **自动生成、选择与清理断点**：可选地在最终 SYSTEM 末尾和每个 ASSISTANT 消息后预生成 marker，无需逐条手写；随后统一规范化 inline、独立 marker、content array 和 Anthropic system 候选，自动去重、删除未选 marker 与空消息，并在固定头、锚点、最新尾点及调用方已有控制之间分配最多四点预算。
+- **三条实际请求链路**：统一处理并验证 OpenAI 入站 → OpenAI 上游、OpenAI 入站 → Anthropic 上游、Anthropic 入站 → Anthropic 上游的最终请求体。
+- **更完整的诊断**：可查看候选路径、入选原因、上下文短哈希、锚点动作或暂停原因、最终上游请求体以及上游返回的缓存 token 用量，便于定位断点选择和缓存未命中问题。
 
 ## 安装与启动
 
@@ -39,7 +50,7 @@ API Key: 你的上游供应商 API Key
 
 ### Windows
 
-可以双击：
+下载并解压本项目后，进入 `ST-ClaudeCacheGateway-Continued` 文件夹。可以双击：
 
 ```text
 start-gateway.bat
@@ -48,18 +59,16 @@ start-gateway.bat
 也可以在终端运行：
 
 ```powershell
-git clone https://github.com/shanye5593/ST-ClaudeCacheGateway.git
-cd ST-ClaudeCacheGateway
+cd ST-ClaudeCacheGateway-Continued
 npm start
 ```
 
 ### macOS / Linux
 
-`.bat` 只适用于 Windows，macOS / Linux 不要运行它。
+下载并解压本项目后进入 `ST-ClaudeCacheGateway-Continued`。`.bat` 只适用于 Windows，macOS / Linux 不要运行它。
 
 ```sh
-git clone https://github.com/shanye5593/ST-ClaudeCacheGateway.git
-cd ST-ClaudeCacheGateway
+cd ST-ClaudeCacheGateway-Continued
 chmod +x start-gateway.sh
 ./start-gateway.sh
 ```
@@ -72,11 +81,12 @@ npm start
 
 ### Termux / Android
 
+先下载并解压本项目，再进入 `ST-ClaudeCacheGateway-Continued`。由于本文档尚未提供本项目的仓库地址，这里只说明本地解压后的启动步骤。
+
 ```sh
 pkg update
-pkg install git nodejs-lts
-git clone https://github.com/shanye5593/ST-ClaudeCacheGateway.git
-cd ST-ClaudeCacheGateway
+pkg install nodejs-lts
+cd ST-ClaudeCacheGateway-Continued
 npm start
 ```
 
@@ -99,7 +109,7 @@ http://127.0.0.1:8788/console
 - 网关概览：当前渠道、缓存转译、上游格式、TTL、Prefix 状态。
 - 渠道配置：切换 / 保存渠道 Profile。
 - 缓存策略：查看缓存标记、切换 TTL、配置固定头与缓存锚点、管理 Prefix 锁定。
-- 请求日志：临时打开诊断、查看最终请求体和缓存结果。
+- 请求日志：开启或关闭请求诊断、查看最终请求体和缓存结果；开关状态会保留到下次启动，日志正文仍只存于内存。
 - 高级配置：处理主体参数和请求头。
 
 ## 客户端接入
@@ -164,6 +174,19 @@ POST http://127.0.0.1:8788/v1/messages/count_tokens
 
 简单理解：蓝灯世界书放在 `[[CACHE_BREAK]]` 前面，绿灯世界书放在 `[[CACHE_BREAK]]` 后面。
 
+### 自动生成缓存断点
+
+在控制台“缓存策略 → 缓存标记与 TTL”中可开启“自动生成缓存断点”。此开关默认关闭；开启后，网关会在渠道请求体参数合并完成后进行预处理：
+
+- OpenAI-compatible 最后一个 `system` 消息的末尾生成一个 marker。
+- Anthropic native 顶层 `system` 的末尾生成一个 marker。
+- 每个 `assistant` 消息的末尾生成一个 marker。
+- 已经位于末尾的 marker 不会重复生成；空内容或没有可落点内容块的消息会跳过并写入诊断。
+
+自动生成只负责提供候选边界。之后仍执行原有的去重、固定头、锚点、最新尾点和四点预算策略；所有 marker 在发送上游前都会被移除。关闭“缓存转译”时不会生成 marker，以免原始标记被发送给上游。
+
+切换自动生成开关会清空已学习的锚点和 Prefix Lock 内容，下一次成功请求会按新的候选边界重新学习。
+
 Claude 每个请求最多支持 4 个缓存断点。调用方已有的 `cache_control` 与网关注入的断点共用这 4 个位置；所有未选中的 `[[CACHE_BREAK]]` 仍会被移除，不会原样发给上游。
 
 默认的固定头数量为 `0`，锚点模式为“关闭”。在这个兼容模式下，网关仍按旧版行为保留最前面的 4 个候选断点。
@@ -204,7 +227,7 @@ A / F / O / P
 
 滚动模式以成功请求为提交边界：上游非 2xx、网络错误、请求取消和 `/count_tokens` 都不会学习、晋升或淘汰锚点。不同渠道、上游协议、模型和 TTL 的学习上下文彼此隔离，内存中最多保留 32 个最近使用的上下文。
 
-三个策略设置会持久化到 `gateway-settings.json`。旧配置会自动迁移到 `schemaVersion: 3`，缺省值为固定头 `0`、锚点 `off`、滚动间隔 `3`。已学习的锚点、轮换进度和上下文索引只保存在内存里，应用重启后会从下一次成功请求重新学习。不需要也没有新增对应的环境变量。
+策略设置会持久化到 `gateway-settings.json`。旧配置会在运行时迁移到 `schemaVersion: 4`：固定头、锚点和滚动间隔缺省为 `0 / off / 3`，自动生成断点与请求诊断缺省为关闭。已学习的锚点、轮换进度、上下文索引和诊断正文只保存在内存里；锚点在重启后重新学习，诊断开关则保持上次设置。不需要也没有新增对应的环境变量。
 
 > 缓存锚点与 Prefix Lock 互斥，采用“最后启用者生效”：启用单锚点或滚动锚点会关闭并清空 Prefix Lock；启用 Prefix Lock 会把锚点模式切回“关闭”并清空已学习锚点。固定头策略本身可以继续保留。
 
@@ -370,7 +393,7 @@ provider.allow_fallbacks
 ```json
 {
   "HTTP-Referer": "https://example.com",
-  "X-Title": "ST Claude Cache Gateway"
+  "X-Title": "ST-ClaudeCacheGateway-Continued"
 }
 ```
 
@@ -399,7 +422,7 @@ x-forwarded-for
 
 ## 请求诊断
 
-请求诊断默认关闭，每次启动都是关闭状态。
+请求诊断初始默认关闭。你在控制台修改开关后，该开关会保存到本地 `gateway-settings.json`，重启应用仍会沿用上次状态；捕获到的请求记录和正文不会写入设置文件，只保存在当前进程的内存中，重启后清空。
 
 开启后，网关会在内存里保存最近请求记录，用于查看：
 
@@ -411,7 +434,7 @@ x-forwarded-for
 - 上游状态码
 - 上游返回的缓存 read / creation token 用量
 
-诊断记录可能包含私密提示词、聊天内容、世界书内容。不要公开分享导出的诊断 JSON。诊断数据只保存在内存中，重启后清空。
+诊断记录可能包含私密提示词、聊天内容、世界书内容和最终上游请求体。不要公开分享导出的诊断 JSON。需要特别注意：虽然旧记录会在重启后清空，但诊断开关本身会保持开启，应用重启后可能继续捕获新的请求；排查完成后请主动关闭诊断并清空记录。
 
 ## 环境变量
 
@@ -502,7 +525,7 @@ http://127.0.0.1:8788/v1
 
 ### 请求日志要一直开吗？
 
-不要。请求诊断只在排查问题时临时开启；平常保持关闭即可。诊断结束后建议关闭并清空日志。
+不建议。请求诊断只在排查问题时临时开启；开关状态会持久化，重启应用不会自动关闭。诊断结束后请关闭并清空日志。
 
 ### 缓存不命中
 
@@ -539,4 +562,4 @@ CACHE_TTL=default npm start
 - 不要把 API Key 写进 README、Profile、高级配置或截图。
 - `gateway-settings.json` 是本地运行配置，不应该提交到公开仓库。
 - 默认绑定 `127.0.0.1`，建议保持仅本机访问。
-- 请求诊断每次启动默认关闭，避免意外记录私密内容。
+- 请求诊断初始默认关闭，但一旦开启会在重启后继续保持开启；排查完成后请手动关闭并清空内存记录。

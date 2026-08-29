@@ -1,7 +1,7 @@
 {
-  "name": "st-claude-cache-gateway",
+  "name": "st-claude-cache-gateway-continued",
   "version": "0.1.0",
-  "description": "OpenAI-compatible local gateway that converts [[CACHE_BREAK]] markers into Claude prompt-cache cache_control blocks.",
+  "description": "Continued local Claude prompt-cache gateway for SillyTavern with stable breakpoint and rolling-anchor policies.",
   "type": "module",
   "main": "server.js",
   "scripts": {

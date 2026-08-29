@@ -274,10 +274,139 @@ function normalizeProtocol(protocol) {
     return normalized;
 }
 
+function isLandableContentBlock(block, marker = MARKER) {
+    if (!isObject(block)) {
+        return false;
+    }
+
+    if (!isTextBlock(block)) {
+        return true;
+    }
+
+    return stripMarkers(block.text, marker).trim() !== '';
+}
+
+function contentEndsWithMarker(content, marker = MARKER) {
+    if (typeof content === 'string') {
+        return content.trimEnd().endsWith(marker);
+    }
+
+    if (!Array.isArray(content) || content.length === 0) {
+        return false;
+    }
+
+    const last = content[content.length - 1];
+    return isTextBlock(last) && last.text.trimEnd().endsWith(marker);
+}
+
+export function preprocessAutomaticCacheBreaks(body, options = {}) {
+    if (!isObject(body)) {
+        throw new CachePolicyError('Request body must be a JSON object.', 'INVALID_REQUEST_BODY');
+    }
+
+    const protocol = normalizeProtocol(options.protocol);
+    const enabled = options.enabled === true;
+    const marker = options.marker ?? MARKER;
+
+    if (typeof marker !== 'string' || marker.length === 0) {
+        throw new CachePolicyError('marker must be a non-empty string.', 'INVALID_CACHE_MARKER');
+    }
+
+    const nextBody = cloneJson(body);
+    const diagnostics = {
+        enabled,
+        protocol,
+        added: 0,
+        alreadyMarked: 0,
+        unlandable: 0,
+        paths: [],
+    };
+
+    if (!enabled) {
+        return { body: nextBody, diagnostics };
+    }
+
+    function record(path, source, status, markerPath = path) {
+        diagnostics[status]++;
+        diagnostics.paths.push({ path, markerPath, source, status });
+    }
+
+    function appendToContent(owner, key, path, source) {
+        const content = owner?.[key];
+
+        if (contentEndsWithMarker(content, marker)) {
+            record(path, source, 'alreadyMarked');
+            return;
+        }
+
+        if (typeof content === 'string') {
+            if (content.trim() === '') {
+                record(path, source, 'unlandable');
+                return;
+            }
+
+            owner[key] = `${content}${marker}`;
+            record(path, source, 'added');
+            return;
+        }
+
+        if (!Array.isArray(content)) {
+            record(path, source, 'unlandable');
+            return;
+        }
+
+        const hasTarget = content.some((block) => isLandableContentBlock(block, marker));
+
+        if (!hasTarget) {
+            record(path, source, 'unlandable');
+            return;
+        }
+
+        const markerPath = `${path}[${content.length}]`;
+        content.push({ type: 'text', text: marker });
+        record(path, source, 'added', markerPath);
+    }
+
+    if (protocol === 'anthropic' && hasOwn(nextBody, 'system')) {
+        appendToContent(nextBody, 'system', 'system', 'anthropic-system');
+    }
+
+    const messages = Array.isArray(nextBody.messages) ? nextBody.messages : [];
+
+    if (protocol === 'openai') {
+        let lastSystemIndex = -1;
+
+        for (let index = 0; index < messages.length; index++) {
+            if (messages[index]?.role === 'system') {
+                lastSystemIndex = index;
+            }
+        }
+
+        if (lastSystemIndex >= 0) {
+            appendToContent(
+                messages[lastSystemIndex],
+                'content',
+                `messages[${lastSystemIndex}].content`,
+                'openai-system',
+            );
+        }
+    }
+
+    for (let index = 0; index < messages.length; index++) {
+        if (messages[index]?.role !== 'assistant') {
+            continue;
+        }
+
+        appendToContent(messages[index], 'content', `messages[${index}].content`, 'assistant');
+    }
+
+    return { body: nextBody, diagnostics };
+}
+
 function addMarkerCandidate(normalization, target, source, count = 1) {
     normalization.totalMarkers += count;
 
-    if (!target || !isTextBlock(target) || target.text.trim() === '') {
+    if (!isLandableContentBlock(target)) {
         normalization.unlandableMarkers += count;
         return;
     }
@@ -344,6 +473,16 @@ function splitTextBlock(block, nextBlocks, normalization, source, marker = MARKE
     return true;
 }
 
+function findPreviousLandableBlock(blocks, marker = MARKER) {
+    for (let index = blocks.length - 1; index >= 0; index--) {
+        if (isLandableContentBlock(blocks[index], marker)) {
+            return blocks[index];
+        }
+    }
+
+    return null;
+}
+
 function normalizeContent(content, normalization, source, marker = MARKER) {
     if (typeof content === 'string') {
         if (!content.includes(marker)) {
@@ -374,10 +513,9 @@ function normalizeContent(content, normalization, source, marker = MARKER) {
         changed = true;
 
         if (isMarkerOnlyText(block.text, marker)) {
-            const previous = nextBlocks[nextBlocks.length - 1];
             addMarkerCandidate(
                 normalization,
-                isTextBlock(previous) ? previous : null,
+                findPreviousLandableBlock(nextBlocks, marker),
                 `${source}:standalone-block`,
                 markerCount(block.text, marker),
             );
