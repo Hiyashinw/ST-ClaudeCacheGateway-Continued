@@ -92,6 +92,45 @@ function ttlLabel(value) {
   return value === '1h' ? '1 小时' : '5 分钟';
 }
 
+const CACHE_BREAKPOINT_LIMIT = 4;
+
+function integerInRange(value, minimum, maximum, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= minimum && number <= maximum ? number : fallback;
+}
+
+function cacheAnchorModeLabel(value) {
+  if (value === 'single') return '单锚点';
+  if (value === 'rolling') return '滚动锚点';
+  return '关闭';
+}
+
+function getCachePolicy(runtime = state.runtime) {
+  const nested = runtime?.cachePolicy || {};
+  const anchorState = runtime?.cacheAnchorState || nested.cacheAnchorState || nested.anchorState || {};
+  const fixedHeadBreakpointCount = integerInRange(
+    runtime?.fixedHeadBreakpointCount ?? nested.fixedHeadBreakpointCount,
+    0,
+    CACHE_BREAKPOINT_LIMIT,
+    0,
+  );
+  const rawMode = runtime?.cacheAnchorMode ?? nested.cacheAnchorMode ?? 'off';
+  const cacheAnchorMode = ['off', 'single', 'rolling'].includes(rawMode) ? rawMode : 'off';
+  const cacheAnchorIntervalBlocks = integerInRange(
+    runtime?.cacheAnchorIntervalBlocks ?? nested.cacheAnchorIntervalBlocks,
+    1,
+    1000,
+    3,
+  );
+
+  return { fixedHeadBreakpointCount, cacheAnchorMode, cacheAnchorIntervalBlocks, anchorState };
+}
+
+function cachePolicyLabel(policy = getCachePolicy()) {
+  if (policy.fixedHeadBreakpointCount === 0 && policy.cacheAnchorMode === 'off') return '旧版前 4 点';
+  return `固定头 ${policy.fixedHeadBreakpointCount} · ${cacheAnchorModeLabel(policy.cacheAnchorMode)}`;
+}
+
 function upstreamModeLabel(value) {
   return value === 'anthropic' ? 'Anthropic native' : 'OpenAI-compatible';
 }
@@ -309,9 +348,12 @@ function getProfileById(id) {
 function renderTopbar() {
   const runtime = state.runtime;
   if (!runtime) return;
+  const policy = getCachePolicy(runtime);
   $('topChannel').textContent = `渠道：${channelName(runtime)}`;
   $('topCapture').textContent = `诊断：${runtime.captureRequests ? '开启' : '关闭'} / ${runtime.capturedRequests}`;
-  $('topPrefix').textContent = `锁定：${runtime.prefixLockActive ? '开启' : runtime.prefixLockEnabled ? '学习' : '关闭'}`;
+  $('topPrefix').textContent = runtime.prefixLockActive || runtime.prefixLockEnabled
+    ? `Prefix：${runtime.prefixLockActive ? '开启' : '学习'}`
+    : `锚点：${cacheAnchorModeLabel(policy.cacheAnchorMode)}`;
 }
 
 function setSegActive(rootId, value) {
@@ -337,6 +379,7 @@ function renderCaptureControls() {
 function renderDashboard() {
   const runtime = state.runtime;
   if (!runtime) return;
+  const policy = getCachePolicy(runtime);
   $('sidebarAddress').textContent = `${runtime.host}:${runtime.port}`;
   $('statCacheTranslation').textContent = runtime.cacheTranslationEnabled ? '开启' : '关闭';
   $('cacheTranslationSwitch').checked = Boolean(runtime.cacheTranslationEnabled);
@@ -358,6 +401,7 @@ function renderDashboard() {
     ['上游连接', runtime.upstreamBaseUrl, { mono: true }],
     ['上游格式', upstreamModeLabel(runtime.upstreamMode)],
     ['当前渠道', channelName(runtime)],
+    ['断点保留', cachePolicyLabel(policy)],
     ['最新 Prefix Hash', runtime.prefixLockHash || '-', { mono: true }],
     ['额外 JSON 键', runtime.upstreamExtraJsonEnabled ? runtime.upstreamExtraJsonKeys.join(', ') : '关闭'],
   ]);
@@ -588,10 +632,87 @@ function renderChannels() {
   $('channelStateBadge').textContent = `${channelName(runtime)} · ${upstreamModeLabel(runtime.upstreamMode)}`;
 }
 
+function readCachePolicyForm() {
+  return {
+    fixedHeadBreakpointCount: integerInRange($('fixedHeadBreakpointCount')?.value, 0, CACHE_BREAKPOINT_LIMIT, 0),
+    cacheAnchorMode: ['off', 'single', 'rolling'].includes($('cacheAnchorMode')?.value) ? $('cacheAnchorMode').value : 'off',
+    cacheAnchorIntervalBlocks: integerInRange($('cacheAnchorIntervalBlocks')?.value, 1, 1000, 3),
+  };
+}
+
+function renderCachePolicyBudget(useDraft = false) {
+  const current = getCachePolicy();
+  const policy = useDraft ? readCachePolicyForm() : current;
+  const intervalInput = $('cacheAnchorIntervalBlocks');
+  if (intervalInput) intervalInput.disabled = policy.cacheAnchorMode !== 'rolling';
+
+  const root = $('cachePolicyBudget');
+  if (!root) return;
+  clearNode(root);
+
+  if (policy.fixedHeadBreakpointCount === 0 && policy.cacheAnchorMode === 'off') {
+    for (let index = 0; index < CACHE_BREAKPOINT_LIMIT; index += 1) {
+      appendText(root, 'span', `前点 ${index + 1}`, 'budget-slot head');
+    }
+    $('cachePolicyBudgetText').textContent = '兼容模式 · 保留最前 4 个候选点';
+    $('cachePolicyHint').textContent = '固定头为 0 且锚点关闭时，选择行为与旧版本完全一致：保留最前 4 个断点。';
+    return;
+  }
+
+  const samePolicy = policy.fixedHeadBreakpointCount === current.fixedHeadBreakpointCount
+    && policy.cacheAnchorMode === current.cacheAnchorMode
+    && policy.cacheAnchorIntervalBlocks === current.cacheAnchorIntervalBlocks;
+  const anchorState = samePolicy ? current.anchorState : {};
+  const activeCount = Math.max(0, Number(anchorState.activeAnchorCount) || 0);
+  const retiringCount = Math.max(0, Number(anchorState.retiringAnchorCount ?? anchorState.pendingEvictionAnchorCount) || 0);
+  const capacity = CACHE_BREAKPOINT_LIMIT - policy.fixedHeadBreakpointCount;
+  let slotsLeft = CACHE_BREAKPOINT_LIMIT;
+
+  for (let index = 0; index < policy.fixedHeadBreakpointCount; index += 1) {
+    appendText(root, 'span', `固定头 ${index + 1}`, 'budget-slot head');
+    slotsLeft -= 1;
+  }
+  while (slotsLeft > 0) {
+    const label = policy.cacheAnchorMode === 'off'
+      ? '最新尾点'
+      : policy.cacheAnchorMode === 'single' && slotsLeft === capacity
+        ? '锚点优先'
+        : '锚点 / 尾点共享';
+    appendText(root, 'span', label, policy.cacheAnchorMode !== 'off' ? 'budget-slot anchor' : 'budget-slot');
+    slotsLeft -= 1;
+  }
+
+  $('cachePolicyBudgetText').textContent = `固定头 ${policy.fixedHeadBreakpointCount} · 单请求共享 ${capacity} · 内存锚点 ${activeCount}+${retiringCount}`;
+  if (capacity === 0 && policy.cacheAnchorMode !== 'off') {
+    $('cachePolicyHint').textContent = '固定头已占满全部 4 点，锚点当前没有可用配额；减少固定头数量后才能学习或轮换。';
+  } else {
+    $('cachePolicyHint').textContent = `固定头、锚点和最新普通尾点按优先级共用 4 点；调用方已有 cache_control 还会先占用其中的位置。${policy.cacheAnchorMode === 'rolling' ? ` 滚动间隔：${policy.cacheAnchorIntervalBlocks} 块。` : ''}`;
+  }
+}
+
 function renderCache() {
   const runtime = state.runtime;
   if (!runtime) return;
+  const policy = getCachePolicy(runtime);
+  const anchorState = policy.anchorState;
   setSegActive('cacheTtlSeg', runtime.cacheTtl === '1h' ? '1h' : '');
+  $('fixedHeadBreakpointCount').value = String(policy.fixedHeadBreakpointCount);
+  $('cacheAnchorMode').value = policy.cacheAnchorMode;
+  $('cacheAnchorIntervalBlocks').value = String(policy.cacheAnchorIntervalBlocks);
+  const noAnchorCapacity = policy.cacheAnchorMode !== 'off' && policy.fixedHeadBreakpointCount >= CACHE_BREAKPOINT_LIMIT;
+  $('cachePolicyBadge').textContent = noAnchorCapacity ? '锚点无配额' : cachePolicyLabel(policy);
+  $('cachePolicyBadge').classList.toggle('off', policy.fixedHeadBreakpointCount === 0 && policy.cacheAnchorMode === 'off');
+  $('cachePolicyBadge').classList.toggle('warning', noAnchorCapacity);
+  renderCachePolicyBudget();
+  renderKv($('cacheAnchorKv'), [
+    ['内存上下文', `${anchorState.contextCount ?? 0} / ${anchorState.maxContexts ?? 32}`],
+    ['活动锚点', anchorState.activeAnchorCount ?? 0],
+    ['待淘汰锚点', anchorState.retiringAnchorCount ?? anchorState.pendingEvictionAnchorCount ?? 0],
+    ['最近动作', anchorState.lastAction],
+    ['最近原因', anchorState.lastReason],
+    ['暂停原因', anchorState.lastPauseReason ?? anchorState.pauseReason],
+    ['最近更新', anchorState.lastUpdatedAt ? new Date(anchorState.lastUpdatedAt).toLocaleString() : '-'],
+  ]);
   $('prefixLockSwitch').checked = runtime.prefixLockEnabled;
   $('prefixLockBadge').textContent = runtime.prefixLockActive ? '开启' : runtime.prefixLockEnabled ? '学习' : '关闭';
   $('prefixLockBadge').classList.toggle('off', !runtime.prefixLockEnabled);
@@ -624,6 +745,12 @@ function renderAdvanced() {
     upstreamMode: runtime.upstreamMode,
     upstreamBaseUrl: runtime.upstreamBaseUrl,
     cacheControl: runtime.cacheControl,
+    cachePolicy: {
+      fixedHeadBreakpointCount: getCachePolicy(runtime).fixedHeadBreakpointCount,
+      cacheAnchorMode: getCachePolicy(runtime).cacheAnchorMode,
+      cacheAnchorIntervalBlocks: getCachePolicy(runtime).cacheAnchorIntervalBlocks,
+      anchorState: getCachePolicy(runtime).anchorState,
+    },
     anthropicInboundEnabled: runtime.anthropicInboundEnabled,
     prefixLock: {
       enabled: runtime.prefixLockEnabled,
@@ -693,11 +820,21 @@ function renderRequests() {
       injection.appendChild(document.createElement('br'));
       appendText(injection, 'small', `注入 ${item.injected || 0} / 溢出 ${item.overflowRemoved || 0}`);
     }
+    const summaryBreakpoints = selectedBreakpoints(item);
+    if (summaryBreakpoints.length) {
+      injection.appendChild(document.createElement('br'));
+      appendText(injection, 'small', summaryBreakpoints.map(breakpointReasonsLabel).join(' / '));
+    }
 
-    const prefix = tableCell(tr, '', 'td-mono', 'Prefix');
-    prefix.append(document.createTextNode(prefixActionLabel(item)));
+    const prefix = tableCell(tr, '', 'td-mono', 'Prefix / 锚点');
+    prefix.append(document.createTextNode(`Prefix ${prefixActionLabel(item)}`));
     prefix.appendChild(document.createElement('br'));
     appendText(prefix, 'small', compactHash(item.prefixHash));
+    const policyDiagnostics = getCaptureCachePolicy(item);
+    if (policyDiagnostics.action || policyDiagnostics.reason || policyDiagnostics.contextHash) {
+      prefix.appendChild(document.createElement('br'));
+      appendText(prefix, 'small', `锚点 ${policyDiagnostics.action || '-'}${policyDiagnostics.reason ? ` · ${policyDiagnostics.reason}` : ''} · ${compactHash(policyDiagnostics.contextHash)}`);
+    }
 
     const stats = tableCell(tr, '', '', 'Usage');
     appendText(stats, 'span', upstreamStatsLabel(item), `badge ${upstreamStatsClass(item)}`.trim());
@@ -755,6 +892,7 @@ function selectedSummary() {
     cacheResult: item?.response?.cacheResult,
     provider: item?.response?.upstreamProvider,
     cache: item?.upstream?.cache,
+    cachePolicy: getCaptureCachePolicy(item),
     prefixLock: item?.gateway?.prefixLock,
     upstreamExtraJson: item?.gateway?.upstreamExtraJsonApplied,
     usage,
@@ -787,10 +925,116 @@ function hasCacheControl(value) {
   return Boolean(value && typeof value === 'object' && value.cache_control);
 }
 
+function getCaptureCachePolicy(capture) {
+  const nested = capture?.gateway?.cachePolicy
+    || capture?.cachePolicy
+    || capture?.upstream?.cache?.cachePolicy
+    || capture?.upstream?.cache?.selection;
+  if (nested) return nested;
+  if (capture?.selectedBreakpoints || capture?.cachePolicyAction || capture?.cachePolicyReason || capture?.cacheContextHash) {
+    return {
+      selectedBreakpoints: capture.selectedBreakpoints || [],
+      action: capture.cachePolicyAction || null,
+      reason: capture.cachePolicyReason || null,
+      contextHash: capture.cacheContextHash || null,
+      candidateCount: capture.cacheCandidateCount ?? null,
+    };
+  }
+  return {};
+}
+
+function cachePolicyCandidateCount(diagnostics) {
+  if (diagnostics?.candidateCount !== undefined && diagnostics?.candidateCount !== null) return diagnostics.candidateCount;
+  return Array.isArray(diagnostics?.candidates) ? diagnostics.candidates.length : null;
+}
+
+function breakpointReasonLabel(value) {
+  const normalized = String(value || 'selected').trim().toLowerCase().replaceAll('_', '-');
+  const labels = {
+    'fixed-head': '固定头',
+    fixed: '固定头',
+    'active-anchor': '活动锚点',
+    anchor: '活动锚点',
+    'learned-anchor': '新学习锚点',
+    'promoted-anchor': '晋升锚点',
+    promoted: '晋升锚点',
+    'retiring-anchor': '待淘汰锚点',
+    retiring: '待淘汰锚点',
+    'pending-eviction': '待淘汰锚点',
+    tail: '最新尾点',
+    'latest-tail': '最新尾点',
+    existing: '调用方已有',
+    'existing-cache-control': '调用方已有',
+    'existing-control': '调用方已有',
+    legacy: '兼容前点',
+    'legacy-head': '兼容前点',
+    selected: '已选缓存点',
+  };
+  return labels[normalized] || value || '已选缓存点';
+}
+
+function breakpointReasonClass(value) {
+  const normalized = String(value || '').toLowerCase().replaceAll('_', '-');
+  if (normalized.includes('fixed')) return 'fixed-head';
+  if (normalized.includes('retir') || normalized.includes('evict')) return 'retiring-anchor';
+  return '';
+}
+
+function breakpointReasonsLabel(entry) {
+  const reasons = Array.isArray(entry?.reasons) && entry.reasons.length ? entry.reasons : [entry?.reason];
+  return [...new Set(reasons.filter(Boolean).map(breakpointReasonLabel))].join(' + ') || '已选缓存点';
+}
+
+function selectedBreakpoints(capture, segments = []) {
+  const diagnostics = getCaptureCachePolicy(capture);
+  const cache = capture?.upstream?.cache || {};
+  const normalizeEntries = (raw) => Array.isArray(raw) ? raw.map((entry) => {
+    if (typeof entry === 'string') return { path: entry, reason: null, reasons: [], prefixHash: null };
+    return {
+      path: entry?.path || entry?.cacheControlPath || entry?.targetPath || '',
+      reason: entry?.reason || entry?.selectionReason || entry?.kind || null,
+      reasons: Array.isArray(entry?.reasons) ? entry.reasons : [],
+      prefixHash: entry?.prefixHash || entry?.hash || null,
+    };
+  }).filter((entry) => entry.path) : [];
+  const diagnosticSelected = Array.isArray(diagnostics.selectedBreakpoints)
+    ? diagnostics.selectedBreakpoints
+    : Array.isArray(diagnostics.selected)
+      ? diagnostics.selected
+      : Array.isArray(diagnostics.candidates)
+        ? diagnostics.candidates.filter((candidate) => candidate?.selected)
+        : [];
+  const selected = normalizeEntries(diagnosticSelected.length ? diagnosticSelected : cache.selectedBreakpoints || []);
+  const actual = normalizeEntries(cache.breakpoints || cache.cacheControlPaths || []);
+  let entries = selected;
+
+  if (selected.length && selected.length === actual.length) {
+    entries = selected.map((entry, index) => ({ ...entry, path: actual[index].path || entry.path }));
+  } else {
+    for (const entry of actual) {
+      if (!entries.some((selectedEntry) => pathMatches(entry.path.replace(/\.cache_control$/, ''), selectedEntry.path))) entries.push(entry);
+    }
+  }
+
+  for (const segment of segments) {
+    if (segment.cache && !entries.some((entry) => pathMatches(segment.path, entry.path))) {
+      entries.push({ path: `${segment.path}.cache_control`, reason: null, reasons: [], prefixHash: null });
+    }
+  }
+
+  const seen = new Set();
+  return entries.filter((entry) => {
+    const key = `${entry.path}\u0000${entry.reason || ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function getOrderedBodySegments(body, mode) {
   const segments = [];
-  const add = (role, value, path, label) => {
-    segments.push({ role, value, path, label, cache: hasCacheControl(value), text: contentText(value) });
+  const add = (role, value, path, label, cacheOwner = value) => {
+    segments.push({ role, value, path, label, cache: hasCacheControl(value) || hasCacheControl(cacheOwner), text: contentText(value) });
   };
 
   if (!body || typeof body !== 'object') return segments;
@@ -809,7 +1053,7 @@ function getOrderedBodySegments(body, mode) {
     if (Array.isArray(message?.content)) {
       message.content.forEach((block, blockIndex) => add(role, block, `messages[${messageIndex}].content[${blockIndex}]`, `messages[${messageIndex}] · block ${blockIndex}`));
     } else {
-      add(role, message?.content ?? message, `messages[${messageIndex}]`, `messages[${messageIndex}]`);
+      add(role, message?.content ?? message, `messages[${messageIndex}]`, `messages[${messageIndex}]`, message);
     }
   });
 
@@ -852,18 +1096,48 @@ function renderMessageCard(root, segment, index, isPrefix) {
   root.appendChild(card);
 }
 
-function renderCacheDivider(root, cache) {
+function renderCacheDivider(root, cache, breakpoint = {}, ordinal = 1, total = 1, cacheTtl = null) {
   const divider = document.createElement('div');
-  divider.className = 'cache-divider';
+  divider.className = `cache-divider ${breakpointReasonClass(breakpoint.reason)}`.trim();
   const icon = document.createElement('div');
   icon.className = 'cache-icon';
   icon.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="4.5" y="10.5" width="15" height="10" rx="2.4" fill="currentColor"></rect><path d="M7.5 10.5V7.5C7.5 5.01 9.51 3 12 3C14.49 3 16.5 5.01 16.5 7.5V10.5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"></path><circle cx="12" cy="15" r="1.6" fill="#fff"></circle><rect x="11.2" y="15.4" width="1.6" height="3" rx="0.8" fill="#fff"></rect></svg>';
   const textWrap = document.createElement('div');
   textWrap.className = 'cache-text';
-  appendText(textWrap, 'span', `[[CACHE_BREAK]] 第一缓存点 · cache_control(ephemeral, ${ttlLabel(state.selected?.gateway?.cacheTtl)})`, 'cache-title');
-  appendText(textWrap, 'span', `以上为缓存前缀 · Prefix Hash ${compactHash(cache?.prefixHash)} · ${cache?.prefixLength || 0} chars`, 'cache-sub');
+  appendText(textWrap, 'span', `缓存点 ${ordinal}/${total} · ${breakpointReasonsLabel(breakpoint)} · cache_control(ephemeral, ${ttlLabel(cacheTtl)})`, 'cache-title');
+  const hash = breakpoint.prefixHash || (ordinal === 1 ? cache?.prefixHash : null);
+  appendText(textWrap, 'span', `${breakpoint.path || '路径未记录'} · Prefix ${compactHash(hash)}`, 'cache-sub');
   divider.append(icon, textWrap);
   root.appendChild(divider);
+}
+
+function renderBreakpointDiagnostics(root, capture) {
+  clearNode(root);
+  const body = capture?.upstream?.body;
+  const mode = capture?.upstream?.mode || capture?.gateway?.upstreamMode;
+  const segments = getOrderedBodySegments(body, mode);
+  const breakpoints = selectedBreakpoints(capture, segments);
+  const diagnostics = getCaptureCachePolicy(capture);
+
+  if (!breakpoints.length) {
+    appendText(root, 'span', '此诊断记录没有最终 cache_control，或旧版记录未提供断点路径。', 'breakpoint-chip empty');
+  } else {
+    breakpoints.forEach((breakpoint, index) => {
+      const chip = document.createElement('span');
+      chip.className = 'breakpoint-chip';
+      appendText(chip, 'strong', `#${index + 1} ${breakpointReasonsLabel(breakpoint)}`);
+      appendText(chip, 'code', breakpoint.path);
+      root.appendChild(chip);
+    });
+  }
+
+  const metadata = [];
+  const candidateCount = cachePolicyCandidateCount(diagnostics);
+  if (candidateCount !== null) metadata.push(`候选 ${candidateCount}`);
+  if (diagnostics.contextHash) metadata.push(`上下文 ${compactHash(diagnostics.contextHash)}`);
+  if (diagnostics.action) metadata.push(`动作 ${diagnostics.action}`);
+  if (diagnostics.reason) metadata.push(`原因 ${diagnostics.reason}`);
+  if (metadata.length) appendText(root, 'span', metadata.join(' · '), 'breakpoint-chip');
 }
 
 function renderRequestBodyStream(root, capture, prefixOnly = false) {
@@ -872,8 +1146,9 @@ function renderRequestBodyStream(root, capture, prefixOnly = false) {
   const mode = capture?.upstream?.mode || capture?.gateway?.upstreamMode;
   const cache = capture?.upstream?.cache || {};
   const segments = getOrderedBodySegments(body, mode);
+  const breakpoints = selectedBreakpoints(capture, segments);
   const firstCachePath = cache.firstCacheControlPath;
-  let cacheIndex = segments.findIndex((segment) => segment.cache || pathMatches(segment.path, firstCachePath));
+  let cacheIndex = segments.findIndex((segment) => segment.cache || pathMatches(segment.path, firstCachePath) || breakpoints.some((breakpoint) => pathMatches(segment.path, breakpoint.path)));
   if (cacheIndex < 0 && prefixOnly) cacheIndex = segments.length - 1;
   const visible = prefixOnly && cacheIndex >= 0 ? segments.slice(0, cacheIndex + 1) : segments;
 
@@ -885,7 +1160,12 @@ function renderRequestBodyStream(root, capture, prefixOnly = false) {
   visible.forEach((segment, index) => {
     const isPrefix = cacheIndex >= 0 && index <= cacheIndex;
     renderMessageCard(root, segment, index, isPrefix);
-    if (index === cacheIndex) renderCacheDivider(root, cache);
+    const matches = breakpoints.filter((breakpoint) => pathMatches(segment.path, breakpoint.path));
+    if (!matches.length && segment.cache) matches.push({ path: `${segment.path}.cache_control`, reason: null, reasons: [], prefixHash: null });
+    for (const breakpoint of matches) {
+      const ordinal = Math.max(1, breakpoints.indexOf(breakpoint) + 1);
+      renderCacheDivider(root, cache, breakpoint, ordinal, Math.max(1, breakpoints.length), capture?.gateway?.cacheTtl);
+    }
   });
 }
 
@@ -902,6 +1182,7 @@ function renderDetail() {
     ['注入断点', item.gateway?.conversion?.injected ?? 0, (item.gateway?.conversion?.injected ?? 0) > 0 ? 'success' : ''],
     ['转换标记', item.gateway?.conversion?.removed ?? 0],
     ['缓存点数量', item.upstream?.cache?.cacheControlCount ?? 0],
+    ['候选断点', cachePolicyCandidateCount(getCaptureCachePolicy(item)) ?? '-'],
     ['Prefix 动作', item.gateway?.prefixLock?.action || 'disabled'],
     ['Usage', hasUsage(usage) ? '已返回' : '未返回'],
     ['当前渠道', channelName(state.runtime)],
@@ -923,6 +1204,7 @@ function renderDetail() {
   $('detailBodyTab').hidden = !showBody;
   $('detailPre').hidden = showBody;
   if (showBody) {
+    renderBreakpointDiagnostics($('detailBreakpointSummary'), item);
     renderRequestBodyStream($('detailBodyStream'), item);
   } else {
     $('detailPre').textContent = state.selectedTab === 'usage'
@@ -959,6 +1241,44 @@ async function applyTtl(value) {
   await postJson('/console/cache-ttl', { ttl: value });
   await refreshAll();
   setStatus(`TTL 已切换为 ${ttlLabel(value)}`);
+}
+
+async function applyCachePolicy() {
+  const rawHead = Number($('fixedHeadBreakpointCount').value);
+  const rawInterval = Number($('cacheAnchorIntervalBlocks').value);
+  const mode = $('cacheAnchorMode').value;
+  if (!Number.isInteger(rawHead) || rawHead < 0 || rawHead > CACHE_BREAKPOINT_LIMIT) throw new Error('固定头缓存点必须是 0–4 的整数。');
+  if (!['off', 'single', 'rolling'].includes(mode)) throw new Error('缓存锚点模式无效。');
+  if (!Number.isInteger(rawInterval) || rawInterval < 1 || rawInterval > 1000) throw new Error('滚动间隔必须是 1–1000 的整数。');
+
+  const button = $('cachePolicyApply');
+  const previous = getCachePolicy();
+  const changed = rawHead !== previous.fixedHeadBreakpointCount
+    || mode !== previous.cacheAnchorMode
+    || rawInterval !== previous.cacheAnchorIntervalBlocks;
+  button.disabled = true;
+  try {
+    await postJson('/console/cache-policy', {
+      fixedHeadBreakpointCount: rawHead,
+      cacheAnchorMode: mode,
+      cacheAnchorIntervalBlocks: rawInterval,
+    });
+    await refreshAll();
+    const suffix = mode === 'off'
+      ? ''
+      : changed
+        ? '；Prefix Lock 已关闭，下一次成功请求将学习锚点'
+        : '；锚点状态保持不变';
+    setStatus(`断点保留策略已应用：固定头 ${rawHead}，${cacheAnchorModeLabel(mode)}${suffix}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function clearCacheAnchors() {
+  await api('/console/cache-anchors/clear', { method: 'POST' });
+  await refreshAll();
+  setStatus('缓存锚点已清空，下一次成功请求会重新学习');
 }
 
 async function addCustomChannel() {
@@ -1015,11 +1335,16 @@ function bindEvents() {
   $('dashboardRefresh').onclick = $('refreshAll').onclick;
   $('cacheTranslationSwitch').onchange = async () => { await postJson('/console/cache-translation', { enabled: $('cacheTranslationSwitch').checked }); await refreshAll(); setStatus($('cacheTranslationSwitch').checked ? '缓存转译已开启' : '缓存转译已关闭，高级配置仍会生效'); };
   $('quickCaptureSwitch').onchange = async () => { await postJson('/console/capture', { enabled: $('quickCaptureSwitch').checked }); await refreshAll(); setStatus($('quickCaptureSwitch').checked ? '诊断已开启' : '诊断已关闭'); };
-  $('quickPrefixSwitch').onchange = async () => { await postJson('/console/prefix-lock', { enabled: $('quickPrefixSwitch').checked }); await refreshAll(); setStatus($('quickPrefixSwitch').checked ? 'Prefix Lock 已开启' : 'Prefix Lock 已关闭并清空'); };
-  $('quickPrefixRefresh').onclick = async () => { await api('/console/prefix-lock/clear', { method: 'POST' }); await postJson('/console/prefix-lock', { enabled: true }); await refreshAll(); setStatus('Prefix Lock 已清空，下一次带缓存点请求会重新学习'); };
+  $('quickPrefixSwitch').onchange = async () => { await postJson('/console/prefix-lock', { enabled: $('quickPrefixSwitch').checked }); await refreshAll(); setStatus($('quickPrefixSwitch').checked ? 'Prefix Lock 已开启，缓存锚点已关闭并清空' : 'Prefix Lock 已关闭并清空'); };
+  $('quickPrefixRefresh').onclick = async () => { await api('/console/prefix-lock/clear', { method: 'POST' }); await postJson('/console/prefix-lock', { enabled: true }); await refreshAll(); setStatus('Prefix Lock 已清空并重新开启，缓存锚点已关闭'); };
 
   for (const button of document.querySelectorAll('#quickTtlSeg button, #cacheTtlSeg button')) button.onclick = () => applyTtl(button.dataset.ttl);
-  $('prefixLockSwitch').onchange = async () => { await postJson('/console/prefix-lock', { enabled: $('prefixLockSwitch').checked }); await refreshAll(); setStatus($('prefixLockSwitch').checked ? 'Prefix Lock 已开启' : 'Prefix Lock 已关闭并清空'); };
+  $('fixedHeadBreakpointCount').onchange = () => renderCachePolicyBudget(true);
+  $('cacheAnchorMode').onchange = () => renderCachePolicyBudget(true);
+  $('cacheAnchorIntervalBlocks').oninput = () => renderCachePolicyBudget(true);
+  $('cachePolicyApply').onclick = () => applyCachePolicy().catch((error) => { renderCache(); setStatus(error.message); });
+  $('cacheAnchorsClear').onclick = () => clearCacheAnchors().catch((error) => setStatus(error.message));
+  $('prefixLockSwitch').onchange = async () => { await postJson('/console/prefix-lock', { enabled: $('prefixLockSwitch').checked }); await refreshAll(); setStatus($('prefixLockSwitch').checked ? 'Prefix Lock 已开启，缓存锚点已关闭并清空' : 'Prefix Lock 已关闭并清空'); };
   $('prefixLockRefresh').onclick = async () => { await refreshAll(); setStatus('Prefix Lock 状态已刷新'); };
   $('prefixLockClear').onclick = async () => { await api('/console/prefix-lock/clear', { method: 'POST' }); await refreshAll(); setStatus('Prefix Lock 已清空'); };
   $('prefixModalClear').onclick = $('prefixLockClear').onclick;

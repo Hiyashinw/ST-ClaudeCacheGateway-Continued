@@ -5,3 +5,4 @@ node_modules/
 claude-cache-*.json
 claude-cache-*.txt
 gateway-settings.json
+.learnings/

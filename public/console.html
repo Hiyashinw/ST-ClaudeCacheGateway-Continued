@@ -210,6 +210,42 @@
         </div>
       </section>
 
+      <section class="panel cache-policy-panel">
+        <div class="panel-head">
+          <div><h3>断点保留策略</h3><p class="panel-subtitle">固定最前面的稳定缓存点，并可让长上下文中的锚点渐进轮换。</p></div>
+          <span class="lock-state-badge off" id="cachePolicyBadge">加载中</span>
+        </div>
+        <div class="set-row">
+          <div class="set-info"><div class="set-title">固定头缓存点</div><div class="set-desc">始终保留最前面的 0–4 个候选断点。设为 0 且关闭锚点时，保持旧版“最前 4 点”行为。</div></div>
+          <div class="set-control">
+            <label class="compact-field" for="fixedHeadBreakpointCount"><span>数量</span><select id="fixedHeadBreakpointCount"><option value="0">0（不启用）</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label>
+          </div>
+        </div>
+        <div class="set-row">
+          <div class="set-info"><div class="set-title">缓存锚点</div><div class="set-desc">单锚点会保留首次入选的非固定头第一点；滚动锚点会从该点开始随上下文增长逐步晋升。</div></div>
+          <div class="set-control">
+            <label class="compact-field" for="cacheAnchorMode"><span>模式</span><select id="cacheAnchorMode"><option value="off">关闭</option><option value="single">单锚点</option><option value="rolling">滚动锚点</option></select></label>
+          </div>
+        </div>
+        <div class="set-row">
+          <div class="set-info"><div class="set-title">滚动间隔</div><div class="set-desc">从最新锚点起累计的非空逻辑内容块数；达到间隔后的第一个候选断点会参与晋升。</div></div>
+          <div class="set-control">
+            <label class="compact-field" for="cacheAnchorIntervalBlocks"><span>内容块</span><input id="cacheAnchorIntervalBlocks" type="number" min="1" max="1000" step="1" inputmode="numeric" value="3"></label>
+          </div>
+        </div>
+        <div class="breakpoint-budget-wrap" aria-live="polite">
+          <div class="breakpoint-budget-head"><strong>上游 4 点预算</strong><span id="cachePolicyBudgetText">加载中</span></div>
+          <div class="breakpoint-budget" id="cachePolicyBudget"></div>
+          <p class="note policy-note" id="cachePolicyHint">固定头、锚点、最新普通尾点和调用方已有的 cache_control 共用 4 个位置。</p>
+        </div>
+        <div class="policy-actions">
+          <button class="primary" id="cachePolicyApply">应用策略</button>
+          <button class="danger-light" id="cacheAnchorsClear">清空锚点并重学</button>
+        </div>
+        <p class="note policy-warning">锚点模式与 Prefix Lock 互斥，最后启用的功能生效。策略会持久保存；学习到的锚点只在内存中保留，重启应用后会自动重学。</p>
+        <div class="kv-list" id="cacheAnchorKv"></div>
+      </section>
+
       <section class="panel">
         <div class="panel-head"><h3>强制 Prefix 锁定</h3><span class="panel-actions"><button class="primary small pill-btn" id="prefixLockRefresh">刷新</button><span class="lock-state-badge" id="prefixLockBadge">加载中</span></span></div>
         <div class="set-row">
@@ -237,7 +273,7 @@
             <button id="clear" class="danger-light">清空</button>
           </div>
         </div>
-        <div class="table-wrap"><table><thead><tr><th>详情</th><th>时间</th><th>模型</th><th>状态</th><th>缓存注入</th><th>Prefix</th><th>Usage</th><th>渠道</th></tr></thead><tbody id="requestRows"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>详情</th><th>时间</th><th>模型</th><th>状态</th><th>缓存注入</th><th>Prefix / 锚点</th><th>Usage</th><th>渠道</th></tr></thead><tbody id="requestRows"></tbody></table></div>
         <div class="pagination"><button id="prevPage">上一页</button><span id="pageInfo">1 / 1</span><button id="nextPage">下一页</button></div>
       </section>
     </section>
@@ -302,6 +338,7 @@
       <div class="meta-grid" id="detailMetaGrid"></div>
       <div id="detailBodyTab">
         <div class="section-label action-label"><span>发给上游的最终请求体（按顺序）</span><span class="label-actions"><button class="ghost small" id="expandAllMessages">全部展开</button><button class="ghost small" id="collapseAllMessages">全部折叠</button></span></div>
+        <div class="breakpoint-diagnostics" id="detailBreakpointSummary"></div>
         <div class="body-stream" id="detailBodyStream"></div>
       </div>
       <pre id="detailPre" hidden>暂无选择。</pre>
@@ -337,6 +374,7 @@
       <a href="#g-quickstart" class="guide-toc-item active">快速开始</a>
       <a href="#g-client" class="guide-toc-item">客户端接入</a>
       <a href="#g-marker" class="guide-toc-item">缓存标记</a>
+      <a href="#g-retention" class="guide-toc-item">断点保留</a>
       <a href="#g-prefixlock" class="guide-toc-item">Prefix 锁定</a>
       <a href="#g-translation" class="guide-toc-item">缓存转译</a>
       <a href="#g-channel" class="guide-toc-item">渠道</a>
@@ -370,6 +408,19 @@
           <li>Claude 每次请求最多支持 4 个缓存断点；多余标记会被移除但不会注入缓存控制。</li>
         </ul>
       </section>
+      <section class="guide-section" id="g-retention">
+        <h3>固定头与缓存锚点</h3>
+        <p>启用新策略后，网关按“固定头 → 锚点 → 最新普通尾点”的顺序分配最多 4 个缓存点。</p>
+        <ul>
+          <li>固定头缓存点设为 1 时，最前面的候选断点不会再随总断点数量增长而被挤掉。</li>
+          <li>单锚点会记住新上下文最终入选断点中、排除固定头后的第一个 marker 断点；只要该点之前的完整前缀不变，就持续保留。</li>
+          <li>滚动锚点按设定的内容块间隔晋升新锚点，并在成功请求之间渐进淘汰最老锚点，适合持续增长的长上下文。</li>
+          <li>固定头 1、间隔 3 的轮换示例：<code>A/F/I/J → A/F(待淘汰)/I/L → A/I/L/M</code>。</li>
+          <li>固定头、锚点、普通尾点以及调用方已有的 <code>cache_control</code> 共用上游 4 点预算。例如固定头为 1、单锚点占 1 点时，长示例只会选择 <code>A / F / O / P</code>，不会再加入第五个 N 点。</li>
+          <li>策略设置会持久保存，但已学习锚点只存在内存中；重启、更改策略或前缀变化后会重新学习。</li>
+          <li>锚点模式与 Prefix Lock 互斥，最后启用的功能生效。</li>
+        </ul>
+      </section>
       <section class="guide-section" id="g-prefixlock">
         <h3>Prefix 锁定 / 强制锁定</h3>
         <p>Prefix 锁定用于处理“前缀漂移”：如果世界书、正则、插件或数据库填表内容在缓存点前产生变化，缓存命中率会下降。</p>
@@ -379,6 +430,7 @@
           <li>它是替换，不是追加，不会把世界书、系统提示词或角色卡重复拼接。</li>
           <li>更换角色卡、世界书、预设或缓存点前内容后，请清空并重新学习。</li>
           <li>关闭“缓存转译”后，Prefix 锁定也会跳过。</li>
+          <li>Prefix Lock 与缓存锚点互斥：启用 Prefix Lock 会关闭锚点，启用锚点会关闭并清空 Prefix Lock。</li>
         </ul>
       </section>
       <section class="guide-section" id="g-translation">
@@ -413,7 +465,7 @@
         <ul>
           <li>请求诊断默认关闭，开启后只保存在内存里，重启即清空。</li>
           <li>诊断会记录最终请求体，可能包含私密提示词；不要公开导出的诊断 JSON。</li>
-          <li>可通过诊断查看最终请求体、缓存断点、Prefix hash、suffix hash 和上游缓存用量。</li>
+          <li>可通过诊断查看最终请求体、全部缓存断点、每个断点的选择原因、Prefix hash、suffix hash 和上游缓存用量。</li>
         </ul>
       </section>
       <section class="guide-section" id="g-faq">

@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
+import {
+    AnchorStore,
+    CachePolicyError,
+    assertCachePlan,
+    planCacheBreaks,
+} from './cache-policy.js';
 
 const MARKER = '[[CACHE_BREAK]]';
 const MAX_BREAKPOINTS = 4;
@@ -13,6 +19,9 @@ const host = process.env.HOST || '127.0.0.1';
 let channelProfiles = runtimeSettings.channels;
 let activeChannelId = runtimeSettings.activeChannelId;
 let cacheTranslationEnabled = normalizeBoolean(getRuntimeConfigValue('CACHE_TRANSLATION_ENABLED', runtimeSettings.cacheTranslationEnabled, true), true);
+let fixedHeadBreakpointCount = normalizeFixedHeadBreakpointCount(runtimeSettings.fixedHeadBreakpointCount);
+let cacheAnchorMode = normalizeCacheAnchorMode(runtimeSettings.cacheAnchorMode);
+let cacheAnchorIntervalBlocks = normalizeCacheAnchorIntervalBlocks(runtimeSettings.cacheAnchorIntervalBlocks);
 let upstreamBaseUrl = normalizeBaseUrl(getRuntimeConfigValue('UPSTREAM_BASE_URL', getActiveChannel()?.baseUrl, DEFAULT_UPSTREAM_BASE_URL));
 let cacheTtl = normalizeCacheTtl(getRuntimeConfigValue('CACHE_TTL', runtimeSettings.cacheTtl, '1h'));
 let upstreamMode = normalizeUpstreamMode(getRuntimeConfigValue('UPSTREAM_MODE', runtimeSettings.upstreamMode || getActiveChannel()?.upstreamMode, 'openai'));
@@ -30,6 +39,7 @@ const prefixLockStats = {
     lastSkipReason: null,
     lastAppliedAt: null,
 };
+const cacheAnchorStore = new AnchorStore({ maxContexts: 32 });
 const requestCaptures = [];
 const MAX_REQUEST_CAPTURES = 20;
 
@@ -311,8 +321,11 @@ function migrateRuntimeSettings(rawSettings = {}) {
 
     return {
         ...rawSettings,
-        schemaVersion: 2,
+        schemaVersion: 3,
         cacheTtl: rawSettings.cacheTtl,
+        fixedHeadBreakpointCount: normalizeFixedHeadBreakpointCount(rawSettings.fixedHeadBreakpointCount),
+        cacheAnchorMode: normalizeCacheAnchorMode(rawSettings.cacheAnchorMode),
+        cacheAnchorIntervalBlocks: normalizeCacheAnchorIntervalBlocks(rawSettings.cacheAnchorIntervalBlocks),
         activeChannelId: activeId,
         channels,
         upstreamMode: activeProfile.upstreamMode,
@@ -384,9 +397,12 @@ function getChannelState() {
 function saveRuntimeSettings() {
     syncActiveChannelFromRuntime();
     writeFileSync(SETTINGS_FILE, `${JSON.stringify({
-        schemaVersion: 2,
+        schemaVersion: 3,
         cacheTranslationEnabled,
         cacheTtl: getCacheTtlLabel(),
+        fixedHeadBreakpointCount,
+        cacheAnchorMode,
+        cacheAnchorIntervalBlocks,
         activeChannelId,
         channels: channelProfiles.map(getSafeChannelProfile),
         upstreamMode,
@@ -444,6 +460,60 @@ function normalizeBoolean(value, defaultValue = false) {
     }
 
     return defaultValue;
+}
+
+function normalizeFixedHeadBreakpointCount(value, { strict = false } = {}) {
+    if (strict && typeof value !== 'number') {
+        throw new Error(`fixedHeadBreakpointCount must be an integer from 0 to ${MAX_BREAKPOINTS}.`);
+    }
+
+    const number = Number(value ?? 0);
+
+    if (!Number.isInteger(number) || number < 0 || number > MAX_BREAKPOINTS) {
+        if (strict) {
+            throw new Error(`fixedHeadBreakpointCount must be an integer from 0 to ${MAX_BREAKPOINTS}.`);
+        }
+
+        return 0;
+    }
+
+    return number;
+}
+
+function normalizeCacheAnchorMode(value, { strict = false } = {}) {
+    if (strict && typeof value !== 'string') {
+        throw new Error('cacheAnchorMode must be off, single, or rolling.');
+    }
+
+    const normalized = String(value || 'off').trim().toLowerCase();
+
+    if (['off', 'single', 'rolling'].includes(normalized)) {
+        return normalized;
+    }
+
+    if (strict) {
+        throw new Error('cacheAnchorMode must be off, single, or rolling.');
+    }
+
+    return 'off';
+}
+
+function normalizeCacheAnchorIntervalBlocks(value, { strict = false } = {}) {
+    if (strict && typeof value !== 'number') {
+        throw new Error('cacheAnchorIntervalBlocks must be an integer from 1 to 1000.');
+    }
+
+    const number = Number(value ?? 3);
+
+    if (!Number.isInteger(number) || number < 1 || number > 1000) {
+        if (strict) {
+            throw new Error('cacheAnchorIntervalBlocks must be an integer from 1 to 1000.');
+        }
+
+        return 3;
+    }
+
+    return number;
 }
 
 function normalizeCacheTtl(ttl) {
@@ -674,6 +744,67 @@ function getCacheControl() {
     return cacheControl;
 }
 
+function getCachePolicy() {
+    return {
+        fixedHeadBreakpointCount,
+        cacheAnchorMode,
+        cacheAnchorIntervalBlocks,
+    };
+}
+
+function getCacheAnchorState() {
+    return cacheAnchorStore.getStats();
+}
+
+function getCachePolicyScope(body, protocol) {
+    return {
+        channelId: activeChannelId,
+        upstreamMode: protocol,
+        model: String(body?.model || ''),
+        cacheTtl: getCacheTtlLabel(),
+    };
+}
+
+function planRequestCache(body, protocol) {
+    return planCacheBreaks(body, {
+        protocol,
+        enabled: cacheTranslationEnabled,
+        policy: getCachePolicy(),
+        scope: getCachePolicyScope(body, protocol),
+        store: cacheAnchorStore,
+        cacheControl: getCacheControl(),
+    });
+}
+
+function commitRequestCache(plan, upstreamResponse) {
+    if (!plan || !upstreamResponse?.ok) {
+        return false;
+    }
+
+    if (typeof plan.commit === 'function') {
+        return Boolean(plan.commit());
+    }
+
+    return false;
+}
+
+function getCachePlanResult(plan) {
+    const diagnostics = safeJsonClone(plan?.diagnostics || {});
+    return {
+        ...diagnostics,
+        selectedBreakpoints: diagnostics.selectedBreakpoints ?? diagnostics.selected ?? [],
+        action: diagnostics.action ?? diagnostics.anchorAction ?? null,
+        reason: diagnostics.reason ?? diagnostics.pauseReason ?? diagnostics.resetReason ?? null,
+        contextHash: diagnostics.contextHash ?? diagnostics.context?.hash ?? null,
+        candidateCount: diagnostics.candidateCount ?? diagnostics.candidates?.length ?? 0,
+        injected: diagnostics.injected ?? diagnostics.selectedMarkerCount ?? 0,
+        removed: diagnostics.removed ?? diagnostics.markerCount ?? 0,
+        overflowRemoved: diagnostics.overflowRemoved ?? diagnostics.unselectedMarkerCount ?? 0,
+        changedMessages: diagnostics.changedMessages ?? 0,
+        modifiedMessages: diagnostics.modifiedMessages ?? [],
+    };
+}
+
 function getRuntimeState() {
     return {
         ok: true,
@@ -687,6 +818,11 @@ function getRuntimeState() {
         cacheTranslationEnabled,
         cacheTtl: getCacheTtlLabel(),
         cacheControl: getCacheControl(),
+        fixedHeadBreakpointCount,
+        cacheAnchorMode,
+        cacheAnchorIntervalBlocks,
+        cachePolicy: getCachePolicy(),
+        cacheAnchorState: getCacheAnchorState(),
         upstreamExtraJsonEnabled: getUpstreamExtraJsonKeys().length > 0,
         upstreamExtraJson: safeJsonClone(upstreamExtraJson),
         upstreamExtraJsonText: getUpstreamExtraJsonText(),
@@ -1232,7 +1368,19 @@ function getSegmentLength(segments) {
 function getCacheDiagnostics(body, mode) {
     const segments = getCacheSegments(body, mode);
     const firstCacheIndex = segments.findIndex((segment) => segment.cacheControl);
-    const cacheControlCount = segments.reduce((total, segment) => total + (segment.cacheControl ? 1 : 0), 0);
+    const cacheAssertion = assertCachePlan(body, {
+        marker: MARKER,
+        maxBreakpoints: MAX_BREAKPOINTS,
+        translationEnabled: false,
+    });
+    const cacheControlCount = cacheAssertion.cacheControlCount;
+    const segmentControls = new Map(segments
+        .filter((segment) => segment.cacheControl)
+        .map((segment) => [`${segment.path}.cache_control`, safeJsonClone(segment.cacheControl)]));
+    const breakpoints = cacheAssertion.cacheControlPaths.map((path) => ({
+        path,
+        cacheControl: segmentControls.get(path) || null,
+    }));
     const prefixSegments = firstCacheIndex >= 0 ? segments.slice(0, firstCacheIndex + 1) : [];
     const suffixSegments = firstCacheIndex >= 0 ? segments.slice(firstCacheIndex + 1) : segments;
 
@@ -1240,6 +1388,7 @@ function getCacheDiagnostics(body, mode) {
         bodyHash: getBodyHash(body),
         markerRemaining: JSON.stringify(body).includes(MARKER),
         cacheControlCount,
+        breakpoints,
         firstCacheControlPath: firstCacheIndex >= 0 ? `${segments[firstCacheIndex].path}.cache_control` : null,
         firstCacheControl: firstCacheIndex >= 0 ? safeJsonClone(segments[firstCacheIndex].cacheControl) : null,
         prefixHash: firstCacheIndex >= 0 ? getSegmentHash(prefixSegments) : null,
@@ -1393,6 +1542,11 @@ function applyPrefixLock(body, mode) {
         return { body, diagnostics: { enabled: prefixLockEnabled, action: 'skipped', reason: 'cache-translation-disabled' } };
     }
 
+    if (cacheAnchorMode !== 'off') {
+        updatePrefixLockStats('skipped', 'cache-anchor-enabled');
+        return { body, diagnostics: { enabled: false, action: 'skipped', reason: 'cache-anchor-enabled' } };
+    }
+
     if (!prefixLockEnabled) {
         updatePrefixLockStats('disabled');
         return { body, diagnostics: { enabled: false, action: 'disabled' } };
@@ -1489,7 +1643,7 @@ function getCacheResultFromUsage(usage) {
 }
 
 function deepMergeJson(base, extra) {
-    const merged = safeJsonClone(base);
+    const merged = isPlainObject(base) ? safeJsonClone(base) : {};
 
     for (const [key, value] of Object.entries(extra)) {
         if (isPlainObject(value) && isPlainObject(merged[key])) {
@@ -1541,11 +1695,6 @@ function applyUpstreamBodyParameters(body, mode) {
 
     if (includeKeys.length === 0 && excludePaths.length === 0) {
         diagnostics.skippedReason = 'empty';
-        return { body, diagnostics };
-    }
-
-    if (mode !== 'openai') {
-        diagnostics.skippedReason = 'upstream-mode-not-openai';
         return { body, diagnostics };
     }
 
@@ -1640,6 +1789,7 @@ function addRequestCapture({ request, originalBody, convertedBody, result, inbou
             cacheTranslationEnabled,
             cacheTtl: getCacheTtlLabel(),
             cacheControl: getCacheControl(),
+            cachePolicy: safeJsonClone(result?.diagnostics || result || {}),
             upstreamExtraJsonEnabled: getUpstreamExtraJsonKeys().length > 0,
             upstreamExtraJson: safeJsonClone(upstreamExtraJson),
             upstreamExtraJsonApplied: null,
@@ -2246,15 +2396,45 @@ function convertAnthropicStreamToOpenAi(stream, model, capture = null) {
     });
 }
 
-async function proxyChatCompletionsAnthropic(request, body, convertedBody, result, capture) {
-    let anthropicBody = convertOpenAiToAnthropicBody(convertedBody);
+async function proxyChatCompletionsAnthropic(request, body) {
+    const baseBody = convertOpenAiToAnthropicBody(safeJsonClone(body));
+    const extraJsonResult = applyUpstreamExtraJson(baseBody, 'anthropic');
+
+    if (!Array.isArray(extraJsonResult.body?.messages)) {
+        throw new CachePolicyError(
+            'Final upstream request body must include a messages array after channel body overrides.',
+            'INVALID_FINAL_MESSAGES',
+        );
+    }
+
+    const cachePlan = planRequestCache(extraJsonResult.body, 'anthropic');
+    const result = getCachePlanResult(cachePlan);
+    const convertedBody = cachePlan.body;
+    let anthropicBody = convertedBody;
     const prefixLockResult = applyPrefixLock(anthropicBody, 'anthropic');
     anthropicBody = prefixLockResult.body;
+    assertCachePlan(anthropicBody, {
+        marker: MARKER,
+        maxBreakpoints: MAX_BREAKPOINTS,
+        translationEnabled: cacheTranslationEnabled,
+    });
+    const capture = addRequestCapture({ request, originalBody: body, convertedBody, result });
 
     if (capture) {
         capture.gateway.prefixLock = safeJsonClone(prefixLockResult.diagnostics);
-        capture.gateway.upstreamExtraJsonApplied = safeJsonClone(applyUpstreamExtraJson(anthropicBody, 'anthropic').diagnostics);
+        capture.gateway.upstreamExtraJsonApplied = safeJsonClone(extraJsonResult.diagnostics);
     }
+
+    log('Forwarding chat completion as Anthropic messages.', {
+        model: anthropicBody.model,
+        stream: Boolean(anthropicBody.stream),
+        messages: anthropicBody.messages.length,
+        injected: result.injected,
+        removed: result.removed,
+        cachePolicyAction: result.action ?? null,
+        cacheTtl: getCacheTtlLabel(),
+        captureId: capture?.id ?? null,
+    });
 
     const upstreamUrl = buildApiUrl(upstreamBaseUrl, '/v1/messages');
     const upstreamHeaders = getAnthropicHeaders(request);
@@ -2273,8 +2453,8 @@ async function proxyChatCompletionsAnthropic(request, body, convertedBody, resul
         body: JSON.stringify(anthropicBody),
         signal: request.signal,
     });
-
     if (anthropicBody.stream) {
+        commitRequestCache(cachePlan, upstreamResponse);
         setCaptureResponse(capture, upstreamResponse);
 
         const headers = addCorsHeaders(new Headers({
@@ -2290,6 +2470,7 @@ async function proxyChatCompletionsAnthropic(request, body, convertedBody, resul
     }
 
     const text = await upstreamResponse.text();
+    commitRequestCache(cachePlan, upstreamResponse);
     let json = null;
 
     try {
@@ -2320,13 +2501,22 @@ async function proxyAnthropicCountTokens(request) {
     }
 
     const body = await readJsonRequest(request);
+    const extraJsonResult = applyUpstreamExtraJson(body, 'anthropic');
 
-    if (!body || !Array.isArray(body.messages)) {
-        return jsonResponse({ error: 'Request body must include messages array.' }, 400);
+    if (!Array.isArray(extraJsonResult.body?.messages)) {
+        throw new CachePolicyError(
+            'Final upstream request body must include a messages array after channel body overrides.',
+            'INVALID_FINAL_MESSAGES',
+        );
     }
 
-    const convertedBody = safeJsonClone(body);
-    applyAnthropicCacheBreaks(convertedBody);
+    const cachePlan = planRequestCache(extraJsonResult.body, 'anthropic');
+    const convertedBody = cachePlan.body;
+    assertCachePlan(convertedBody, {
+        marker: MARKER,
+        maxBreakpoints: MAX_BREAKPOINTS,
+        translationEnabled: cacheTranslationEnabled,
+    });
 
     const upstreamResponse = await fetch(buildApiUrl(upstreamBaseUrl, '/v1/messages/count_tokens'), {
         method: 'POST',
@@ -2354,13 +2544,23 @@ async function proxyAnthropicMessages(request) {
     }
 
     const body = await readJsonRequest(request);
+    const extraJsonResult = applyUpstreamExtraJson(body, 'anthropic');
 
-    if (!body || !Array.isArray(body.messages)) {
-        return jsonResponse({ error: 'Request body must include messages array.' }, 400);
+    if (!Array.isArray(extraJsonResult.body?.messages)) {
+        throw new CachePolicyError(
+            'Final upstream request body must include a messages array after channel body overrides.',
+            'INVALID_FINAL_MESSAGES',
+        );
     }
 
-    const convertedBody = safeJsonClone(body);
-    const result = applyAnthropicCacheBreaks(convertedBody);
+    const cachePlan = planRequestCache(extraJsonResult.body, 'anthropic');
+    const convertedBody = cachePlan.body;
+    const result = getCachePlanResult(cachePlan);
+    assertCachePlan(convertedBody, {
+        marker: MARKER,
+        maxBreakpoints: MAX_BREAKPOINTS,
+        translationEnabled: cacheTranslationEnabled,
+    });
     const capture = addRequestCapture({
         request,
         originalBody: body,
@@ -2369,6 +2569,10 @@ async function proxyAnthropicMessages(request) {
         inboundMode: 'anthropic',
         inboundPath: '/v1/messages',
     });
+
+    if (capture) {
+        capture.gateway.upstreamExtraJsonApplied = safeJsonClone(extraJsonResult.diagnostics);
+    }
 
     log('Forwarding Anthropic messages.', {
         model: convertedBody.model,
@@ -2399,7 +2603,6 @@ async function proxyAnthropicMessages(request) {
         body: JSON.stringify(convertedBody),
         signal: request.signal,
     });
-
     const headers = addCorsHeaders(new Headers({
         'content-type': upstreamResponse.headers.get('content-type') || (convertedBody.stream ? 'text/event-stream' : 'application/json'),
     }));
@@ -2409,6 +2612,7 @@ async function proxyAnthropicMessages(request) {
     }
 
     if (convertedBody.stream) {
+        commitRequestCache(cachePlan, upstreamResponse);
         setCaptureResponse(capture, upstreamResponse);
 
         return new Response(captureSseUsage(upstreamResponse.body, capture, 'anthropic'), {
@@ -2419,6 +2623,7 @@ async function proxyAnthropicMessages(request) {
     }
 
     const text = await upstreamResponse.text();
+    commitRequestCache(cachePlan, upstreamResponse);
     let json = null;
 
     try {
@@ -2439,36 +2644,50 @@ async function proxyAnthropicMessages(request) {
 }
 
 async function proxyChatCompletions(request) {
-    const url = buildApiUrl(upstreamBaseUrl, '/v1/chat/completions');
     const body = await readJsonRequest(request);
 
     if (!body || !Array.isArray(body.messages)) {
         return jsonResponse({ error: 'Request body must include messages array.' }, 400);
     }
 
-    const convertedBody = JSON.parse(JSON.stringify(body));
-    const result = applyCacheBreaks(convertedBody.messages);
+    if (upstreamMode === 'anthropic') {
+        return proxyChatCompletionsAnthropic(request, body);
+    }
+
+    const url = buildApiUrl(upstreamBaseUrl, '/v1/chat/completions');
+    const extraJsonResult = applyUpstreamExtraJson(safeJsonClone(body), 'openai');
+
+    if (!Array.isArray(extraJsonResult.body?.messages)) {
+        throw new CachePolicyError(
+            'Final upstream request body must include a messages array after channel body overrides.',
+            'INVALID_FINAL_MESSAGES',
+        );
+    }
+
+    const cachePlan = planRequestCache(extraJsonResult.body, 'openai');
+    const convertedBody = cachePlan.body;
+    const result = getCachePlanResult(cachePlan);
+    const prefixLockResult = applyPrefixLock(convertedBody, 'openai');
+    const upstreamBody = prefixLockResult.body;
+    assertCachePlan(upstreamBody, {
+        marker: MARKER,
+        maxBreakpoints: MAX_BREAKPOINTS,
+        translationEnabled: cacheTranslationEnabled,
+    });
     const capture = addRequestCapture({ request, originalBody: body, convertedBody, result });
 
     log('Forwarding chat completion.', {
-        model: convertedBody.model,
-        stream: Boolean(convertedBody.stream),
-        messages: convertedBody.messages.length,
+        model: upstreamBody.model,
+        stream: Boolean(upstreamBody.stream),
+        messages: upstreamBody.messages.length,
         injected: result.injected,
         removed: result.removed,
         overflowRemoved: result.overflowRemoved,
+        cachePolicyAction: result.action ?? null,
         cacheTtl: getCacheTtlLabel(),
         upstreamMode,
         captureId: capture?.id ?? null,
     });
-
-    if (upstreamMode === 'anthropic') {
-        return proxyChatCompletionsAnthropic(request, body, convertedBody, result, capture);
-    }
-
-    const prefixLockResult = applyPrefixLock(convertedBody, 'openai');
-    const extraJsonResult = applyUpstreamExtraJson(prefixLockResult.body, 'openai');
-    const upstreamBody = extraJsonResult.body;
 
     if (capture) {
         capture.gateway.prefixLock = safeJsonClone(prefixLockResult.diagnostics);
@@ -2491,8 +2710,8 @@ async function proxyChatCompletions(request) {
         body: JSON.stringify(upstreamBody),
         signal: request.signal,
     });
-
-    if (convertedBody.stream) {
+    if (upstreamBody.stream) {
+        commitRequestCache(cachePlan, upstreamResponse);
         setCaptureResponse(capture, upstreamResponse);
 
         const headers = addCorsHeaders(new Headers({
@@ -2508,6 +2727,7 @@ async function proxyChatCompletions(request) {
     }
 
     const text = await upstreamResponse.text();
+    commitRequestCache(cachePlan, upstreamResponse);
     let json = null;
 
     try {
@@ -2608,6 +2828,11 @@ function getCaptureSummary(capture) {
         injected: capture.gateway?.conversion?.injected ?? 0,
         removed: capture.gateway?.conversion?.removed ?? 0,
         overflowRemoved: capture.gateway?.conversion?.overflowRemoved ?? 0,
+        cachePolicyAction: capture.gateway?.cachePolicy?.action ?? null,
+        cachePolicyReason: capture.gateway?.cachePolicy?.reason ?? null,
+        cacheContextHash: capture.gateway?.cachePolicy?.contextHash ?? null,
+        cacheCandidateCount: capture.gateway?.cachePolicy?.candidateCount ?? capture.gateway?.cachePolicy?.candidates?.length ?? 0,
+        selectedBreakpoints: safeJsonClone(capture.gateway?.cachePolicy?.selectedBreakpoints || []),
         cacheControlCount: capture.upstream?.cache?.cacheControlCount ?? 0,
         firstCacheControlPath: capture.upstream?.cache?.firstCacheControlPath ?? null,
         prefixHash: capture.upstream?.cache?.prefixHash ?? null,
@@ -2765,6 +2990,53 @@ async function handleConsoleApi(request, url) {
         return jsonResponse(getRuntimeState());
     }
 
+    if (request.method === 'POST' && url.pathname === '/console/cache-policy') {
+        const body = await readJsonRequest(request);
+
+        try {
+            const requiredFields = ['fixedHeadBreakpointCount', 'cacheAnchorMode', 'cacheAnchorIntervalBlocks'];
+
+            if (!body || requiredFields.some((field) => !Object.prototype.hasOwnProperty.call(body, field))) {
+                throw new Error('cache-policy requires fixedHeadBreakpointCount, cacheAnchorMode, and cacheAnchorIntervalBlocks.');
+            }
+
+            const nextFixedHeadBreakpointCount = normalizeFixedHeadBreakpointCount(body?.fixedHeadBreakpointCount, { strict: true });
+            const nextCacheAnchorMode = normalizeCacheAnchorMode(body?.cacheAnchorMode, { strict: true });
+            const nextCacheAnchorIntervalBlocks = normalizeCacheAnchorIntervalBlocks(body?.cacheAnchorIntervalBlocks, { strict: true });
+            const changed = nextFixedHeadBreakpointCount !== fixedHeadBreakpointCount
+                || nextCacheAnchorMode !== cacheAnchorMode
+                || nextCacheAnchorIntervalBlocks !== cacheAnchorIntervalBlocks;
+
+            fixedHeadBreakpointCount = nextFixedHeadBreakpointCount;
+            cacheAnchorMode = nextCacheAnchorMode;
+            cacheAnchorIntervalBlocks = nextCacheAnchorIntervalBlocks;
+
+            if (cacheAnchorMode !== 'off') {
+                prefixLockEnabled = false;
+                clearPrefixLock();
+            }
+
+            if (changed) {
+                cacheAnchorStore.clear('policy-changed');
+            }
+
+            saveRuntimeSettings();
+            log('Updated cache breakpoint policy from console.', {
+                ...getCachePolicy(),
+                prefixLockEnabled,
+            });
+            return jsonResponse(getRuntimeState());
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/console/cache-anchors/clear') {
+        cacheAnchorStore.clear('manual-clear');
+        log('Cleared learned cache anchors from console.', getCachePolicy());
+        return jsonResponse(getRuntimeState());
+    }
+
     if (request.method === 'POST' && url.pathname === '/console/upstream-mode') {
         const body = await readJsonRequest(request);
         upstreamMode = normalizeUpstreamMode(body?.mode || 'openai');
@@ -2850,6 +3122,12 @@ async function handleConsoleApi(request, url) {
     if (request.method === 'POST' && url.pathname === '/console/prefix-lock') {
         const body = await readJsonRequest(request);
         prefixLockEnabled = Boolean(body?.enabled);
+
+        if (prefixLockEnabled && cacheAnchorMode !== 'off') {
+            cacheAnchorMode = 'off';
+            cacheAnchorStore.clear('prefix-lock-enabled');
+            saveRuntimeSettings();
+        }
 
         if (!prefixLockEnabled) {
             clearPrefixLock();
@@ -2943,6 +3221,14 @@ async function handleRequest(request) {
         if (isAbortError(error) || request.signal?.aborted) {
             log('Request aborted.', { path: url.pathname });
             return new Response(null, { status: 499, statusText: 'Client Closed Request', headers: addCorsHeaders() });
+        }
+
+        if (error instanceof CachePolicyError) {
+            log('Cache policy rejected request.', { path: url.pathname, code: error.code, message: error.message });
+            return jsonResponse({
+                error: error.message,
+                code: error.code,
+            }, error.statusCode || 400);
         }
 
         log('Request failed.', { message: error.message, name: error.name });
