@@ -81,7 +81,7 @@ npm start
 
 ### Termux / Android
 
-先下载并解压本项目，再进入 `ST-ClaudeCacheGateway-Continued`。由于本文档尚未提供本项目的仓库地址，这里只说明本地解压后的启动步骤。
+先下载并解压本项目，再进入 `ST-ClaudeCacheGateway-Continued`。
 
 ```sh
 pkg update
