@@ -1,6 +1,6 @@
 # ST-ClaudeCacheGateway-Continued 使用指南
 
-**ST-ClaudeCacheGateway-Continued** 是基于原项目 [ST-ClaudeCacheGateway](https://github.com/shanye5593/ST-ClaudeCacheGateway) 的继续开发版。它是一个面向 SillyTavern / 酒馆的本地 Claude 缓存网关，接收 OpenAI-compatible 或 Anthropic native 请求，并在发送给上游前处理 `[[CACHE_BREAK]]`、Claude prompt cache、Prefix 锁定、渠道 Profile 和高级参数。
+**ST-ClaudeCacheGateway-Continued** 是基于原项目 [ST-ClaudeCacheGateway](https://github.com/shanye5593/ST-ClaudeCacheGateway) 的继续开发版。它是一个面向 SillyTavern / 酒馆的本地 Claude 缓存网关，接收 OpenAI-compatible 或 Anthropic native 请求，并在发送给上游前处理缓存 marker、Claude prompt cache、Prefix 锁定、渠道 Profile 和高级参数。
 
 本项目新增的断点保留和轮换策略，目标是在长上下文持续增长时减少稳定缓存边界的无谓移动，从而更容易提高缓存命中率；实际命中情况仍取决于模型、供应商以及缓存点之前的内容是否完全稳定。
 
@@ -23,10 +23,10 @@ API Key: 你的上游供应商 API Key
 
 - 接收 OpenAI-compatible `POST /v1/chat/completions` 请求。
 - 默认使用 Pioneer 的 OpenAI-compatible 上游格式，也可切换为 Anthropic native `/v1/messages`。
-- 支持 `[[CACHE_BREAK]]` 手动缓存标记，以及 SYSTEM 末尾 / 每个 ASSISTANT 消息后的自动断点预处理。
+- 支持 `[[CACHE_BREAK]]` 与 `[[CACHE_BREAK_SHORT]]` 两种手动标记；在手动 TTL 下可分别指定 1h 长缓存与 5m 短缓存。
 - 支持 Claude `cache_control` 注入，最多 4 个缓存断点。
 - 支持固定头缓存点，以及单锚点 / 滚动锚点保留策略。
-- 支持 1 小时缓存 TTL 或供应商默认缓存窗口。
+- 支持 Claude 原生 5 分钟 / 1 小时缓存 TTL、不发送 `ttl` 的自动模式，以及由两种 marker 分别指定长短窗口的手动模式。
 - 支持首页“缓存转译”总开关。
 - 支持 Prefix 锁定，降低前缀漂移导致的缓存不命中。
 - 支持多渠道 Profile：Pioneer、OpenRouter、Anthropic、Vertex、Bedrock、自定义渠道。
@@ -40,7 +40,7 @@ API Key: 你的上游供应商 API Key
 - **固定头缓存点**：可始终保留最前面的 0–4 个候选断点，避免候选持续增长时稳定头部断点被上游四点上限挤掉。
 - **稳定 Seed（初始锚点）**：新上下文先确定本次真正发送的最多四点，再把排除固定头后的第一个 marker 候选作为 Seed；后缀增长时继续复用该稳定边界，而不是把首次最后一个尾点固定下来。
 - **渐进滚动锚点**：达到配置的逻辑内容块间隔后逐次晋升新锚点，并用新旧锚点短暂重叠完成轮换；每次成功请求最多晋升一个，失败请求不会推进状态。
-- **自动生成、选择与清理断点**：可选地在最终 SYSTEM 末尾和每个 ASSISTANT 消息后预生成 marker，无需逐条手写；随后统一规范化 inline、独立 marker、content array 和 Anthropic system 候选，自动去重、删除未选 marker 与空消息，并在固定头、锚点、最新尾点及调用方已有控制之间分配最多四点预算。
+- **自动生成、选择与清理断点**：支持自动判断、始终开启和完全关闭三种生成模式；需要生成时，会在最终 SYSTEM 末尾和每个 ASSISTANT 消息后预生成 marker。随后统一规范化 inline、独立 marker、content array 和 Anthropic system 候选，自动去重、删除未选 marker 与空消息，并在固定头、锚点、最新尾点及调用方已有控制之间分配最多四点预算。
 - **三条实际请求链路**：统一处理并验证 OpenAI 入站 → OpenAI 上游、OpenAI 入站 → Anthropic 上游、Anthropic 入站 → Anthropic 上游的最终请求体。
 - **更完整的诊断**：可查看候选路径、入选原因、上下文短哈希、锚点动作或暂停原因、最终上游请求体以及上游返回的缓存 token 用量，便于定位断点选择和缓存未命中问题。
 
@@ -137,15 +137,16 @@ POST http://127.0.0.1:8788/v1/messages/count_tokens
 
 如果使用 Claude 原生入站，请把当前渠道的上游格式保持为 Anthropic native。
 
-## 缓存标记 `[[CACHE_BREAK]]`
+## 缓存标记
 
-把下面的标记放在大段稳定内容之后：
+把缓存 marker 放在大段稳定内容之后。可使用以下任一种：
 
-```text
-[[CACHE_BREAK]]
-```
+- `[[CACHE_BREAK]]`：在“手动” TTL 下表示 1 小时长缓存。
+- `[[CACHE_BREAK_SHORT]]`：在“手动” TTL 下表示 5 分钟短缓存。
 
-网关会在发送上游前移除这个标记，并在对应位置注入 Claude prompt cache：
+在“自动”“5 分钟”或“1 小时”模式下，两种 marker 都跟随全局 TTL，不作长短区分。
+
+网关会在发送上游前移除 marker，并在对应位置注入 Claude prompt cache。例如全局 TTL 为“1 小时”时，任一种 marker 都会生成：
 
 ```json
 {
@@ -172,22 +173,28 @@ POST http://127.0.0.1:8788/v1/messages/count_tokens
 - 短期记忆
 - 会频繁变化的上下文
 
-简单理解：蓝灯世界书放在 `[[CACHE_BREAK]]` 前面，绿灯世界书放在 `[[CACHE_BREAK]]` 后面。
+简单理解：蓝灯世界书放在 marker 前面，绿灯世界书放在 marker 后面。
 
 ### 自动生成缓存断点
 
-在控制台“缓存策略 → 缓存标记与 TTL”中可开启“自动生成缓存断点”。此开关默认关闭；开启后，网关会在渠道请求体参数合并完成后进行预处理：
+控制台“缓存策略 → 缓存标记与 TTL”提供三种生成模式：
 
-- OpenAI-compatible 最后一个 `system` 消息的末尾生成一个 marker。
-- Anthropic native 顶层 `system` 的末尾生成一个 marker。
-- 每个 `assistant` 消息的末尾生成一个 marker。
+- **自动**：先检查格式转换和渠道参数合并后的最终请求，但检查发生在自动生成之前。只要其中包含 `[[CACHE_BREAK]]`、`[[CACHE_BREAK_SHORT]]` 或已有的合法 `cache_control`，就视为调用方已经安排断点，本次不再自动生成；三者都没有时才生成。
+- **开启**：始终执行自动生成。已有 marker 会去重，但不会因为请求中存在手写断点而跳过其他生成位置。
+- **关闭**：不自动生成，只处理调用方提供的 marker 或 `cache_control`。这是新安装和旧版关闭状态的默认值。
+
+需要自动生成时，网关会在渠道请求体参数合并完成后进行预处理：
+
+- 在 OpenAI-compatible 最后一个 `system` 消息的末尾生成一个普通 `[[CACHE_BREAK]]`。
+- 在 Anthropic native 顶层 `system` 的末尾生成一个普通 `[[CACHE_BREAK]]`。
+- 在每个 `assistant` 消息的末尾生成一个普通 `[[CACHE_BREAK]]`。
 - 已经位于末尾的 marker 不会重复生成；空内容或没有可落点内容块的消息会跳过并写入诊断。
 
-自动生成只负责提供候选边界。之后仍执行原有的去重、固定头、锚点、最新尾点和四点预算策略；所有 marker 在发送上游前都会被移除。关闭“缓存转译”时不会生成 marker，以免原始标记被发送给上游。
+自动生成的普通 marker 在“手动” TTL 下使用 1h。自动生成只负责提供候选边界，之后仍执行去重、固定头、锚点、最新尾点和四点预算策略；所有 marker 在发送上游前都会被移除。关闭“缓存转译”时不会生成 marker，也不会转译手写 marker。
 
-切换自动生成开关会清空已学习的锚点和 Prefix Lock 内容，下一次成功请求会按新的候选边界重新学习。
+切换自动生成模式会清空已学习的锚点和 Prefix Lock 内容，下一次成功请求会按新的候选边界重新学习。
 
-Claude 每个请求最多支持 4 个缓存断点。调用方已有的 `cache_control` 与网关注入的断点共用这 4 个位置；所有未选中的 `[[CACHE_BREAK]]` 仍会被移除，不会原样发给上游。
+Claude 每个请求最多支持 4 个缓存断点。两种 marker、自动生成的候选和调用方已有的 `cache_control` 共用这 4 个位置；所有未选中的 marker 仍会被移除，不会原样发给上游。
 
 默认的固定头数量为 `0`，锚点模式为“关闭”。在这个兼容模式下，网关仍按旧版行为保留最前面的 4 个候选断点。
 
@@ -199,15 +206,15 @@ Claude 每个请求最多支持 4 个缓存断点。调用方已有的 `cache_co
 - **单锚点**：新上下文会先按四点预算选出固定头和最新尾点，再把“最终已选断点中排除固定头后的第一个 marker 候选”学为锚点。只要锚点之前的完整前缀不变，后续请求都会继续保留它；前缀变化、重启或手动“清空锚点并重学”会触发重新学习。
 - **滚动锚点**：先按单锚点学习，再按设定的非空逻辑内容块间隔晋升新锚点。晋升成功时保留新旧重叠，随后一次请求再淘汰最老锚点，避免长上下文突然失去已有缓存前缀。
 
-例如固定头为 1、滚动间隔为 3 时，一组稳定的轮换会按成功请求渐进变化：
+例如滚动间隔为 3 时，一组稳定的轮换会按成功请求渐进变化。下面的字母代表连续内容，斜杠 `/` 用来分隔各段；每个分组末尾（包括每行最后一组）都有缓存断点：
 
 ```text
-A / F / I / J
-A / F（待淘汰） / I / L
-A / I / L / M
+ABCDE / FGH / I / J
+ABCDE（E 后锚点待淘汰） / FGH / IJK / L
+ABCDEFGH / IJK / L / M
 ```
 
-第二步让 F、I、L 临时重叠；只有该请求成功后，下一次才移除 F，因此不会在同一次调用中突然跨过已有缓存锚点。
+第一行中 E 后、H 后、I 后和 J 后各有一个断点。第二行暂时保留 E 后的旧锚点，同时让 H 后、K 后和 L 后的断点参与新窗口；只有该请求成功后，第三行才移除 E 后的旧锚点。这样，锚点轮换不会在同一次调用中突然跨过已有缓存前缀。
 
 启用任一新策略后，断点按以下优先级选择：
 
@@ -227,7 +234,7 @@ A / F / O / P
 
 滚动模式以成功请求为提交边界：上游非 2xx、网络错误、请求取消和 `/count_tokens` 都不会学习、晋升或淘汰锚点。不同渠道、上游协议、模型和 TTL 的学习上下文彼此隔离，内存中最多保留 32 个最近使用的上下文。
 
-策略设置会持久化到 `gateway-settings.json`。旧配置会在运行时迁移到 `schemaVersion: 4`：固定头、锚点和滚动间隔缺省为 `0 / off / 3`，自动生成断点与请求诊断缺省为关闭。已学习的锚点、轮换进度、上下文索引和诊断正文只保存在内存里；锚点在重启后重新学习，诊断开关则保持上次设置。不需要也没有新增对应的环境变量。
+策略设置会持久化到 `gateway-settings.json`。旧配置会在运行时迁移到 `schemaVersion: 6`：固定头、锚点和滚动间隔缺省为 `0 / off / 3`；旧的自动断点布尔值 `true / false` 分别迁移为 `on / off`，缺省仍为 `off`；旧的空值、`default`、`provider-default` 和 `none` TTL 会迁移为 `auto`。已学习的锚点、轮换进度、上下文索引和诊断正文只保存在内存里；锚点在重启后重新学习，诊断开关则保持上次设置。不需要新增环境变量。
 
 > 缓存锚点与 Prefix Lock 互斥，采用“最后启用者生效”：启用单锚点或滚动锚点会关闭并清空 Prefix Lock；启用 Prefix Lock 会把锚点模式切回“关闭”并清空已学习锚点。固定头策略本身可以继续保留。
 
@@ -235,7 +242,7 @@ A / F / O / P
 
 Prefix 锁定是给“缓存点前面的内容不够稳定”准备的保护功能。它不是必须开启的功能；如果你的缓存点前内容本来就稳定，可以先不开。
 
-它解决的问题是“前缀漂移”：有些酒馆配置、插件、世界书、正则、数据库填表内容或动态注入内容，可能会在 `[[CACHE_BREAK]]` 之前插入变化内容。只要缓存点之前有细微变化，Claude 看到的稳定前缀就不再完全一致，缓存命中率就会下降。
+它解决的问题是“前缀漂移”：有些酒馆配置、插件、世界书、正则、数据库填表内容或动态注入内容，可能会在缓存 marker 之前插入变化内容。只要缓存点之前有细微变化，Claude 看到的稳定前缀就不再完全一致，缓存命中率就会下降。
 
 开启后：
 
@@ -248,7 +255,7 @@ Prefix 锁定是给“缓存点前面的内容不够稳定”准备的保护功�
 
 适合开启 Prefix 锁定的情况：
 
-- 你已经正确放置了 `[[CACHE_BREAK]]`，但缓存仍然不稳定。
+- 你已经正确放置了缓存 marker，但缓存仍然不稳定。
 - 怀疑世界书、正则、插件、数据库填表在缓存点前产生了动态变化。
 - 想临时验证缓存不命中是否由前缀漂移造成。
 
@@ -276,13 +283,13 @@ Prefix Lock 与缓存锚点不能同时启用。启用 Prefix Lock 会关闭锚�
 
 开启时：
 
-- 网关识别 `[[CACHE_BREAK]]`。
+- 网关识别 `[[CACHE_BREAK]]` 和 `[[CACHE_BREAK_SHORT]]`。
 - 网关注入 `cache_control`。
 - Prefix 锁定可以参与请求处理。
 
 关闭时：
 
-- 网关不处理 `[[CACHE_BREAK]]`。
+- 网关不处理两种缓存 marker。
 - 网关不注入 `cache_control`。
 - Prefix 锁定会跳过。
 - 高级配置仍然生效。
@@ -294,15 +301,27 @@ Prefix Lock 与缓存锚点不能同时启用。启用 Prefix Lock 会关闭锚�
 
 缓存策略页可以切换 TTL：
 
-- `1 小时`：发送 Claude 原生 1 小时缓存窗口：`ttl: "1h"`。
-- `默认窗口`：不发送 `ttl`，交给上游供应商默认 ephemeral 缓存窗口处理。
+- `自动`：不发送 `ttl`，交给上游供应商默认 ephemeral 缓存窗口处理。
+- `5 分钟`：两种 marker 都发送 Claude 原生短缓存窗口：`ttl: "5m"`。
+- `1 小时`：两种 marker 都发送 Claude 原生长缓存窗口：`ttl: "1h"`。
+- `手动`：`[[CACHE_BREAK]]` 发送 `ttl: "1h"`，`[[CACHE_BREAK_SHORT]]` 发送 `ttl: "5m"`。
 
-如果上游或模型不支持 1 小时 TTL，请切回默认窗口。
+换句话说，只有“手动”会让两种 marker 表示不同 TTL；在另外三种模式中，两种 marker 都服从同一项全局设置。自动生成断点使用普通 `[[CACHE_BREAK]]`，所以它在手动模式下属于 1h 断点。
+
+所有来源的断点共用上游最多 4 点预算，包括两种 marker、自动生成点和调用方已有的 `cache_control`。若同一请求混用 1 小时与 5 分钟缓存点，所有 `1h` 点必须位于所有 `5m` 点之前；网关会在最终发送前检查顺序，并对“5m 后又出现 1h”的请求返回明确的 400 错误。
+
+如果上游或模型不支持 1 小时 TTL，请使用“5 分钟”或“自动”。“手动”模式中只要入选了 `[[CACHE_BREAK]]`，就仍会发送 1h。
 
 也可以用环境变量启动：
 
 ```sh
-CACHE_TTL=default npm start
+CACHE_TTL=auto npm start
+```
+
+如需从环境变量启用手动 TTL：
+
+```sh
+CACHE_TTL=manual npm start
 ```
 
 ## 渠道 Profile
@@ -449,7 +468,7 @@ x-forwarded-for
 | `UPSTREAM_HEADERS` | `{}` | 启动时包含请求头。不要写密钥。 |
 | `UPSTREAM_EXCLUDE_HEADERS` | 空 | 启动时排除请求头，逗号或换行分隔。 |
 | `UPSTREAM_API_KEY` | 空 | 当客户端没有传 API Key 时的 fallback。仅建议私有环境使用。 |
-| `CACHE_TTL` | `1h` | `1h` 或 `default`。 |
+| `CACHE_TTL` | `1h` | `auto`、`5m`、`1h` 或 `manual`；旧值 `default` 仍兼容并等同于 `auto`。 |
 | `CACHE_TRANSLATION_ENABLED` | `true` | 是否启用缓存转译。 |
 
 示例：
@@ -475,7 +494,7 @@ PowerShell 示例：
 ```powershell
 $env:UPSTREAM_BASE_URL = 'https://api.pioneer.ai'
 $env:PORT = '8788'
-$env:CACHE_TTL = 'default'
+$env:CACHE_TTL = 'auto'
 npm start
 ```
 
@@ -531,9 +550,9 @@ http://127.0.0.1:8788/v1
 
 检查：
 
-- 稳定内容是否都在 `[[CACHE_BREAK]]` 之前。
-- 蓝灯世界书是否在 `[[CACHE_BREAK]]` 之前，绿灯世界书是否在 `[[CACHE_BREAK]]` 之后。
-- 最近聊天和当前输入是否在 `[[CACHE_BREAK]]` 之后。
+- 稳定内容是否都在缓存 marker 之前。
+- 蓝灯世界书是否在 marker 之前，绿灯世界书是否在 marker 之后。
+- 最近聊天和当前输入是否在 marker 之后。
 - 是否有世界书、正则、插件在缓存点之前插入动态内容。
 - 必要时开启 Prefix 锁定测试是否是前缀漂移。
 - 候选断点持续增长时，可配置固定头或滚动锚点，并在请求详情里检查每个断点的选择原因。
@@ -546,10 +565,12 @@ http://127.0.0.1:8788/v1
 
 ### 上游报不支持 `ttl: 1h`
 
-到“缓存策略”把 TTL 切换为默认窗口，或启动时使用：
+到“缓存策略”把 TTL 切换为“5 分钟”或“自动”。如果当前为“手动”，请注意普通 `[[CACHE_BREAK]]` 会明确要求 1h；仅使用 `[[CACHE_BREAK_SHORT]]`，或直接切换全局 TTL。
+
+选择“自动”也可以在启动时使用：
 
 ```sh
-CACHE_TTL=default npm start
+CACHE_TTL=auto npm start
 ```
 
 ### 可以把 Key 保存到 Profile 吗？

@@ -68,7 +68,7 @@
           <p>
             <b>① 查看完整指南</b>。<br>
             <b>② 客户端设置</b>：Base URL 填 <code>http://127.0.0.1:8788/v1</code>。<br>
-            <b>③ 缓存标记</b>：可手动插入 <code>[[CACHE_BREAK]]</code>，也可在缓存策略中开启自动生成。
+            <b>③ 缓存标记</b>：可手动插入长 / 短 marker，也可在缓存策略中选择自动生成模式。
           </p>
         </div>
         <div class="hero-actions">
@@ -111,9 +111,9 @@
               <span>Prefix 锁定 <em id="mockLockState">加载中</em></span>
               <div class="quick-controls"><button class="ghost small" id="quickPrefixRefresh">刷新</button><label class="switch" aria-label="快速切换 Prefix 锁定"><input type="checkbox" id="quickPrefixSwitch"><span class="track"></span><span class="thumb"></span></label></div>
             </div>
-            <div class="quick-row">
+            <div class="quick-row ttl-quick-row">
               <span>缓存 TTL <em id="mockTtlState">加载中</em></span>
-              <div class="seg" id="quickTtlSeg"><button data-ttl="1h">1 小时</button><button data-ttl="">5 分钟</button></div>
+              <div class="seg ttl-seg" id="quickTtlSeg"><button data-ttl="auto">自动</button><button data-ttl="5m">5 分钟</button><button data-ttl="1h">1 小时</button><button data-ttl="manual">手动</button></div>
             </div>
           </div>
         </section>
@@ -195,22 +195,22 @@
           <div class="marker">[[CACHE_BREAK]]</div>
           <div class="prompt-block dynamic">动态后缀<br><small>近期聊天 / 当前输入</small></div>
         </div>
-        <p class="note cache-note">缓存命中的关键：把大段不变的内容放在 <span class="marker-code">[[CACHE_BREAK]]</span> 之前，动态变化的内容放在它之后。前缀越稳定，命中率越高。</p>
+        <p class="note cache-note">缓存命中的关键：把大段不变的内容放在缓存 marker 之前，动态变化的内容放在它之后。前缀越稳定，命中率越高；需要 5m 短缓存时可在手动 TTL 下使用 <span class="marker-code">[[CACHE_BREAK_SHORT]]</span>。</p>
       </section>
 
       <section class="panel">
         <div class="panel-head"><h3>缓存标记与 TTL</h3></div>
         <div class="set-row">
-          <div class="set-info"><div class="set-title">缓存断点标记</div><div class="set-desc">在稳定内容末尾插入此标记，网关会在该处注入 cache_control。最多支持 4 个断点。</div></div>
-          <div class="set-control"><span class="marker-code">[[CACHE_BREAK]]</span></div>
+          <div class="set-info"><div class="set-title">缓存断点标记</div><div class="set-desc">两个标记都能建立断点；仅在 TTL 选择“手动”时，普通标记固定为 1 小时，SHORT 标记固定为 5 分钟。最多支持 4 个断点。</div></div>
+          <div class="set-control marker-options"><span class="marker-code">[[CACHE_BREAK]]</span><span class="marker-code">[[CACHE_BREAK_SHORT]]</span></div>
         </div>
         <div class="set-row">
-          <div class="set-info"><div class="set-title">自动生成缓存断点</div><div class="set-desc">在最终 SYSTEM 末尾及每个 ASSISTANT 消息后预生成 marker，再交给固定头、锚点和四点预算处理。默认关闭；缓存转译关闭时暂停生效。</div></div>
-          <div class="set-control"><label class="switch" aria-label="切换自动生成缓存断点"><input type="checkbox" id="autoGenerateCacheBreakpointsSwitch"><span class="track"></span><span class="thumb"></span></label></div>
+          <div class="set-info"><div class="set-title">自动生成缓存断点</div><div class="set-desc">“自动”会在请求已有任一 marker 或合法 cache_control 时跳过生成，否则在最终 SYSTEM 末尾及每个 ASSISTANT 后生成候选；“开启”始终生成，“关闭”从不生成。</div></div>
+          <div class="set-control"><div class="seg" id="autoGenerateCacheBreakpointsSeg" aria-label="自动生成缓存断点模式"><button data-auto-breakpoints="auto">自动</button><button data-auto-breakpoints="on">开启</button><button data-auto-breakpoints="off">关闭</button></div></div>
         </div>
         <div class="set-row">
-          <div class="set-info"><div class="set-title">缓存有效期 TTL</div><div class="set-desc">1 小时使用 Claude 原生长缓存窗口；5 分钟表示不发送 ttl，使用供应商默认 ephemeral 窗口。</div></div>
-          <div class="set-control"><div class="seg" id="cacheTtlSeg"><button data-ttl="1h">1 小时</button><button data-ttl="">5 分钟</button></div></div>
+          <div class="set-info"><div class="set-title">缓存有效期 TTL</div><div class="set-desc">自动不发送 ttl；5 分钟和 1 小时统一应用对应的 Claude 原生窗口；手动模式按两种 marker 分别使用 1h / 5m。</div></div>
+          <div class="set-control"><div class="seg ttl-seg" id="cacheTtlSeg"><button data-ttl="auto">自动</button><button data-ttl="5m">5 分钟</button><button data-ttl="1h">1 小时</button><button data-ttl="manual">手动</button></div></div>
         </div>
       </section>
 
@@ -405,12 +405,13 @@
       </section>
       <section class="guide-section" id="g-marker">
         <h3>缓存标记</h3>
-        <p>在稳定的大段内容末尾放置 <code>[[CACHE_BREAK]]</code>，网关会移除标记并注入 Claude prompt cache 的 <code>cache_control</code>。</p>
+        <p>在稳定的大段内容末尾放置 <code>[[CACHE_BREAK]]</code> 或 <code>[[CACHE_BREAK_SHORT]]</code>，网关会移除标记并注入 Claude prompt cache 的 <code>cache_control</code>。</p>
         <ul>
-          <li>开启“自动生成缓存断点”后，网关会在渠道参数合并完成的最终请求中，为 SYSTEM 末尾和每个 ASSISTANT 消息生成候选 marker，再执行原有四点选择。</li>
+          <li>自动断点设为“开启”时，会为最终 SYSTEM 末尾和每个 ASSISTANT 消息生成候选 marker；设为“自动”时，仅在请求没有任何手写 marker 和已有的合法 <code>cache_control</code> 时生成。</li>
           <li>适合放在标记前：系统提示词、角色卡、蓝灯世界书、长设定、固定规则。</li>
           <li>适合放在标记后：绿灯世界书、最近聊天、当前输入、短期记忆、会频繁变化的内容。</li>
-          <li>Claude 每次请求最多支持 4 个缓存断点；多余标记会被移除但不会注入缓存控制。</li>
+          <li>TTL 设为“手动”时，<code>[[CACHE_BREAK]]</code> 固定使用 1h，<code>[[CACHE_BREAK_SHORT]]</code> 固定使用 5m；其他 TTL 模式下两种标记都跟随全局设置。</li>
+          <li>Claude 每次请求最多支持 4 个缓存断点；两种 marker 和已有 <code>cache_control</code> 共用预算，多余标记会被移除。</li>
         </ul>
       </section>
       <section class="guide-section" id="g-retention">
@@ -420,7 +421,7 @@
           <li>固定头缓存点设为 1 时，最前面的候选断点不会再随总断点数量增长而被挤掉。</li>
           <li>单锚点会记住新上下文最终入选断点中、排除固定头后的第一个 marker 断点；只要该点之前的完整前缀不变，就持续保留。</li>
           <li>滚动锚点按设定的内容块间隔晋升新锚点，并在成功请求之间渐进淘汰最老锚点，适合持续增长的长上下文。</li>
-          <li>固定头 1、间隔 3 的轮换示例：<code>A/F/I/J → A/F(待淘汰)/I/L → A/I/L/M</code>。</li>
+          <li>间隔 3 的轮换示例：<code>ABCDE / FGH / I / J → ABCDE（E 后锚点待淘汰） / FGH / IJK / L → ABCDEFGH / IJK / L / M</code>。字母表示连续内容，斜杠用于分组；每个分组末尾（包括行末）都有缓存断点。</li>
           <li>固定头、锚点、普通尾点以及调用方已有的 <code>cache_control</code> 共用上游 4 点预算。例如固定头为 1、单锚点占 1 点时，长示例只会选择 <code>A / F / O / P</code>，不会再加入第五个 N 点。</li>
           <li>策略设置会持久保存，但已学习锚点只存在内存中；重启、更改策略或前缀变化后会重新学习。</li>
           <li>锚点模式与 Prefix Lock 互斥，最后启用的功能生效。</li>
@@ -441,9 +442,10 @@
       <section class="guide-section" id="g-translation">
         <h3>缓存转译与 TTL</h3>
         <ul>
-          <li>“缓存转译”开启时，网关会处理 <code>[[CACHE_BREAK]]</code>、注入 <code>cache_control</code>，并允许 Prefix 锁定参与。</li>
+          <li>“缓存转译”开启时，网关会处理两种缓存 marker、注入 <code>cache_control</code>，并允许 Prefix 锁定参与。</li>
           <li>关闭后，网关不做缓存标记转译，也不会执行 Prefix 锁定；但渠道、高级配置、上游格式转换仍然生效。</li>
-          <li>TTL 选择 <code>1h</code> 会发送 Claude 1 小时缓存窗口；选择默认窗口则不发送 <code>ttl</code>，交给供应商默认处理。</li>
+          <li>TTL 选择“自动”时不发送 <code>ttl</code>；选择“5 分钟”或“1 小时”时，所有 marker 统一使用对应窗口。</li>
+          <li>TTL 选择“手动”时，<code>[[CACHE_BREAK]]</code> 使用 <code>ttl: "1h"</code>，<code>[[CACHE_BREAK_SHORT]]</code> 使用 <code>ttl: "5m"</code>。1h 断点必须排在所有 5m 断点之前。</li>
         </ul>
       </section>
       <section class="guide-section" id="g-channel">
@@ -479,9 +481,9 @@
           <li><b>Mac 打不开 bat？</b> <code>.bat</code> 只适用于 Windows。macOS / Linux 请用 <code>chmod +x start-gateway.sh</code> 后运行 <code>./start-gateway.sh</code>。</li>
           <li><b>请求 404 或路径不对？</b> 酒馆 Base URL 优先填写 <code>http://127.0.0.1:8788/v1</code>。</li>
           <li><b>请求日志要一直开吗？</b> 不建议。开关会跨重启保持，诊断又会记录最终请求体；排查结束后请主动关闭并清空日志。</li>
-          <li><b>缓存没命中？</b> 确认蓝灯世界书在 <code>[[CACHE_BREAK]]</code> 之前、绿灯世界书在它之后；必要时开启 Prefix 锁定排查前缀漂移。</li>
+          <li><b>缓存没命中？</b> 确认蓝灯世界书在缓存 marker 之前、绿灯世界书在它之后；必要时开启 Prefix 锁定排查前缀漂移。</li>
           <li><b>使用数据库会影响缓存吗？</b> 数据库本身不影响缓存，官方渠道验证正常；若数据库蓝灯条目会随填表更新，请把全局注入位置改到缓存点后面，例如角色后、系统。</li>
-          <li><b>上游不支持 1h TTL？</b> 在“缓存策略”里切回默认窗口。</li>
+          <li><b>上游不支持 1h TTL？</b> 在“缓存策略”里切换为“5 分钟”或“自动”；手动模式下不要使用会生成 1h 的 <code>[[CACHE_BREAK]]</code>。</li>
         </ul>
       </section>
     </div>

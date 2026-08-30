@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const MARKER = '[[CACHE_BREAK]]';
+const SHORT_MARKER = '[[CACHE_BREAK_SHORT]]';
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = dirname(TEST_DIR);
 const DEFAULT_POLICY = {
@@ -58,6 +59,30 @@ function automaticAnthropicBody(model = 'automatic-anthropic-model') {
     };
 }
 
+function manualOpenAiBody(model = 'manual-openai-model') {
+    return {
+        model,
+        max_tokens: 32,
+        messages: [
+            { role: 'system', content: [{ type: 'text', text: `Stable system${MARKER}` }] },
+            { role: 'user', content: [{ type: 'text', text: 'Question' }] },
+            { role: 'assistant', content: [{ type: 'text', text: `Recent answer${SHORT_MARKER}` }] },
+        ],
+    };
+}
+
+function manualAnthropicBody(model = 'manual-anthropic-model') {
+    return {
+        model,
+        max_tokens: 32,
+        system: [{ type: 'text', text: `Stable native system${MARKER}` }],
+        messages: [
+            { role: 'user', content: [{ type: 'text', text: 'Native question' }] },
+            { role: 'assistant', content: [{ type: 'text', text: `Recent native answer${SHORT_MARKER}` }] },
+        ],
+    };
+}
+
 function findCacheControlledTexts(value, output = []) {
     if (Array.isArray(value)) {
         for (const item of value) {
@@ -98,8 +123,41 @@ function countCacheControls(value) {
     );
 }
 
+function findCacheControls(value, output = []) {
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            findCacheControls(item, output);
+        }
+        return output;
+    }
+
+    if (!value || typeof value !== 'object') {
+        return output;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+        if (key === 'cache_control') {
+            output.push(child);
+        } else {
+            findCacheControls(child, output);
+        }
+    }
+
+    return output;
+}
+
+function findPromptCacheControls(body) {
+    return [
+        ...findCacheControls(body?.tools),
+        ...findCacheControls(body?.functions),
+        ...findCacheControls(body?.system),
+        ...findCacheControls(body?.messages),
+    ];
+}
+
 function assertFinalUpstreamBody(request, expectedTexts = ['A', 'E', 'F', 'G']) {
     assert.equal(request.rawBody.includes(MARKER), false, 'the wire JSON must not contain cache markers');
+    assert.equal(request.rawBody.includes(SHORT_MARKER), false, 'the wire JSON must not contain short cache markers');
     assert.ok(countCacheControls(request.body) <= 4, 'the wire JSON must contain at most four cache controls');
     const selectedPromptTexts = [
         ...findCacheControlledTexts(request.body?.system),
@@ -110,6 +168,24 @@ function assertFinalUpstreamBody(request, expectedTexts = ['A', 'E', 'F', 'G']) 
         expectedTexts,
         'fixed head 1 must preserve the first candidate and fill the remaining budget from the tail',
     );
+}
+
+function assertGatewayCacheTtl(request, expectedTtl) {
+    const controls = findCacheControls(request.body);
+    assert.ok(controls.length > 0, 'the test request must contain gateway cache controls');
+
+    for (const control of controls) {
+        assert.equal(control.type, 'ephemeral');
+        if (expectedTtl === null) {
+            assert.equal(
+                Object.prototype.hasOwnProperty.call(control, 'ttl'),
+                false,
+                'Auto mode must omit cache_control.ttl',
+            );
+        } else {
+            assert.equal(control.ttl, expectedTtl);
+        }
+    }
 }
 
 function writeJson(response, status, body) {
@@ -256,7 +332,10 @@ async function startGatewayFixture({
     policy = DEFAULT_POLICY,
     upstreamExtraJson = {},
     schemaVersion = 3,
+    savedCacheTtl = 'provider-default',
+    environmentCacheTtl = 'provider-default',
     autoGenerateCacheBreakpoints,
+    autoGenerateCacheBreakpointsMode,
     captureRequests,
 }) {
     const upstream = await startMockUpstream();
@@ -274,9 +353,10 @@ async function startGatewayFixture({
             writeFile(settingsPath, `${JSON.stringify({
                 schemaVersion,
                 cacheTranslationEnabled: true,
-                cacheTtl: 'provider-default',
+                cacheTtl: savedCacheTtl,
                 ...policy,
                 ...(autoGenerateCacheBreakpoints === undefined ? {} : { autoGenerateCacheBreakpoints }),
+                ...(autoGenerateCacheBreakpointsMode === undefined ? {} : { autoGenerateCacheBreakpointsMode }),
                 ...(captureRequests === undefined ? {} : { captureRequests }),
                 activeChannelId: 'integration-upstream',
                 channels: [{
@@ -308,6 +388,7 @@ async function startGatewayFixture({
             'UPSTREAM_API_KEY',
             'ANTHROPIC_BETA',
             'ANTHROPIC_VERSION',
+            'CACHE_TTL',
         ]) {
             delete environment[name];
         }
@@ -317,8 +398,11 @@ async function startGatewayFixture({
             UPSTREAM_BASE_URL: upstream.baseUrl,
             UPSTREAM_MODE: upstreamMode,
             CACHE_TRANSLATION_ENABLED: 'true',
-            CACHE_TTL: 'provider-default',
         });
+
+        if (environmentCacheTtl !== null) {
+            environment.CACHE_TTL = environmentCacheTtl;
+        }
 
         const baseUrl = `http://127.0.0.1:${port}`;
 
@@ -405,13 +489,393 @@ test('OpenAI inbound -> OpenAI upstream sends the fixed-head final JSON', async 
     assertFinalUpstreamBody(request);
 });
 
-test('schema 3 settings default automatic cache breaks and request capture to disabled', async (t) => {
+test('schema 3 settings migrate automatic cache breaks to Off and request capture to disabled', async (t) => {
     const fixture = await startGatewayFixture({ upstreamMode: 'openai', schemaVersion: 3 });
     t.after(() => fixture.close());
 
     const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     assert.equal(state.autoGenerateCacheBreakpoints, false);
+    assert.equal(state.autoGenerateCacheBreakpointsMode, 'off');
     assert.equal(state.captureRequests, false);
+    assert.equal(state.cacheTtl, 'auto');
+});
+
+test('schema 6 migrates the old automatic breakpoint boolean and persists the canonical mode', async (t) => {
+    for (const testCase of [
+        { name: 'legacy true becomes On', legacy: true, expected: 'on' },
+        { name: 'legacy false becomes Off', legacy: false, expected: 'off' },
+        { name: 'missing legacy setting becomes Off', legacy: undefined, expected: 'off' },
+    ]) {
+        await t.test(testCase.name, async () => {
+            const fixture = await startGatewayFixture({
+                upstreamMode: 'openai',
+                schemaVersion: 5,
+                autoGenerateCacheBreakpoints: testCase.legacy,
+            });
+
+            try {
+                const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+                assert.equal(state.autoGenerateCacheBreakpointsMode, testCase.expected);
+                assert.equal(state.autoGenerateCacheBreakpoints, testCase.expected !== 'off');
+
+                await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
+                const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+                assert.equal(savedSettings.schemaVersion, 6);
+                assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, testCase.expected);
+                assert.equal(
+                    Object.prototype.hasOwnProperty.call(savedSettings, 'autoGenerateCacheBreakpoints'),
+                    false,
+                    'schema 6 must persist only the canonical three-state field',
+                );
+            } finally {
+                await fixture.close();
+            }
+        });
+    }
+});
+
+test('automatic breakpoint API validates mode atomically and accepts the legacy enabled boolean', async (t) => {
+    const fixture = await startGatewayFixture({ upstreamMode: 'openai' });
+    t.after(() => fixture.close());
+
+    const automatic = await postJson(fixture.gatewayBaseUrl, '/console/auto-cache-breakpoints', { mode: 'auto' });
+    assert.equal(automatic.autoGenerateCacheBreakpointsMode, 'auto');
+
+    for (const body of [{}, { mode: 'sometimes' }, { mode: true }, { enabled: 'true' }]) {
+        const response = await fetch(`${fixture.gatewayBaseUrl}/console/auto-cache-breakpoints`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 400, `body ${JSON.stringify(body)} must be rejected`);
+    }
+
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.autoGenerateCacheBreakpointsMode, 'auto', 'invalid updates must not mutate the mode');
+
+    const legacyOn = await postJson(fixture.gatewayBaseUrl, '/console/auto-cache-breakpoints', { enabled: true });
+    assert.equal(legacyOn.autoGenerateCacheBreakpointsMode, 'on');
+    const legacyOff = await postJson(fixture.gatewayBaseUrl, '/console/auto-cache-breakpoints', { enabled: false });
+    assert.equal(legacyOff.autoGenerateCacheBreakpointsMode, 'off');
+
+    const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.equal(savedSettings.schemaVersion, 6);
+    assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, 'off');
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.autoGenerateCacheBreakpoints, false);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/cache-policy', {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'single',
+        cacheAnchorIntervalBlocks: 3,
+    });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('mode-anchor-clear'));
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheAnchorState.contextCount, 1);
+    state = await postJson(fixture.gatewayBaseUrl, '/console/auto-cache-breakpoints', { mode: 'auto' });
+    assert.equal(state.cacheAnchorState.contextCount, 0, 'changing generation mode must clear learned anchors');
+});
+
+test('TTL modes send no ttl for Auto and native ttl values for 5m and 1h', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 4,
+        savedCacheTtl: 'provider-default',
+        environmentCacheTtl: null,
+    });
+    t.after(() => fixture.close());
+
+    const initialState = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(initialState.cacheTtl, 'auto');
+    assert.deepEqual(initialState.cacheControl, { type: 'ephemeral' });
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('ttl-auto-initial'));
+    assertGatewayCacheTtl(fixture.requests[0], null);
+
+    const fiveMinutes = await postJson(fixture.gatewayBaseUrl, '/console/cache-ttl', { ttl: '5m' });
+    assert.equal(fiveMinutes.cacheTtl, '5m');
+    assert.deepEqual(fiveMinutes.cacheControl, { type: 'ephemeral', ttl: '5m' });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('ttl-five-minutes'));
+    assertGatewayCacheTtl(fixture.requests[1], '5m');
+
+    const oneHour = await postJson(fixture.gatewayBaseUrl, '/console/cache-ttl', { ttl: '1h' });
+    assert.equal(oneHour.cacheTtl, '1h');
+    assert.deepEqual(oneHour.cacheControl, { type: 'ephemeral', ttl: '1h' });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('ttl-one-hour'));
+    assertGatewayCacheTtl(fixture.requests[2], '1h');
+
+    const automatic = await postJson(fixture.gatewayBaseUrl, '/console/cache-ttl', { ttl: 'auto' });
+    assert.equal(automatic.cacheTtl, 'auto');
+    assert.deepEqual(automatic.cacheControl, { type: 'ephemeral' });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('ttl-auto-final'));
+    assertGatewayCacheTtl(fixture.requests[3], null);
+
+    const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.equal(savedSettings.schemaVersion, 6);
+    assert.equal(savedSettings.cacheTtl, 'auto');
+});
+
+test('Manual TTL maps long and short markers on all three final upstream request chains', async (t) => {
+    const cases = [
+        {
+            name: 'OpenAI inbound to OpenAI upstream',
+            upstreamMode: 'openai',
+            path: '/v1/chat/completions',
+            inboundPath: '/v1/chat/completions',
+            body: manualOpenAiBody('manual-openai-wire'),
+            expectedTexts: ['Stable system', 'Recent answer'],
+        },
+        {
+            name: 'OpenAI inbound to Anthropic upstream',
+            upstreamMode: 'anthropic',
+            path: '/v1/messages',
+            inboundPath: '/v1/chat/completions',
+            body: manualOpenAiBody('manual-converted-wire'),
+            expectedTexts: ['Stable system', 'Recent answer'],
+        },
+        {
+            name: 'Anthropic native inbound',
+            upstreamMode: 'anthropic',
+            path: '/v1/messages',
+            inboundPath: '/v1/messages',
+            body: manualAnthropicBody('manual-native-wire'),
+            expectedTexts: ['Stable native system', 'Recent native answer'],
+        },
+    ];
+
+    for (const testCase of cases) {
+        await t.test(testCase.name, async () => {
+            const fixture = await startGatewayFixture({
+                upstreamMode: testCase.upstreamMode,
+                schemaVersion: 6,
+                savedCacheTtl: 'manual',
+                environmentCacheTtl: null,
+            });
+
+            try {
+                const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+                assert.equal(state.cacheTtl, 'manual');
+                assert.deepEqual(state.cacheControl, { type: 'ephemeral', ttl: '1h' });
+                assert.deepEqual(state.shortCacheControl, { type: 'ephemeral', ttl: '5m' });
+
+                await postJson(fixture.gatewayBaseUrl, testCase.inboundPath, testCase.body);
+                assert.equal(fixture.requests.length, 1);
+                const request = fixture.requests[0];
+                assert.equal(request.path, testCase.path);
+                assertFinalUpstreamBody(request, testCase.expectedTexts);
+                assert.deepEqual(
+                    findPromptCacheControls(request.body).map((control) => control.ttl),
+                    ['1h', '5m'],
+                );
+            } finally {
+                await fixture.close();
+            }
+        });
+    }
+});
+
+test('non-Manual TTL modes apply the global TTL equally to long and short markers', async (t) => {
+    const cases = [
+        { ttl: 'auto', expected: [undefined, undefined] },
+        { ttl: '5m', expected: ['5m', '5m'] },
+        { ttl: '1h', expected: ['1h', '1h'] },
+    ];
+
+    for (const testCase of cases) {
+        await t.test(testCase.ttl, async () => {
+            const fixture = await startGatewayFixture({
+                upstreamMode: 'openai',
+                schemaVersion: 6,
+                savedCacheTtl: testCase.ttl,
+                environmentCacheTtl: null,
+            });
+
+            try {
+                await postJson(
+                    fixture.gatewayBaseUrl,
+                    '/v1/chat/completions',
+                    manualOpenAiBody(`uniform-${testCase.ttl}`),
+                );
+                assert.deepEqual(
+                    findPromptCacheControls(fixture.requests[0].body).map((control) => control.ttl),
+                    testCase.expected,
+                );
+            } finally {
+                await fixture.close();
+            }
+        });
+    }
+});
+
+test('Manual TTL rejects a short marker before a later long marker without contacting upstream', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 6,
+        savedCacheTtl: 'manual',
+        environmentCacheTtl: null,
+    });
+    t.after(() => fixture.close());
+
+    const body = manualAnthropicBody('manual-invalid-order');
+    body.system[0].text = `Short first${SHORT_MARKER}`;
+    body.messages[1].content[0].text = `Long later${MARKER}`;
+    const response = await fetch(`${fixture.gatewayBaseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    const responseBody = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(responseBody.code, 'CACHE_TTL_ORDER_INVALID');
+    assert.equal(fixture.requests.length, 0);
+});
+
+test('changing TTL clears a learned Prefix Lock so cached controls cannot retain the old lifetime', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        savedCacheTtl: '1h',
+        environmentCacheTtl: null,
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/console/prefix-lock', { enabled: true });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('ttl-prefix-lock'));
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.prefixLockActive, true);
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/cache-ttl', { ttl: '5m' });
+    assert.equal(state.cacheTtl, '5m');
+    assert.equal(state.prefixLockActive, false);
+    assert.equal(state.prefixLockEnabled, true, 'TTL change should relearn rather than disable Prefix Lock');
+});
+
+test('explicit 5m TTL is applied to every gateway breakpoint after Anthropic conversion', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 4,
+        savedCacheTtl: '5m',
+        environmentCacheTtl: null,
+    });
+    t.after(() => fixture.close());
+
+    const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheTtl, '5m');
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('ttl-anthropic-five-minutes'));
+    assert.equal(fixture.requests[0].path, '/v1/messages');
+    assertGatewayCacheTtl(fixture.requests[0], '5m');
+});
+
+test('legacy default TTL aliases migrate to canonical Auto in state and saved settings', async (t) => {
+    for (const legacyValue of ['', 'default', 'provider-default', 'none']) {
+        await t.test(JSON.stringify(legacyValue), async () => {
+            const fixture = await startGatewayFixture({
+                upstreamMode: 'openai',
+                schemaVersion: 4,
+                savedCacheTtl: legacyValue,
+                environmentCacheTtl: null,
+            });
+
+            try {
+                const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+                assert.equal(state.cacheTtl, 'auto');
+                assert.deepEqual(state.cacheControl, { type: 'ephemeral' });
+
+                await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
+                const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+                assert.equal(savedSettings.schemaVersion, 6);
+                assert.equal(savedSettings.cacheTtl, 'auto');
+            } finally {
+                await fixture.close();
+            }
+        });
+    }
+});
+
+test('unknown saved or environment TTL values safely fall back to Auto', async (t) => {
+    const cases = [
+        { name: 'saved setting', savedCacheTtl: '30m', environmentCacheTtl: null },
+        { name: 'environment override', savedCacheTtl: '1h', environmentCacheTtl: '30m' },
+    ];
+
+    for (const testCase of cases) {
+        await t.test(testCase.name, async () => {
+            const fixture = await startGatewayFixture({
+                upstreamMode: 'openai',
+                schemaVersion: 4,
+                ...testCase,
+            });
+
+            try {
+                const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+                assert.equal(state.cacheTtl, 'auto');
+                assert.deepEqual(state.cacheControl, { type: 'ephemeral' });
+                await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('ttl-invalid-fallback'));
+                assertGatewayCacheTtl(fixture.requests[0], null);
+            } finally {
+                await fixture.close();
+            }
+        });
+    }
+});
+
+test('cache TTL API rejects non-canonical and missing values without changing state', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        savedCacheTtl: '1h',
+        environmentCacheTtl: null,
+    });
+    t.after(() => fixture.close());
+
+    for (const body of [
+        {},
+        { ttl: '' },
+        { ttl: null },
+        { ttl: 'provider-default' },
+        { ttl: '30m' },
+    ]) {
+        const response = await fetch(`${fixture.gatewayBaseUrl}/console/cache-ttl`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const responseBody = await response.json();
+        assert.equal(response.status, 400, `body ${JSON.stringify(body)} must be rejected`);
+        assert.match(responseBody.error, /auto, 5m, 1h, or manual/i);
+    }
+
+    const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheTtl, '1h');
+    assert.deepEqual(state.cacheControl, { type: 'ephemeral', ttl: '1h' });
+});
+
+test('canonical TTL participates in anchor context isolation', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        savedCacheTtl: 'auto',
+        environmentCacheTtl: null,
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'single',
+            cacheAnchorIntervalBlocks: 3,
+        },
+    });
+    t.after(() => fixture.close());
+
+    const body = markerBody('ttl-anchor-scope', 'ABCDEFG');
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', body);
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheAnchorState.contextCount, 1);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/cache-ttl', { ttl: '5m' });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', body);
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheAnchorState.contextCount, 2, '5m must use a distinct anchor scope from Auto');
+
+    await postJson(fixture.gatewayBaseUrl, '/console/cache-ttl', { ttl: 'auto' });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', body);
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheAnchorState.contextCount, 2, 'returning to Auto must reuse the canonical Auto scope');
 });
 
 test('OpenAI inbound -> OpenAI upstream auto-generates last-system and assistant candidates before H=1 selection', async (t) => {
@@ -462,6 +926,50 @@ test('Anthropic native inbound auto-generates system and assistant candidates be
     assertFinalUpstreamBody(fixture.requests[0], ['Native system last', 'N-A3', 'N-A4', 'N-A5']);
 });
 
+test('Auto generation enables only when the final request has no explicit marker or cache control', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 6,
+        autoGenerateCacheBreakpointsMode: 'auto',
+        captureRequests: true,
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', automaticOpenAiBody('adaptive-empty'));
+    assertFinalUpstreamBody(fixture.requests[0], ['System last', 'A3', 'A4', 'A5']);
+    let captureList = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    let capture = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(captureList.requests[0].id)}`,
+    );
+    assert.equal(capture.gateway.autoGenerateCacheBreakpointsMode, 'auto');
+    assert.equal(capture.gateway.autoGenerateCacheBreakpointsEffective, true);
+    assert.equal(capture.gateway.cachePolicy.autoGeneratedBreakpoints.enabled, true);
+    assert.equal(capture.gateway.cachePolicy.autoGeneratedBreakpoints.suppressionReason, null);
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', manualOpenAiBody('adaptive-explicit-markers'));
+    assertFinalUpstreamBody(fixture.requests[1], ['Stable system', 'Recent answer']);
+    captureList = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    capture = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(captureList.requests[0].id)}`,
+    );
+    assert.equal(capture.gateway.autoGenerateCacheBreakpointsMode, 'auto');
+    assert.equal(capture.gateway.autoGenerateCacheBreakpointsEffective, false);
+    assert.equal(capture.gateway.cachePolicy.autoGeneratedBreakpoints.explicitMarkerCount, 2);
+    assert.equal(capture.gateway.cachePolicy.autoGeneratedBreakpoints.suppressionReason, 'explicit-marker');
+
+    const callerControlled = automaticOpenAiBody('adaptive-existing-control');
+    callerControlled.messages[0].content[0].cache_control = { type: 'ephemeral' };
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', callerControlled);
+    assert.equal(countCacheControls(fixture.requests[2].body), 1);
+    captureList = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    capture = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(captureList.requests[0].id)}`,
+    );
+    assert.equal(capture.gateway.autoGenerateCacheBreakpointsEffective, false);
+    assert.equal(capture.gateway.cachePolicy.autoGeneratedBreakpoints.existingCacheControlCount, 1);
+    assert.equal(capture.gateway.cachePolicy.autoGeneratedBreakpoints.suppressionReason, 'existing-cache-control');
+});
+
 test('request capture setting persists across a gateway restart while captures remain in-memory only', async (t) => {
     const fixture = await startGatewayFixture({
         upstreamMode: 'openai',
@@ -479,7 +987,7 @@ test('request capture setting persists across a gateway restart while captures r
     assert.equal(beforeRestart.capturedRequests, 1);
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 4);
+    assert.equal(savedSettings.schemaVersion, 6);
     assert.equal(savedSettings.captureRequests, true, 'POST /console/capture must persist the setting');
 
     await fixture.restart();
@@ -539,6 +1047,37 @@ test('OpenAI inbound -> Anthropic rejects an invalid messages override before co
     assert.equal(body.code, 'INVALID_FINAL_MESSAGES');
     assert.match(body.error, /messages array/i);
     assert.equal(fixture.requests.length, 0, 'invalid merged JSON must never reach the upstream');
+});
+
+test('Anthropic wire rejects a gateway-generated 1h breakpoint after a caller-owned implicit 5m breakpoint', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        savedCacheTtl: '1h',
+        environmentCacheTtl: null,
+    });
+    t.after(() => fixture.close());
+
+    const requestBody = markerBody('mixed-ttl-wire-rejection');
+    requestBody.messages[0].content[0].cache_control = { type: 'ephemeral' };
+    const response = await fetch(`${fixture.gatewayBaseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(requestBody),
+    });
+    const responseBody = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(responseBody.code, 'CACHE_TTL_ORDER_INVALID');
+    assert.match(responseBody.error, /1h cache_control.*after 5m cache_control/i);
+    assert.equal(responseBody.details.firstFiveMinutePath, 'messages[0].content[0].cache_control');
+    assert.equal(responseBody.details.laterOneHourPath, 'messages[4].content[0].cache_control');
+    assert.deepEqual(responseBody.details.paths, [
+        'messages[0].content[0].cache_control',
+        'messages[4].content[0].cache_control',
+        'messages[5].content[0].cache_control',
+        'messages[6].content[0].cache_control',
+    ]);
+    assert.equal(fixture.requests.length, 0, 'invalid mixed TTL order must never reach the upstream wire');
 });
 
 test('Anthropic native inbound selects breakpoints after channel JSON is merged', async (t) => {

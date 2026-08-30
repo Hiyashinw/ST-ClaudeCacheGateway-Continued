@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 export const MARKER = '[[CACHE_BREAK]]';
+export const SHORT_MARKER = '[[CACHE_BREAK_SHORT]]';
 export const MAX_BREAKPOINTS = 4;
 export const DEFAULT_CACHE_POLICY = Object.freeze({
     fixedHeadBreakpointCount: 0,
@@ -42,43 +43,131 @@ function hasOwn(object, key) {
     return Object.prototype.hasOwnProperty.call(object, key);
 }
 
-function markerCount(text, marker = MARKER) {
-    return typeof text === 'string' ? text.split(marker).length - 1 : 0;
+function markerDefinitions(marker = MARKER, shortMarker = SHORT_MARKER) {
+    const definitions = [
+        { marker, kind: 'long' },
+        { marker: shortMarker, kind: 'short' },
+    ];
+
+    for (const definition of definitions) {
+        if (typeof definition.marker !== 'string' || definition.marker.length === 0) {
+            throw new CachePolicyError('Cache markers must be non-empty strings.', 'INVALID_CACHE_MARKER');
+        }
+    }
+
+    if (marker === shortMarker) {
+        throw new CachePolicyError(
+            'Long and short cache markers must be different strings.',
+            'DUPLICATE_CACHE_MARKER',
+        );
+    }
+
+    return definitions;
 }
 
-function stripMarkers(text, marker = MARKER) {
-    return typeof text === 'string' ? text.split(marker).join('') : text;
+function findMarkers(text, definitions = markerDefinitions()) {
+    if (typeof text !== 'string' || text.length === 0) {
+        return [];
+    }
+
+    const found = [];
+
+    for (const definition of definitions) {
+        let fromIndex = 0;
+
+        while (fromIndex <= text.length - definition.marker.length) {
+            const index = text.indexOf(definition.marker, fromIndex);
+
+            if (index < 0) {
+                break;
+            }
+
+            found.push({ ...definition, index });
+            fromIndex = index + definition.marker.length;
+        }
+    }
+
+    return found.sort((left, right) => left.index - right.index || right.marker.length - left.marker.length);
 }
 
-function isMarkerOnlyText(text, marker = MARKER) {
+function markerCount(text, definitions = markerDefinitions()) {
+    return findMarkers(text, definitions).length;
+}
+
+function markerKindCounts(text, definitions = markerDefinitions()) {
+    const counts = { long: 0, short: 0 };
+
+    for (const match of findMarkers(text, definitions)) {
+        counts[match.kind]++;
+    }
+
+    return counts;
+}
+
+function stripMarkers(text, definitions = markerDefinitions()) {
+    if (typeof text !== 'string') {
+        return text;
+    }
+
+    let stripped = text;
+
+    for (const { marker } of definitions) {
+        stripped = stripped.split(marker).join('');
+    }
+
+    return stripped;
+}
+
+function containsMarker(text, definitions = markerDefinitions()) {
+    return findMarkers(text, definitions).length > 0;
+}
+
+function isMarkerOnlyText(text, definitions = markerDefinitions()) {
     return typeof text === 'string'
-        && text.includes(marker)
-        && stripMarkers(text, marker).trim() === '';
+        && containsMarker(text, definitions)
+        && stripMarkers(text, definitions).trim() === '';
 }
 
-function countMarkersInContent(content, marker = MARKER) {
+function countMarkersInContent(content, definitions = markerDefinitions()) {
     if (typeof content === 'string') {
-        return markerCount(content, marker);
+        return markerCount(content, definitions);
     }
 
     if (!Array.isArray(content)) {
         return 0;
     }
 
-    return content.reduce((total, block) => total + (isTextBlock(block) ? markerCount(block.text, marker) : 0), 0);
+    return content.reduce((total, block) => (
+        total + (isTextBlock(block) ? markerCount(block.text, definitions) : 0)
+    ), 0);
 }
 
-function isMarkerOnlyContent(content, marker = MARKER) {
+function markerKindCountsInContent(content, definitions = markerDefinitions()) {
+    const counts = { long: 0, short: 0 };
+    const texts = typeof content === 'string'
+        ? [content]
+        : (Array.isArray(content) ? content.filter(isTextBlock).map((block) => block.text) : []);
+
+    for (const text of texts) {
+        const current = markerKindCounts(text, definitions);
+        counts.long += current.long;
+        counts.short += current.short;
+    }
+
+    return counts;
+}
+
+function isMarkerOnlyContent(content, definitions = markerDefinitions()) {
     if (typeof content === 'string') {
-        return isMarkerOnlyText(content, marker);
+        return isMarkerOnlyText(content, definitions);
     }
 
     if (!Array.isArray(content) || content.length === 0) {
         return false;
     }
 
-    return content.every((block) => isTextBlock(block) && stripMarkers(block.text, marker).trim() === '')
-        && content.some((block) => block.text.includes(marker));
+    return content.every((block) => isTextBlock(block) && stripMarkers(block.text, definitions).trim() === '')
+        && content.some((block) => containsMarker(block.text, definitions));
 }
 
 function isMeaningfulContent(content) {
@@ -189,13 +278,13 @@ function isPromptCacheControlContainerPath(path) {
     return path.length % 2 === 0;
 }
 
-function normalizeFingerprintValue(value, marker = MARKER, path = []) {
+function normalizeFingerprintValue(value, definitions = markerDefinitions(), path = []) {
     if (typeof value === 'string') {
-        return stripMarkers(value, marker);
+        return stripMarkers(value, definitions);
     }
 
     if (Array.isArray(value)) {
-        return value.map((item, index) => normalizeFingerprintValue(item, marker, [...path, index]));
+        return value.map((item, index) => normalizeFingerprintValue(item, definitions, [...path, index]));
     }
 
     if (!isObject(value)) {
@@ -213,7 +302,7 @@ function normalizeFingerprintValue(value, marker = MARKER, path = []) {
             continue;
         }
 
-        output[key] = normalizeFingerprintValue(child, marker, [...path, key]);
+        output[key] = normalizeFingerprintValue(child, definitions, [...path, key]);
     }
 
     return output;
@@ -274,7 +363,7 @@ function normalizeProtocol(protocol) {
     return normalized;
 }
 
-function isLandableContentBlock(block, marker = MARKER) {
+function isLandableContentBlock(block, definitions = markerDefinitions()) {
     if (!isObject(block)) {
         return false;
     }
@@ -283,12 +372,17 @@ function isLandableContentBlock(block, marker = MARKER) {
         return true;
     }
 
-    return stripMarkers(block.text, marker).trim() !== '';
+    return stripMarkers(block.text, definitions).trim() !== '';
 }
 
-function contentEndsWithMarker(content, marker = MARKER) {
+function contentEndsWithMarker(content, definitions = markerDefinitions()) {
+    function textEndsWithMarker(text) {
+        const trimmed = typeof text === 'string' ? text.trimEnd() : '';
+        return definitions.some(({ marker }) => trimmed.endsWith(marker));
+    }
+
     if (typeof content === 'string') {
-        return content.trimEnd().endsWith(marker);
+        return textEndsWithMarker(content);
     }
 
     if (!Array.isArray(content) || content.length === 0) {
@@ -296,7 +390,41 @@ function contentEndsWithMarker(content, marker = MARKER) {
     }
 
     const last = content[content.length - 1];
-    return isTextBlock(last) && last.text.trimEnd().endsWith(marker);
+    return isTextBlock(last) && textEndsWithMarker(last.text);
+}
+
+function countMarkersDeep(value, definitions = markerDefinitions()) {
+    if (typeof value === 'string') {
+        return markerCount(value, definitions);
+    }
+
+    if (Array.isArray(value)) {
+        return value.reduce((total, item) => total + countMarkersDeep(item, definitions), 0);
+    }
+
+    if (!isObject(value)) {
+        return 0;
+    }
+
+    return Object.values(value).reduce((total, child) => total + countMarkersDeep(child, definitions), 0);
+}
+
+function normalizeAutomaticMode(options) {
+    if (hasOwn(options, 'mode')) {
+        const mode = String(options.mode ?? '').trim().toLowerCase();
+
+        if (!['off', 'on', 'auto'].includes(mode)) {
+            throw new CachePolicyError(
+                'Automatic cache breakpoint mode must be off, on, or auto.',
+                'INVALID_AUTOMATIC_CACHE_BREAKPOINT_MODE',
+                { mode: options.mode },
+            );
+        }
+
+        return mode;
+    }
+
+    return options.enabled === true ? 'on' : 'off';
 }
 
 export function preprocessAutomaticCacheBreaks(body, options = {}) {
@@ -305,16 +433,29 @@ export function preprocessAutomaticCacheBreaks(body, options = {}) {
     }
 
     const protocol = normalizeProtocol(options.protocol);
-    const enabled = options.enabled === true;
     const marker = options.marker ?? MARKER;
-
-    if (typeof marker !== 'string' || marker.length === 0) {
-        throw new CachePolicyError('marker must be a non-empty string.', 'INVALID_CACHE_MARKER');
-    }
+    const shortMarker = options.shortMarker ?? SHORT_MARKER;
+    const definitions = markerDefinitions(marker, shortMarker);
+    const mode = normalizeAutomaticMode(options);
+    const explicitMarkerCount = countMarkersDeep(body, definitions);
+    const existingCacheControlCount = collectCacheControls(body).controls.length;
+    const suppressed = mode === 'auto' && (explicitMarkerCount > 0 || existingCacheControlCount > 0);
+    const enabled = mode === 'on' || (mode === 'auto' && !suppressed);
+    const suppressionReason = !suppressed
+        ? null
+        : (explicitMarkerCount > 0 && existingCacheControlCount > 0
+            ? 'explicit-marker-and-cache-control'
+            : (explicitMarkerCount > 0 ? 'explicit-marker' : 'existing-cache-control'));
 
     const nextBody = cloneJson(body);
     const diagnostics = {
         enabled,
+        mode,
+        requestedMode: mode,
+        suppressed,
+        suppressionReason,
+        explicitMarkerCount,
+        existingCacheControlCount,
         protocol,
         added: 0,
         alreadyMarked: 0,
@@ -334,7 +475,7 @@ export function preprocessAutomaticCacheBreaks(body, options = {}) {
     function appendToContent(owner, key, path, source) {
         const content = owner?.[key];
 
-        if (contentEndsWithMarker(content, marker)) {
+        if (contentEndsWithMarker(content, definitions)) {
             record(path, source, 'alreadyMarked');
             return;
         }
@@ -355,7 +496,7 @@ export function preprocessAutomaticCacheBreaks(body, options = {}) {
             return;
         }
 
-        const hasTarget = content.some((block) => isLandableContentBlock(block, marker));
+        const hasTarget = content.some((block) => isLandableContentBlock(block, definitions));
 
         if (!hasTarget) {
             record(path, source, 'unlandable');
@@ -403,10 +544,11 @@ export function preprocessAutomaticCacheBreaks(body, options = {}) {
     return { body: nextBody, diagnostics };
 }
 
-function addMarkerCandidate(normalization, target, source, count = 1) {
+function addMarkerCandidate(normalization, target, source, kindCounts = { long: 1, short: 0 }) {
+    const count = (kindCounts.long || 0) + (kindCounts.short || 0);
     normalization.totalMarkers += count;
 
-    if (!isLandableContentBlock(target)) {
+    if (!isLandableContentBlock(target, normalization.markerDefinitions)) {
         normalization.unlandableMarkers += count;
         return;
     }
@@ -415,6 +557,9 @@ function addMarkerCandidate(normalization, target, source, count = 1) {
 
     if (current) {
         current.markerCount += count;
+        current.markerKindCounts.long += kindCounts.long || 0;
+        current.markerKindCounts.short += kindCounts.short || 0;
+        current.markerKinds = ['long', 'short'].filter((kind) => current.markerKindCounts[kind] > 0);
 
         if (!current.sources.includes(source)) {
             current.sources.push(source);
@@ -426,30 +571,34 @@ function addMarkerCandidate(normalization, target, source, count = 1) {
     const candidate = {
         target,
         markerCount: count,
+        markerKindCounts: {
+            long: kindCounts.long || 0,
+            short: kindCounts.short || 0,
+        },
+        markerKinds: ['long', 'short'].filter((kind) => (kindCounts[kind] || 0) > 0),
         sources: [source],
     };
     normalization.candidateByTarget.set(target, candidate);
     normalization.rawCandidates.push(candidate);
 }
 
-function splitTextBlock(block, nextBlocks, normalization, source, marker = MARKER) {
-    const count = markerCount(block.text, marker);
+function splitTextBlock(block, nextBlocks, normalization, source, definitions = markerDefinitions()) {
+    const matches = findMarkers(block.text, definitions);
 
-    if (count === 0) {
+    if (matches.length === 0) {
         nextBlocks.push(block);
         return false;
     }
 
-    const parts = block.text.split(marker);
     const originalCacheControl = hasOwn(block, CACHE_CONTROL_KEY) ? cloneJson(block.cache_control) : undefined;
     const base = { ...block };
     delete base.text;
     delete base.cache_control;
     const emitted = [];
+    let cursor = 0;
 
-    for (let index = 0; index < parts.length; index++) {
-        const part = parts[index];
-        const hasMarkerAfter = index < parts.length - 1;
+    for (const match of matches) {
+        const part = block.text.slice(cursor, match.index);
         let target = null;
 
         if (part !== '') {
@@ -461,9 +610,19 @@ function splitTextBlock(block, nextBlocks, normalization, source, marker = MARKE
             target = isTextBlock(previous) ? previous : null;
         }
 
-        if (hasMarkerAfter) {
-            addMarkerCandidate(normalization, target, source, 1);
-        }
+        addMarkerCandidate(normalization, target, source, {
+            long: match.kind === 'long' ? 1 : 0,
+            short: match.kind === 'short' ? 1 : 0,
+        });
+        cursor = match.index + match.marker.length;
+    }
+
+    const tail = block.text.slice(cursor);
+
+    if (tail !== '') {
+        const target = { ...base, type: 'text', text: tail };
+        nextBlocks.push(target);
+        emitted.push(target);
     }
 
     if (originalCacheControl !== undefined && emitted.length > 0) {
@@ -473,9 +632,9 @@ function splitTextBlock(block, nextBlocks, normalization, source, marker = MARKE
     return true;
 }
 
-function findPreviousLandableBlock(blocks, marker = MARKER) {
+function findPreviousLandableBlock(blocks, definitions = markerDefinitions()) {
     for (let index = blocks.length - 1; index >= 0; index--) {
-        if (isLandableContentBlock(blocks[index], marker)) {
+        if (isLandableContentBlock(blocks[index], definitions)) {
             return blocks[index];
         }
     }
@@ -483,14 +642,71 @@ function findPreviousLandableBlock(blocks, marker = MARKER) {
     return null;
 }
 
-function normalizeContent(content, normalization, source, marker = MARKER) {
+function migrateMarkerCarrierControl(block, target, carrierPath, targetPath = null) {
+    if (!isObject(block)
+        || !hasOwn(block, CACHE_CONTROL_KEY)
+        || !isPromptCacheControlValue(block.cache_control)) {
+        return false;
+    }
+
+    const carrierControl = cloneJson(block.cache_control);
+
+    if (!target) {
+        throw new CachePolicyError(
+            `Caller cache_control at ${carrierPath} is attached to a standalone cache marker with no preceding cacheable target.`,
+            'CACHE_MARKER_CONTROL_TARGET_MISSING',
+            {
+                carrierPath,
+                targetPath,
+                cacheControl: carrierControl,
+            },
+        );
+    }
+
+    if (hasOwn(target, CACHE_CONTROL_KEY)) {
+        if (!cacheControlsSemanticallyEqual(target.cache_control, carrierControl)) {
+            throw new CachePolicyError(
+                `Caller cache_control at ${carrierPath} conflicts with the cache_control already present at its marker boundary.`,
+                'CACHE_MARKER_CONTROL_CONFLICT',
+                {
+                    carrierPath,
+                    targetPath,
+                    carrierCacheControl: carrierControl,
+                    targetCacheControl: cloneJson(target.cache_control),
+                },
+            );
+        }
+
+        return false;
+    }
+
+    target.cache_control = carrierControl;
+    return true;
+}
+
+function migrateMarkerOnlyContentControls(content, target, source, targetPath = null) {
+    if (!Array.isArray(content)) {
+        return;
+    }
+
+    for (let index = 0; index < content.length; index++) {
+        migrateMarkerCarrierControl(
+            content[index],
+            target,
+            `${source}[${index}].cache_control`,
+            targetPath,
+        );
+    }
+}
+
+function normalizeContent(content, normalization, source, definitions = markerDefinitions()) {
     if (typeof content === 'string') {
-        if (!content.includes(marker)) {
+        if (!containsMarker(content, definitions)) {
             return { content, changed: false };
         }
 
         const nextBlocks = [];
-        splitTextBlock({ type: 'text', text: content }, nextBlocks, normalization, source, marker);
+        splitTextBlock({ type: 'text', text: content }, nextBlocks, normalization, source, definitions);
         return {
             content: nextBlocks.length > 0 ? nextBlocks : '',
             changed: true,
@@ -504,31 +720,41 @@ function normalizeContent(content, normalization, source, marker = MARKER) {
     const nextBlocks = [];
     let changed = false;
 
-    for (const block of content) {
-        if (!isTextBlock(block) || !block.text.includes(marker)) {
+    for (let blockIndex = 0; blockIndex < content.length; blockIndex++) {
+        const block = content[blockIndex];
+
+        if (!isTextBlock(block) || !containsMarker(block.text, definitions)) {
             nextBlocks.push(block);
             continue;
         }
 
         changed = true;
 
-        if (isMarkerOnlyText(block.text, marker)) {
+        if (isMarkerOnlyText(block.text, definitions)) {
+            const target = findPreviousLandableBlock(nextBlocks, definitions);
+            const targetIndex = target ? nextBlocks.lastIndexOf(target) : -1;
+            migrateMarkerCarrierControl(
+                block,
+                target,
+                `${source}[${blockIndex}].cache_control`,
+                targetIndex >= 0 ? `${source}[${targetIndex}].cache_control` : null,
+            );
             addMarkerCandidate(
                 normalization,
-                findPreviousLandableBlock(nextBlocks, marker),
+                target,
                 `${source}:standalone-block`,
-                markerCount(block.text, marker),
+                markerKindCounts(block.text, definitions),
             );
             continue;
         }
 
-        splitTextBlock(block, nextBlocks, normalization, `${source}:inline`, marker);
+        splitTextBlock(block, nextBlocks, normalization, `${source}:inline`, definitions);
     }
 
     return { content: nextBlocks, changed };
 }
 
-function ensureLastTextTarget(message) {
+function ensureLastLandableTarget(message, definitions = markerDefinitions()) {
     if (typeof message?.content === 'string') {
         if (message.content.trim() === '') {
             return null;
@@ -546,7 +772,7 @@ function ensureLastTextTarget(message) {
     for (let index = message.content.length - 1; index >= 0; index--) {
         const block = message.content[index];
 
-        if (isTextBlock(block) && block.text.trim() !== '') {
+        if (isLandableContentBlock(block, definitions)) {
             return block;
         }
     }
@@ -554,13 +780,13 @@ function ensureLastTextTarget(message) {
     return null;
 }
 
-function findPreviousMessageTarget(messages, role) {
+function findPreviousMessageTarget(messages, role, definitions = markerDefinitions()) {
     for (let index = messages.length - 1; index >= 0; index--) {
         if (messages[index]?.role !== role) {
             continue;
         }
 
-        const target = ensureLastTextTarget(messages[index]);
+        const target = ensureLastLandableTarget(messages[index], definitions);
 
         if (target) {
             return target;
@@ -570,9 +796,10 @@ function findPreviousMessageTarget(messages, role) {
     return null;
 }
 
-function normalizeMarkers(body, protocol, marker = MARKER) {
+function normalizeMarkers(body, protocol, definitions = markerDefinitions()) {
     const normalization = {
         body: cloneJson(body),
+        markerDefinitions: definitions,
         rawCandidates: [],
         candidateByTarget: new Map(),
         totalMarkers: 0,
@@ -583,7 +810,7 @@ function normalizeMarkers(body, protocol, marker = MARKER) {
     const nextBody = normalization.body;
 
     if (protocol === 'anthropic' && hasOwn(nextBody, 'system')) {
-        const result = normalizeContent(nextBody.system, normalization, 'system', marker);
+        const result = normalizeContent(nextBody.system, normalization, 'system', definitions);
 
         if (result.changed) {
             normalization.changedGroups.add('system');
@@ -609,11 +836,22 @@ function normalizeMarkers(body, protocol, marker = MARKER) {
             continue;
         }
 
-        const count = countMarkersInContent(message.content, marker);
+        const count = countMarkersInContent(message.content, definitions);
 
-        if (count > 0 && isMarkerOnlyContent(message.content, marker)) {
-            const target = findPreviousMessageTarget(messages, message.role);
-            addMarkerCandidate(normalization, target, `messages[${index}]:standalone-message`, count);
+        if (count > 0 && isMarkerOnlyContent(message.content, definitions)) {
+            const target = findPreviousMessageTarget(messages, message.role, definitions);
+            migrateMarkerOnlyContentControls(
+                message.content,
+                target,
+                `messages[${index}].content`,
+                target ? 'previous-message-boundary.cache_control' : null,
+            );
+            addMarkerCandidate(
+                normalization,
+                target,
+                `messages[${index}]:standalone-message`,
+                markerKindCountsInContent(message.content, definitions),
+            );
             normalization.changedGroups.add(`messages[${index}]`);
 
             if (messageHasNonContentPayload(message)) {
@@ -626,7 +864,7 @@ function normalizeMarkers(body, protocol, marker = MARKER) {
             continue;
         }
 
-        const result = normalizeContent(message.content, normalization, `messages[${index}].content`, marker);
+        const result = normalizeContent(message.content, normalization, `messages[${index}].content`, definitions);
 
         if (result.changed) {
             message.content = result.content;
@@ -653,7 +891,7 @@ const PROMPT_DEFINITION_KEYS = new Set([
     'response_format',
 ]);
 
-function buildBodyMeta(body) {
+function buildBodyMeta(body, definitions = markerDefinitions()) {
     const meta = {};
 
     for (const [key, value] of Object.entries(body || {})) {
@@ -661,18 +899,25 @@ function buildBodyMeta(body) {
             continue;
         }
 
-        meta[key] = normalizeFingerprintValue(value, MARKER, [key]);
+        meta[key] = normalizeFingerprintValue(value, definitions, [key]);
     }
 
     return meta;
 }
 
-function contentUnits(content, basePath, group, messageMeta = null, fingerprintPath = []) {
+function contentUnits(
+    content,
+    basePath,
+    group,
+    messageMeta = null,
+    fingerprintPath = [],
+    definitions = markerDefinitions(),
+) {
     if (typeof content === 'string') {
         return [{
             target: null,
             path: basePath,
-            descriptor: { group, messageMeta, value: normalizeFingerprintValue(content, MARKER, fingerprintPath) },
+            descriptor: { group, messageMeta, value: normalizeFingerprintValue(content, definitions, fingerprintPath) },
             logical: content.trim() !== '',
         }];
     }
@@ -687,24 +932,24 @@ function contentUnits(content, basePath, group, messageMeta = null, fingerprintP
         descriptor: {
             group,
             messageMeta,
-            value: normalizeFingerprintValue(block, MARKER, [...fingerprintPath, index]),
+            value: normalizeFingerprintValue(block, definitions, [...fingerprintPath, index]),
         },
         logical: isTextBlock(block) ? block.text.trim() !== '' : block !== undefined && block !== null,
     }));
 }
 
-function enumeratePromptUnits(body, protocol) {
+function enumeratePromptUnits(body, protocol, definitions = markerDefinitions()) {
     const units = [];
 
     if (protocol === 'anthropic') {
-        units.push(...contentUnits(body?.system, 'system', 'system', null, ['system']));
+        units.push(...contentUnits(body?.system, 'system', 'system', null, ['system'], definitions));
     }
 
     for (let index = 0; index < (Array.isArray(body?.messages) ? body.messages.length : 0); index++) {
         const message = body.messages[index];
         const messageMeta = normalizeFingerprintValue(
             isObject(message) ? Object.fromEntries(Object.entries(message).filter(([key]) => key !== 'content')) : message,
-            MARKER,
+            definitions,
             ['messages', index],
         );
         units.push({
@@ -719,6 +964,7 @@ function enumeratePromptUnits(body, protocol) {
             `message:${index}`,
             null,
             ['messages', index, 'content'],
+            definitions,
         ));
     }
 
@@ -727,10 +973,11 @@ function enumeratePromptUnits(body, protocol) {
 
 function finalizeCandidates(normalization, protocol) {
     const rawByTarget = normalization.candidateByTarget;
-    const units = enumeratePromptUnits(normalization.body, protocol);
+    const units = enumeratePromptUnits(normalization.body, protocol, normalization.markerDefinitions);
     const prefix = [];
+    const boundaryMarkerHistory = [];
     const candidates = [];
-    const meta = buildBodyMeta(normalization.body);
+    const meta = buildBodyMeta(normalization.body, normalization.markerDefinitions);
     let logicalIndex = 0;
 
     for (const unit of units) {
@@ -746,7 +993,15 @@ function finalizeCandidates(normalization, protocol) {
             continue;
         }
 
-        const prefixHash = hashCanonical({ meta, prefix });
+        boundaryMarkerHistory.push({
+            prefixLength: prefix.length,
+            markerKinds: [...raw.markerKinds],
+        });
+        const prefixHash = hashCanonical({
+            meta,
+            prefix,
+            boundaryMarkerHistory,
+        });
         candidates.push({
             ...raw,
             order: candidates.length,
@@ -844,24 +1099,75 @@ function collectCacheControls(root) {
     return { controls, byTarget };
 }
 
-function hasMarkerDeep(value, marker = MARKER) {
+function getEffectiveClaudeCacheTtl(cacheControl) {
+    if (!hasOwn(cacheControl, 'ttl') || cacheControl.ttl === '5m') {
+        return '5m';
+    }
+
+    if (cacheControl.ttl === '1h') {
+        return '1h';
+    }
+
+    return null;
+}
+
+function describeCacheControlTtls(controls) {
+    return controls.map((control) => ({
+        path: control.path,
+        effectiveTtl: getEffectiveClaudeCacheTtl(control.value),
+        explicitTtl: hasOwn(control.value, 'ttl') ? control.value.ttl : null,
+    }));
+}
+
+function assertClaudeCacheTtlOrder(controls) {
+    let firstFiveMinuteControl = null;
+
+    for (const control of controls) {
+        const effectiveTtl = getEffectiveClaudeCacheTtl(control.value);
+
+        if (effectiveTtl === '5m' && firstFiveMinuteControl === null) {
+            firstFiveMinuteControl = control;
+            continue;
+        }
+
+        if (effectiveTtl === '1h' && firstFiveMinuteControl !== null) {
+            const ttlOrder = describeCacheControlTtls(controls);
+            throw new CachePolicyError(
+                `Invalid cache TTL order: 1h cache_control at ${control.path} appears after 5m cache_control at ${firstFiveMinuteControl.path}. Claude requires every 1h cache breakpoint to appear before all 5m breakpoints.`,
+                'CACHE_TTL_ORDER_INVALID',
+                {
+                    firstFiveMinutePath: firstFiveMinuteControl.path,
+                    laterOneHourPath: control.path,
+                    paths: controls.map((item) => item.path),
+                    ttlOrder,
+                },
+            );
+        }
+    }
+
+    return describeCacheControlTtls(controls);
+}
+
+function hasMarkerDeep(value, definitions = markerDefinitions()) {
     if (typeof value === 'string') {
-        return value.includes(marker);
+        return containsMarker(value, definitions);
     }
 
     if (Array.isArray(value)) {
-        return value.some((item) => hasMarkerDeep(item, marker));
+        return value.some((item) => hasMarkerDeep(item, definitions));
     }
 
     if (!isObject(value)) {
         return false;
     }
 
-    return Object.values(value).some((child) => hasMarkerDeep(child, marker));
+    return Object.values(value).some((child) => hasMarkerDeep(child, definitions));
 }
 
 export function assertCachePlan(body, options = {}) {
     const marker = options.marker ?? MARKER;
+    const shortMarker = options.shortMarker ?? SHORT_MARKER;
+    const definitions = markerDefinitions(marker, shortMarker);
     const maxBreakpoints = options.maxBreakpoints ?? MAX_BREAKPOINTS;
     const translationEnabled = options.translationEnabled !== false;
     const { controls } = collectCacheControls(body);
@@ -874,7 +1180,9 @@ export function assertCachePlan(body, options = {}) {
         );
     }
 
-    if (translationEnabled && hasMarkerDeep(body, marker)) {
+    const cacheControlTtls = assertClaudeCacheTtlOrder(controls);
+
+    if (translationEnabled && hasMarkerDeep(body, definitions)) {
         throw new CachePolicyError(
             'Cache marker remained after cache policy transformation.',
             'CACHE_MARKER_REMAINING',
@@ -883,8 +1191,9 @@ export function assertCachePlan(body, options = {}) {
 
     return {
         cacheControlCount: controls.length,
-        markerRemaining: hasMarkerDeep(body, marker),
+        markerRemaining: hasMarkerDeep(body, definitions),
         cacheControlPaths: controls.map((control) => control.path),
+        cacheControlTtls,
     };
 }
 
@@ -1295,6 +1604,54 @@ function resolveCacheControl(cacheControl) {
     return cloneJson(value ?? { type: 'ephemeral' });
 }
 
+function normalizeCacheControlSemantics(cacheControl) {
+    const normalized = cloneJson(cacheControl);
+
+    if (!isPromptCacheControlValue(normalized)) {
+        return normalized;
+    }
+
+    const effectiveTtl = getEffectiveClaudeCacheTtl(normalized);
+
+    if (effectiveTtl !== null) {
+        normalized.ttl = effectiveTtl;
+    }
+
+    return normalized;
+}
+
+function cacheControlsSemanticallyEqual(left, right) {
+    return canonicalStringify(normalizeCacheControlSemantics(left))
+        === canonicalStringify(normalizeCacheControlSemantics(right));
+}
+
+function resolveCandidateCacheControl(candidate, options) {
+    if (typeof options.cacheControlForCandidate !== 'function') {
+        return resolveCacheControl(options.cacheControl);
+    }
+
+    const resolved = candidate.markerKinds.map((markerKind) => ({
+        markerKind,
+        value: resolveCacheControl(() => options.cacheControlForCandidate(candidate, markerKind)),
+    }));
+    const firstResolved = resolved[0]?.value;
+    const hasConflict = resolved.some((item) => !cacheControlsSemanticallyEqual(item.value, firstResolved));
+
+    if (hasConflict) {
+        throw new CachePolicyError(
+            `Cache boundary at ${candidate.path} contains marker kinds that resolve to different cache_control values. Use only one marker kind at a boundary.`,
+            'CACHE_MARKER_KIND_CONFLICT',
+            {
+                path: candidate.path,
+                markerKinds: [...candidate.markerKinds],
+                resolvedCacheControls: resolved,
+            },
+        );
+    }
+
+    return resolved[0]?.value ?? resolveCacheControl(options.cacheControl);
+}
+
 function semanticCachePathRank(path) {
     if (path.startsWith('tools[') || path.startsWith('functions[')) {
         return 0;
@@ -1315,10 +1672,11 @@ function sortBreakpointDiagnostics(items) {
     return items.sort((left, right) => semanticCachePathRank(left.path) - semanticCachePathRank(right.path));
 }
 
-function disabledPlan(body, protocol, policy, marker, maxBreakpoints) {
+function disabledPlan(body, protocol, policy, marker, shortMarker, maxBreakpoints) {
     const nextBody = cloneJson(body);
     const assertion = assertCachePlan(nextBody, {
         marker,
+        shortMarker,
         maxBreakpoints,
         translationEnabled: false,
     });
@@ -1375,27 +1733,36 @@ export function planCacheBreaks(body, options = {}) {
     const protocol = normalizeProtocol(options.protocol);
     const policy = normalizeCachePolicy(options.policy);
     const marker = options.marker ?? MARKER;
+    const shortMarker = options.shortMarker ?? SHORT_MARKER;
+    const definitions = markerDefinitions(marker, shortMarker);
     const maxBreakpoints = options.maxBreakpoints ?? MAX_BREAKPOINTS;
     const enabled = options.enabled !== false;
 
     if (!enabled) {
-        return disabledPlan(body, protocol, policy, marker, maxBreakpoints);
+        return disabledPlan(body, protocol, policy, marker, shortMarker, maxBreakpoints);
     }
 
     // Validate the caller-owned controls before marker normalization can remove
     // an otherwise empty marker carrier.
     assertCachePlan(body, {
         marker,
+        shortMarker,
         maxBreakpoints,
         translationEnabled: false,
     });
 
-    const normalization = normalizeMarkers(body, protocol, marker);
+    const normalization = normalizeMarkers(body, protocol, definitions);
     const candidates = finalizeCandidates(normalization, protocol);
     const existing = collectCacheControls(normalization.body);
+    const candidateCacheControls = new Map();
 
     if (existing.controls.length > maxBreakpoints) {
-        assertCachePlan(normalization.body, { marker, maxBreakpoints, translationEnabled: false });
+        assertCachePlan(normalization.body, {
+            marker,
+            shortMarker,
+            maxBreakpoints,
+            translationEnabled: false,
+        });
     }
 
     const legacyMode = policy.fixedHeadBreakpointCount === 0 && policy.cacheAnchorMode === 'off';
@@ -1405,10 +1772,50 @@ export function planCacheBreaks(body, options = {}) {
     let injected = 0;
     let pauseReason = null;
 
+    function getCandidateCacheControl(candidate) {
+        if (!candidateCacheControls.has(candidate.target)) {
+            candidateCacheControls.set(candidate.target, resolveCandidateCacheControl(candidate, options));
+        }
+
+        return candidateCacheControls.get(candidate.target);
+    }
+
+    function validateExistingCandidateControl(candidate) {
+        const existingControl = existing.byTarget.get(candidate.target);
+
+        if (!existingControl || typeof options.cacheControlForCandidate !== 'function') {
+            return;
+        }
+
+        const expectedCacheControl = getCandidateCacheControl(candidate);
+
+        if (!cacheControlsSemanticallyEqual(existingControl.value, expectedCacheControl)) {
+            throw new CachePolicyError(
+                `Caller cache_control at ${existingControl.path} conflicts with the cache marker at the same boundary.`,
+                'CACHE_MARKER_EXISTING_CONTROL_CONFLICT',
+                {
+                    path: existingControl.path,
+                    markerKinds: [...candidate.markerKinds],
+                    existingCacheControl: existingControl.value,
+                    expectedCacheControl,
+                },
+            );
+        }
+    }
+
+    // Caller-owned cache controls are already present on the final wire and
+    // therefore selected regardless of the gateway's remaining four-point
+    // budget. Validate every marker that lands on one before policy traversal.
+    for (const candidate of candidates) {
+        validateExistingCandidateControl(candidate);
+    }
+
     function selectCandidate(candidate, reason) {
         if (!selectedTargets.has(candidate.target) && selectedTargets.size >= maxBreakpoints) {
             return false;
         }
+
+        const expectedCacheControl = getCandidateCacheControl(candidate);
 
         const reasons = selectionReasons.get(candidate.target) || [];
 
@@ -1422,7 +1829,7 @@ export function planCacheBreaks(body, options = {}) {
             return true;
         }
 
-        candidate.target.cache_control = resolveCacheControl(options.cacheControl);
+        candidate.target.cache_control = expectedCacheControl;
         selectedTargets.add(candidate.target);
         injected++;
         return true;
@@ -1430,9 +1837,7 @@ export function planCacheBreaks(body, options = {}) {
 
     if (legacyMode) {
         for (const candidate of candidates) {
-            if (!selectCandidate(candidate, existing.byTarget.has(candidate.target) ? 'existing-control' : 'legacy-head')) {
-                break;
-            }
+            selectCandidate(candidate, existing.byTarget.has(candidate.target) ? 'existing-control' : 'legacy-head');
         }
     }
 
@@ -1540,6 +1945,7 @@ export function planCacheBreaks(body, options = {}) {
 
     const assertion = assertCachePlan(normalization.body, {
         marker,
+        shortMarker,
         maxBreakpoints,
         translationEnabled: true,
     });
@@ -1559,6 +1965,8 @@ export function planCacheBreaks(body, options = {}) {
             prefixHash: candidate.prefixHash,
             contextHash: candidate.prefixHash.slice(0, 12),
             markerCount: candidate.markerCount,
+            markerKinds: [...candidate.markerKinds],
+            markerKindCounts: { ...candidate.markerKindCounts },
             sources: [...candidate.sources],
             selected,
             reason: reasons[0] || 'overflow',
@@ -1591,6 +1999,7 @@ export function planCacheBreaks(body, options = {}) {
                 prefixHash: candidate.prefixHash,
                 contextHash: candidate.contextHash,
                 logicalIndex: candidate.logicalIndex,
+                markerKinds: [...candidate.markerKinds],
             };
         }
 
@@ -1604,6 +2013,7 @@ export function planCacheBreaks(body, options = {}) {
             prefixHash: null,
             contextHash: null,
             logicalIndex: null,
+            markerKinds: [],
         };
     });
     sortBreakpointDiagnostics(selectedBreakpoints);

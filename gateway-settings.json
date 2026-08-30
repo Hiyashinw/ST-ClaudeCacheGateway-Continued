@@ -1,11 +1,11 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 6,
   "cacheTranslationEnabled": true,
-  "autoGenerateCacheBreakpoints": true,
+  "autoGenerateCacheBreakpointsMode": "auto",
   "captureRequests": true,
-  "cacheTtl": "1h",
+  "cacheTtl": "manual",
   "fixedHeadBreakpointCount": 1,
-  "cacheAnchorMode": "off",
+  "cacheAnchorMode": "rolling",
   "cacheAnchorIntervalBlocks": 3,
   "activeChannelId": "pioneer",
   "channels": [

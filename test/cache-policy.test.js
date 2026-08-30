@@ -5,6 +5,7 @@ import {
     AnchorStore,
     CachePolicyError,
     MARKER,
+    SHORT_MARKER,
     assertCachePlan,
     canonicalStringify,
     countCacheControls,
@@ -109,6 +110,12 @@ test('automatic preprocessing is disabled by default and never mutates its calle
     assert.notEqual(byDefault.body, input);
     assert.deepEqual(byDefault.diagnostics, {
         enabled: false,
+        mode: 'off',
+        requestedMode: 'off',
+        suppressed: false,
+        suppressionReason: null,
+        explicitMarkerCount: 0,
+        existingCacheControlCount: 0,
         protocol: 'openai',
         added: 0,
         alreadyMarked: 0,
@@ -237,6 +244,482 @@ test('automatic markers still normalize away and obey the final four-point limit
     assert.doesNotThrow(() => assertCachePlan(plan.body));
 });
 
+test('automatic mode generates only when the original request has no explicit cache breakpoint', () => {
+    const plain = {
+        model: 'test-model',
+        messages: [
+            { role: 'system', content: 'system' },
+            { role: 'assistant', content: 'assistant' },
+        ],
+    };
+    const generated = preprocessAutomaticCacheBreaks(plain, { protocol: 'openai', mode: 'auto' });
+
+    assert.equal(generated.diagnostics.enabled, true);
+    assert.equal(generated.diagnostics.suppressed, false);
+    assert.equal(generated.diagnostics.added, 2);
+
+    const explicitMarker = structuredClone(plain);
+    explicitMarker.messages[1].content += SHORT_MARKER;
+    const markerSuppressed = preprocessAutomaticCacheBreaks(explicitMarker, { protocol: 'openai', mode: 'auto' });
+
+    assert.equal(markerSuppressed.diagnostics.enabled, false);
+    assert.equal(markerSuppressed.diagnostics.suppressed, true);
+    assert.equal(markerSuppressed.diagnostics.suppressionReason, 'explicit-marker');
+    assert.equal(markerSuppressed.diagnostics.explicitMarkerCount, 1);
+    assert.equal(markerSuppressed.diagnostics.added, 0);
+    assert.deepEqual(markerSuppressed.body, explicitMarker);
+
+    const explicitControl = structuredClone(plain);
+    explicitControl.messages[1].content = [{
+        type: 'text',
+        text: 'assistant',
+        cache_control: { type: 'ephemeral', ttl: '5m' },
+    }];
+    const controlSuppressed = preprocessAutomaticCacheBreaks(explicitControl, {
+        protocol: 'openai',
+        mode: 'auto',
+    });
+
+    assert.equal(controlSuppressed.diagnostics.enabled, false);
+    assert.equal(controlSuppressed.diagnostics.suppressionReason, 'existing-cache-control');
+    assert.equal(controlSuppressed.diagnostics.existingCacheControlCount, 1);
+    assert.equal(controlSuppressed.diagnostics.added, 0);
+});
+
+test('forced automatic mode treats either marker kind at a target tail as already marked', () => {
+    const input = {
+        model: 'test-model',
+        messages: [
+            { role: 'system', content: `system${SHORT_MARKER}` },
+            { role: 'assistant', content: [{ type: 'text', text: SHORT_MARKER }] },
+            { role: 'assistant', content: 'unmarked' },
+        ],
+    };
+    const result = preprocessAutomaticCacheBreaks(input, { protocol: 'openai', mode: 'on' });
+
+    assert.equal(result.diagnostics.enabled, true);
+    assert.equal(result.diagnostics.alreadyMarked, 2);
+    assert.equal(result.diagnostics.added, 1);
+    assert.equal(result.body.messages[0].content, input.messages[0].content);
+    assert.deepEqual(result.body.messages[1].content, input.messages[1].content);
+    assert.equal(result.body.messages[2].content, `unmarked${MARKER}`);
+    assert.throws(
+        () => preprocessAutomaticCacheBreaks(input, { protocol: 'openai', mode: 'sometimes' }),
+        (error) => error instanceof CachePolicyError
+            && error.code === 'INVALID_AUTOMATIC_CACHE_BREAKPOINT_MODE',
+    );
+});
+
+test('manual marker kinds map to native long and short TTLs across supported content forms', () => {
+    const body = {
+        model: 'claude-test',
+        system: `system${MARKER}`,
+        messages: [
+            { role: 'user', content: `inline${MARKER}` },
+            {
+                role: 'assistant',
+                content: [
+                    { type: 'tool_use', id: 'tool-1', name: 'lookup', input: {} },
+                    { type: 'text', text: SHORT_MARKER },
+                ],
+            },
+            { role: 'assistant', content: SHORT_MARKER },
+        ],
+    };
+    const resolver = (_candidate, markerKind) => ({
+        type: 'ephemeral',
+        ttl: markerKind === 'short' ? '5m' : '1h',
+    });
+    const plan = planCacheBreaks(body, {
+        protocol: 'anthropic',
+        policy: OFF_POLICY,
+        cacheControlForCandidate: resolver,
+    });
+
+    assert.deepEqual(plan.body.system[0].cache_control, { type: 'ephemeral', ttl: '1h' });
+    assert.deepEqual(plan.body.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' });
+    assert.deepEqual(plan.body.messages[1].content[0].cache_control, { type: 'ephemeral', ttl: '5m' });
+    assert.equal(plan.body.messages.length, 2, 'standalone message with the same role lands on the prior assistant message');
+    assert.equal(plan.diagnostics.removed, 4);
+    assert.deepEqual(
+        plan.diagnostics.candidates.map((candidate) => candidate.markerKinds),
+        [['long'], ['long'], ['short']],
+    );
+    assert.equal(JSON.stringify(plan.body).includes(MARKER), false);
+    assert.equal(JSON.stringify(plan.body).includes(SHORT_MARKER), false);
+    assert.doesNotThrow(() => assertCachePlan(plan.body));
+});
+
+test('both marker kinds follow the global TTL outside manual mode', () => {
+    const body = {
+        model: 'test-model',
+        messages: [
+            { role: 'user', content: `long${MARKER}` },
+            { role: 'user', content: `short${SHORT_MARKER}` },
+            { role: 'user', content: `same-boundary${MARKER}${SHORT_MARKER}` },
+        ],
+    };
+    const plan = planCacheBreaks(body, {
+        policy: OFF_POLICY,
+        cacheControl: { type: 'ephemeral', ttl: '1h' },
+    });
+
+    assert.equal(plan.diagnostics.cacheControlCount, 3);
+    assert.equal(plan.diagnostics.candidates[2].markerCount, 2);
+    assert.deepEqual(plan.diagnostics.candidates[2].markerKinds, ['long', 'short']);
+    assert.deepEqual(
+        plan.body.messages.map((message) => message.content[0].cache_control),
+        Array.from({ length: 3 }, () => ({ type: 'ephemeral', ttl: '1h' })),
+    );
+});
+
+test('manual mode rejects ambiguous marker kinds and conflicting caller controls', () => {
+    const resolver = (_candidate, markerKind) => ({
+        type: 'ephemeral',
+        ttl: markerKind === 'short' ? '5m' : '1h',
+    });
+    const mixedBoundary = {
+        messages: [{ role: 'user', content: `mixed${MARKER}${SHORT_MARKER}` }],
+    };
+
+    assert.throws(
+        () => planCacheBreaks(mixedBoundary, {
+            policy: OFF_POLICY,
+            cacheControlForCandidate: resolver,
+        }),
+        (error) => error instanceof CachePolicyError
+            && error.code === 'CACHE_MARKER_KIND_CONFLICT'
+            && error.details.markerKinds.join(',') === 'long,short',
+    );
+
+    const existingConflict = {
+        messages: [{
+            role: 'user',
+            content: [{
+                type: 'text',
+                text: `short${SHORT_MARKER}`,
+                cache_control: { type: 'ephemeral', ttl: '1h' },
+            }],
+        }],
+    };
+
+    assert.throws(
+        () => planCacheBreaks(existingConflict, {
+            policy: OFF_POLICY,
+            cacheControlForCandidate: resolver,
+        }),
+        (error) => error instanceof CachePolicyError
+            && error.code === 'CACHE_MARKER_EXISTING_CONTROL_CONFLICT'
+            && error.details.existingCacheControl.ttl === '1h'
+            && error.details.expectedCacheControl.ttl === '5m',
+    );
+    assert.deepEqual(existingConflict.messages[0].content[0].cache_control, {
+        type: 'ephemeral',
+        ttl: '1h',
+    }, 'caller-owned controls must not be rewritten');
+});
+
+test('manual short marker accepts a caller control with omitted ttl as the same effective 5m window', () => {
+    const body = {
+        messages: [{
+            role: 'user',
+            content: [{
+                type: 'text',
+                text: `short${SHORT_MARKER}`,
+                cache_control: { type: 'ephemeral' },
+            }],
+        }],
+    };
+    const original = structuredClone(body);
+    const plan = planCacheBreaks(body, {
+        policy: OFF_POLICY,
+        cacheControlForCandidate: (_candidate, markerKind) => ({
+            type: 'ephemeral',
+            ttl: markerKind === 'short' ? '5m' : '1h',
+        }),
+    });
+
+    assert.deepEqual(plan.body.messages[0].content[0].cache_control, { type: 'ephemeral' });
+    assert.equal(plan.diagnostics.injected, 0);
+    assert.deepEqual(plan.diagnostics.candidates[0].reasons, ['existing-control']);
+    assert.equal(assertCachePlan(plan.body).cacheControlTtls[0].effectiveTtl, '5m');
+    assert.deepEqual(body, original, 'planning must preserve the caller request and its control');
+});
+
+test('manual mode validates a later existing-control marker even when earlier overflow fills legacy traversal', () => {
+    const controlledBlock = (text, marker = '') => ({
+        role: 'user',
+        content: [{
+            type: 'text',
+            text: `${text}${marker}`,
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+        }],
+    });
+    const body = {
+        model: 'test-model',
+        messages: [
+            { role: 'user', content: `overflow-first${MARKER}` },
+            controlledBlock('B'),
+            controlledBlock('C'),
+            controlledBlock('D'),
+            controlledBlock('conflicting-short', SHORT_MARKER),
+        ],
+    };
+
+    assert.throws(
+        () => planCacheBreaks(body, {
+            policy: OFF_POLICY,
+            cacheControlForCandidate: (_candidate, markerKind) => ({
+                type: 'ephemeral',
+                ttl: markerKind === 'short' ? '5m' : '1h',
+            }),
+        }),
+        (error) => error instanceof CachePolicyError
+            && error.code === 'CACHE_MARKER_EXISTING_CONTROL_CONFLICT'
+            && error.details.path === 'messages[4].content[0].cache_control',
+    );
+});
+
+test('standalone marker-block controls migrate to Anthropic system and whole-message boundaries', () => {
+    const body = {
+        model: 'test-model',
+        system: [
+            { type: 'text', text: 'system' },
+            {
+                type: 'text',
+                text: SHORT_MARKER,
+                cache_control: { type: 'ephemeral' },
+            },
+        ],
+        messages: [
+            { role: 'assistant', content: 'assistant' },
+            {
+                role: 'assistant',
+                content: [{
+                    type: 'text',
+                    text: SHORT_MARKER,
+                    cache_control: { type: 'ephemeral', ttl: '5m' },
+                }],
+            },
+        ],
+    };
+    const plan = planCacheBreaks(body, {
+        protocol: 'anthropic',
+        policy: OFF_POLICY,
+        cacheControlForCandidate: (_candidate, markerKind) => ({
+            type: 'ephemeral',
+            ttl: markerKind === 'short' ? '5m' : '1h',
+        }),
+    });
+
+    assert.equal(plan.body.system.length, 1);
+    assert.deepEqual(plan.body.system[0].cache_control, { type: 'ephemeral' });
+    assert.equal(plan.body.messages.length, 1);
+    assert.deepEqual(plan.body.messages[0].content[0].cache_control, {
+        type: 'ephemeral',
+        ttl: '5m',
+    });
+    assert.equal(plan.diagnostics.existingBreakpoints, 2);
+    assert.equal(plan.diagnostics.injected, 0);
+    assert.equal(JSON.stringify(plan.body).includes(SHORT_MARKER), false);
+});
+
+test('long and short standalone marker messages land after tool-use and media blocks', () => {
+    const body = {
+        model: 'test-model',
+        messages: [
+            {
+                role: 'assistant',
+                content: [{ type: 'tool_use', id: 'tool-1', name: 'lookup', input: {} }],
+            },
+            { role: 'assistant', content: MARKER },
+            {
+                role: 'user',
+                content: [{
+                    type: 'image',
+                    source: { type: 'base64', media_type: 'image/png', data: 'AA==' },
+                }],
+            },
+            { role: 'user', content: [{ type: 'text', text: SHORT_MARKER }] },
+        ],
+    };
+    const original = structuredClone(body);
+    const plan = planCacheBreaks(body, {
+        protocol: 'anthropic',
+        policy: OFF_POLICY,
+        cacheControlForCandidate: (_candidate, markerKind) => ({
+            type: 'ephemeral',
+            ttl: markerKind === 'short' ? '5m' : '1h',
+        }),
+    });
+
+    assert.equal(plan.body.messages.length, 2);
+    assert.deepEqual(plan.body.messages[0].content[0].cache_control, {
+        type: 'ephemeral',
+        ttl: '1h',
+    });
+    assert.deepEqual(plan.body.messages[1].content[0].cache_control, {
+        type: 'ephemeral',
+        ttl: '5m',
+    });
+    assert.deepEqual(
+        plan.diagnostics.candidates.map((candidate) => candidate.markerKinds),
+        [['long'], ['short']],
+    );
+    assert.equal(plan.diagnostics.removedEmptyMessages, 2);
+    assert.equal(JSON.stringify(plan.body).includes(MARKER), false);
+    assert.equal(JSON.stringify(plan.body).includes(SHORT_MARKER), false);
+    assert.deepEqual(body, original, 'planning must not mutate non-text caller blocks');
+});
+
+test('a migrated standalone marker control remains visible to Manual TTL conflict validation', () => {
+    const body = {
+        system: [
+            { type: 'text', text: 'system' },
+            {
+                type: 'text',
+                text: SHORT_MARKER,
+                cache_control: { type: 'ephemeral', ttl: '1h' },
+            },
+        ],
+        messages: [],
+    };
+
+    assert.throws(
+        () => planCacheBreaks(body, {
+            protocol: 'anthropic',
+            policy: OFF_POLICY,
+            cacheControlForCandidate: (_candidate, markerKind) => ({
+                type: 'ephemeral',
+                ttl: markerKind === 'short' ? '5m' : '1h',
+            }),
+        }),
+        (error) => error instanceof CachePolicyError
+            && error.code === 'CACHE_MARKER_EXISTING_CONTROL_CONFLICT'
+            && error.details.path === 'system[0].cache_control',
+    );
+});
+
+test('standalone marker control rejects an incompatible target control instead of overwriting it', () => {
+    const body = {
+        system: [
+            {
+                type: 'text',
+                text: 'system',
+                cache_control: { type: 'ephemeral', ttl: '1h' },
+            },
+            {
+                type: 'text',
+                text: MARKER,
+                cache_control: { type: 'ephemeral', ttl: '5m' },
+            },
+        ],
+        messages: [],
+    };
+
+    assert.throws(
+        () => planCacheBreaks(body, { protocol: 'anthropic', policy: OFF_POLICY }),
+        (error) => error instanceof CachePolicyError
+            && error.code === 'CACHE_MARKER_CONTROL_CONFLICT'
+            && error.details.targetPath === 'system[0].cache_control',
+    );
+    assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral', ttl: '1h' });
+});
+
+test('standalone marker control without a preceding target fails explicitly', () => {
+    const body = {
+        system: [{
+            type: 'text',
+            text: SHORT_MARKER,
+            cache_control: { type: 'ephemeral', ttl: '5m' },
+        }],
+        messages: [],
+    };
+
+    assert.throws(
+        () => planCacheBreaks(body, { protocol: 'anthropic', policy: OFF_POLICY }),
+        (error) => error instanceof CachePolicyError
+            && error.code === 'CACHE_MARKER_CONTROL_TARGET_MISSING'
+            && error.details.carrierPath === 'system[0].cache_control',
+    );
+});
+
+test('an ambiguous manual marker boundary discarded by the four-point budget does not block the request', () => {
+    const body = {
+        model: 'test-model',
+        messages: [
+            ...['A', 'B', 'C', 'D'].map((text) => ({
+                role: 'user',
+                content: `${text}${MARKER}`,
+            })),
+            { role: 'user', content: `overflow${MARKER}${SHORT_MARKER}` },
+        ],
+    };
+    const plan = planCacheBreaks(body, {
+        policy: OFF_POLICY,
+        cacheControlForCandidate: (_candidate, markerKind) => ({
+            type: 'ephemeral',
+            ttl: markerKind === 'short' ? '5m' : '1h',
+        }),
+    });
+
+    assert.equal(plan.diagnostics.cacheControlCount, 4);
+    assert.equal(plan.diagnostics.candidates.at(-1).selected, false);
+    assert.deepEqual(plan.diagnostics.candidates.at(-1).markerKinds, ['long', 'short']);
+    assert.equal(JSON.stringify(plan.body).includes(MARKER), false);
+    assert.equal(JSON.stringify(plan.body).includes(SHORT_MARKER), false);
+});
+
+test('marker kind participates in the anchor boundary fingerprint', () => {
+    const policy = {
+        fixedHeadBreakpointCount: 0,
+        cacheAnchorMode: 'single',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const store = new AnchorStore();
+    const longPlan = planCacheBreaks({
+        model: 'test-model',
+        messages: [{ role: 'user', content: `same${MARKER}` }],
+    }, { policy, store });
+    longPlan.commit();
+    const shortPlan = planCacheBreaks({
+        model: 'test-model',
+        messages: [{ role: 'user', content: `same${SHORT_MARKER}` }],
+    }, { policy, store });
+
+    assert.notEqual(
+        longPlan.diagnostics.candidates[0].prefixHash,
+        shortPlan.diagnostics.candidates[0].prefixHash,
+    );
+    assert.equal(shortPlan.diagnostics.matchedContextId, null);
+    assert.equal(shortPlan.diagnostics.anchorAction, 'learn');
+});
+
+test('a later anchor fingerprint includes the marker-kind history of earlier boundaries', () => {
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'single',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const store = new AnchorStore();
+    const makeBody = (firstMarker) => ({
+        model: 'test-model',
+        messages: [
+            { role: 'user', content: `A${firstMarker}` },
+            { role: 'user', content: `B${MARKER}` },
+        ],
+    });
+    const first = planCacheBreaks(makeBody(MARKER), { policy, store });
+    const originalLaterHash = first.diagnostics.candidates[1].prefixHash;
+    first.commit();
+
+    const changedEarlierKind = planCacheBreaks(makeBody(SHORT_MARKER), { policy, store });
+
+    assert.notEqual(changedEarlierKind.diagnostics.candidates[1].prefixHash, originalLaterHash);
+    assert.equal(changedEarlierKind.diagnostics.matchedContextId, null);
+    assert.equal(changedEarlierKind.diagnostics.anchorAction, 'learn');
+});
+
 test('legacy mode preserves the first four marker boundaries', () => {
     const input = blockBody('ABCDEFG');
     const original = structuredClone(input);
@@ -362,6 +845,75 @@ test('existing cache_control entries reserve budget and are represented in selec
     assert.equal(plan.diagnostics.selectedBreakpoints[0].path, 'tools[0].cache_control');
     assert.equal(assertCachePlan(plan.body).cacheControlPaths[0], 'tools[0].cache_control');
     assert.deepEqual(selectedTexts(plan.body), ['A', 'B', 'C']);
+});
+
+test('cache TTL ordering follows tools then system then messages and allows 1h before 5m', () => {
+    const body = {
+        model: 'ttl-order-valid',
+        // Deliberately use a non-semantic root insertion order. The cache
+        // collector must still evaluate Claude's tools -> system -> messages order.
+        messages: [{
+            role: 'user',
+            content: [{ type: 'text', text: 'M', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+        }],
+        system: [{ type: 'text', text: 'S', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+        tools: [{
+            name: 'lookup',
+            input_schema: { type: 'object' },
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+        }],
+    };
+
+    const assertion = assertCachePlan(body);
+    assert.deepEqual(assertion.cacheControlPaths, [
+        'tools[0].cache_control',
+        'system[0].cache_control',
+        'messages[0].content[0].cache_control',
+    ]);
+    assert.deepEqual(
+        assertion.cacheControlTtls.map(({ effectiveTtl }) => effectiveTtl),
+        ['1h', '1h', '5m'],
+    );
+});
+
+test('cache TTL ordering treats omitted ttl as 5m and reports the later 1h paths', () => {
+    const body = {
+        model: 'ttl-order-invalid',
+        system: [{ type: 'text', text: 'S', cache_control: { type: 'ephemeral' } }],
+        messages: [{
+            role: 'user',
+            content: [{ type: 'text', text: 'M', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+        }],
+    };
+
+    assert.throws(
+        () => assertCachePlan(body),
+        (error) => {
+            assert.ok(error instanceof CachePolicyError);
+            assert.equal(error.code, 'CACHE_TTL_ORDER_INVALID');
+            assert.equal(error.statusCode, 400);
+            assert.match(error.message, /1h cache_control.*after 5m cache_control/i);
+            assert.equal(error.details.firstFiveMinutePath, 'system[0].cache_control');
+            assert.equal(error.details.laterOneHourPath, 'messages[0].content[0].cache_control');
+            assert.deepEqual(error.details.paths, [
+                'system[0].cache_control',
+                'messages[0].content[0].cache_control',
+            ]);
+            assert.deepEqual(error.details.ttlOrder, [
+                {
+                    path: 'system[0].cache_control',
+                    effectiveTtl: '5m',
+                    explicitTtl: null,
+                },
+                {
+                    path: 'messages[0].content[0].cache_control',
+                    effectiveTtl: '1h',
+                    explicitTtl: '1h',
+                },
+            ]);
+            return true;
+        },
+    );
 });
 
 test('rejects more than four existing controls even when translation is disabled', () => {

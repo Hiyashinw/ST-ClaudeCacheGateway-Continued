@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import {
     AnchorStore,
     CachePolicyError,
+    SHORT_MARKER,
     assertCachePlan,
     planCacheBreaks,
     preprocessAutomaticCacheBreaks,
@@ -20,7 +21,7 @@ const host = process.env.HOST || '127.0.0.1';
 let channelProfiles = runtimeSettings.channels;
 let activeChannelId = runtimeSettings.activeChannelId;
 let cacheTranslationEnabled = normalizeBoolean(getRuntimeConfigValue('CACHE_TRANSLATION_ENABLED', runtimeSettings.cacheTranslationEnabled, true), true);
-let autoGenerateCacheBreakpoints = normalizeBoolean(runtimeSettings.autoGenerateCacheBreakpoints, false);
+let autoGenerateCacheBreakpointsMode = normalizeAutoGenerateCacheBreakpointsMode(runtimeSettings.autoGenerateCacheBreakpointsMode);
 let fixedHeadBreakpointCount = normalizeFixedHeadBreakpointCount(runtimeSettings.fixedHeadBreakpointCount);
 let cacheAnchorMode = normalizeCacheAnchorMode(runtimeSettings.cacheAnchorMode);
 let cacheAnchorIntervalBlocks = normalizeCacheAnchorIntervalBlocks(runtimeSettings.cacheAnchorIntervalBlocks);
@@ -323,9 +324,13 @@ function migrateRuntimeSettings(rawSettings = {}) {
 
     return {
         ...rawSettings,
-        schemaVersion: 4,
-        cacheTtl: rawSettings.cacheTtl,
-        autoGenerateCacheBreakpoints: normalizeBoolean(rawSettings.autoGenerateCacheBreakpoints, false),
+        schemaVersion: 6,
+        cacheTtl: serializeCacheTtl(normalizeCacheTtl(rawSettings.cacheTtl ?? '1h')),
+        autoGenerateCacheBreakpointsMode: normalizeAutoGenerateCacheBreakpointsMode(
+            Object.prototype.hasOwnProperty.call(rawSettings, 'autoGenerateCacheBreakpointsMode')
+                ? rawSettings.autoGenerateCacheBreakpointsMode
+                : (normalizeBoolean(rawSettings.autoGenerateCacheBreakpoints, false) ? 'on' : 'off'),
+        ),
         captureRequests: normalizeBoolean(rawSettings.captureRequests, false),
         fixedHeadBreakpointCount: normalizeFixedHeadBreakpointCount(rawSettings.fixedHeadBreakpointCount),
         cacheAnchorMode: normalizeCacheAnchorMode(rawSettings.cacheAnchorMode),
@@ -401,9 +406,9 @@ function getChannelState() {
 function saveRuntimeSettings() {
     syncActiveChannelFromRuntime();
     writeFileSync(SETTINGS_FILE, `${JSON.stringify({
-        schemaVersion: 4,
+        schemaVersion: 6,
         cacheTranslationEnabled,
-        autoGenerateCacheBreakpoints,
+        autoGenerateCacheBreakpointsMode,
         captureRequests,
         cacheTtl: getCacheTtlLabel(),
         fixedHeadBreakpointCount,
@@ -468,6 +473,24 @@ function normalizeBoolean(value, defaultValue = false) {
     return defaultValue;
 }
 
+function normalizeAutoGenerateCacheBreakpointsMode(value, { strict = false } = {}) {
+    if (strict && typeof value !== 'string') {
+        throw new Error('mode must be auto, on, or off.');
+    }
+
+    const normalized = String(value ?? 'off').trim().toLowerCase();
+
+    if (['auto', 'on', 'off'].includes(normalized)) {
+        return normalized;
+    }
+
+    if (strict) {
+        throw new Error('mode must be auto, on, or off.');
+    }
+
+    return 'off';
+}
+
 function normalizeFixedHeadBreakpointCount(value, { strict = false } = {}) {
     if (strict && typeof value !== 'number') {
         throw new Error(`fixedHeadBreakpointCount must be an integer from 0 to ${MAX_BREAKPOINTS}.`);
@@ -522,17 +545,36 @@ function normalizeCacheAnchorIntervalBlocks(value, { strict = false } = {}) {
     return number;
 }
 
-function normalizeCacheTtl(ttl) {
-    const normalized = String(ttl || '').trim();
+function normalizeCacheTtl(ttl, { strict = false } = {}) {
+    const normalized = String(ttl ?? '').trim().toLowerCase();
 
-    if (!normalized
-        || normalized.toLowerCase() === 'default'
-        || normalized.toLowerCase() === 'provider-default'
-        || normalized.toLowerCase() === 'none') {
+    if (normalized === 'auto') {
         return '';
     }
 
-    return normalized;
+    if (normalized === '5m' || normalized === '1h' || normalized === 'manual') {
+        return normalized;
+    }
+
+    if (!strict && (!normalized
+        || normalized === 'default'
+        || normalized === 'provider-default'
+        || normalized === 'none')) {
+        return '';
+    }
+
+    if (strict) {
+        throw new Error('ttl must be auto, 5m, 1h, or manual.');
+    }
+
+    // Unknown legacy/environment values must never be forwarded to Claude.
+    // Falling back to Auto keeps requests valid and delegates the lifetime to
+    // the provider instead of silently changing it to another explicit window.
+    return '';
+}
+
+function serializeCacheTtl(ttl) {
+    return ttl || 'auto';
 }
 
 function normalizeUpstreamMode(mode) {
@@ -737,17 +779,26 @@ function getUpstreamExtraJsonKeys() {
 }
 
 function getCacheTtlLabel() {
-    return cacheTtl || 'provider-default';
+    return serializeCacheTtl(cacheTtl);
 }
 
-function getCacheControl() {
+function getCacheControl(ttl = cacheTtl) {
     const cacheControl = { type: 'ephemeral' };
+    const effectiveTtl = ttl === 'manual' ? '1h' : ttl;
 
-    if (cacheTtl) {
-        cacheControl.ttl = cacheTtl;
+    if (effectiveTtl) {
+        cacheControl.ttl = effectiveTtl;
     }
 
     return cacheControl;
+}
+
+function getCacheControlForMarkerKind(markerKind) {
+    if (cacheTtl !== 'manual') {
+        return getCacheControl();
+    }
+
+    return getCacheControl(markerKind === 'short' ? '5m' : '1h');
 }
 
 function getCachePolicy() {
@@ -772,25 +823,36 @@ function getCachePolicyScope(body, protocol) {
 }
 
 function planRequestCache(body, protocol) {
+    const configuredMode = autoGenerateCacheBreakpointsMode;
     const automaticResult = preprocessAutomaticCacheBreaks(body, {
         protocol,
-        enabled: autoGenerateCacheBreakpoints && cacheTranslationEnabled,
+        mode: cacheTranslationEnabled ? configuredMode : 'off',
         marker: MARKER,
     });
+    automaticResult.diagnostics.configuredMode = configuredMode;
+    automaticResult.diagnostics.effectiveEnabled = Boolean(automaticResult.diagnostics.enabled);
 
-    if (autoGenerateCacheBreakpoints && !cacheTranslationEnabled) {
-        automaticResult.diagnostics.configured = true;
+    if (configuredMode !== 'off' && !cacheTranslationEnabled) {
+        automaticResult.diagnostics.requestedMode = configuredMode;
+        automaticResult.diagnostics.suppressed = true;
+        automaticResult.diagnostics.suppressionReason = 'cache-translation-disabled';
         automaticResult.diagnostics.skippedReason = 'cache-translation-disabled';
     }
 
-    const plan = planCacheBreaks(automaticResult.body, {
+    const planOptions = {
         protocol,
         enabled: cacheTranslationEnabled,
         policy: getCachePolicy(),
         scope: getCachePolicyScope(automaticResult.body, protocol),
         store: cacheAnchorStore,
         cacheControl: getCacheControl(),
-    });
+    };
+
+    if (cacheTtl === 'manual') {
+        planOptions.cacheControlForCandidate = (_candidate, markerKind) => getCacheControlForMarkerKind(markerKind);
+    }
+
+    const plan = planCacheBreaks(automaticResult.body, planOptions);
     plan.diagnostics.autoGeneratedBreakpoints = safeJsonClone(automaticResult.diagnostics);
     return plan;
 }
@@ -835,9 +897,13 @@ function getRuntimeState() {
         activeChannel: getSafeChannelProfile(getActiveChannel()),
         channels: channelProfiles.map(getSafeChannelProfile),
         cacheTranslationEnabled,
-        autoGenerateCacheBreakpoints,
+        // Keep the legacy boolean for older console clients while exposing the
+        // configured three-state mode as the canonical setting.
+        autoGenerateCacheBreakpoints: autoGenerateCacheBreakpointsMode !== 'off',
+        autoGenerateCacheBreakpointsMode,
         cacheTtl: getCacheTtlLabel(),
         cacheControl: getCacheControl(),
+        shortCacheControl: getCacheControlForMarkerKind('short'),
         fixedHeadBreakpointCount,
         cacheAnchorMode,
         cacheAnchorIntervalBlocks,
@@ -1406,7 +1472,7 @@ function getCacheDiagnostics(body, mode) {
 
     return {
         bodyHash: getBodyHash(body),
-        markerRemaining: JSON.stringify(body).includes(MARKER),
+        markerRemaining: cacheAssertion.markerRemaining,
         cacheControlCount,
         breakpoints,
         firstCacheControlPath: firstCacheIndex >= 0 ? `${segments[firstCacheIndex].path}.cache_control` : null,
@@ -1793,6 +1859,9 @@ function addRequestCapture({ request, originalBody, convertedBody, result, inbou
         return null;
     }
 
+    const automaticDiagnostics = result?.diagnostics?.autoGeneratedBreakpoints
+        || result?.autoGeneratedBreakpoints
+        || {};
     const capture = {
         id: `${Date.now()}-${requestCaptures.length + 1}`,
         capturedAt: new Date().toISOString(),
@@ -1807,9 +1876,12 @@ function addRequestCapture({ request, originalBody, convertedBody, result, inbou
         gateway: {
             upstreamMode,
             cacheTranslationEnabled,
-            autoGenerateCacheBreakpoints,
+            autoGenerateCacheBreakpoints: autoGenerateCacheBreakpointsMode !== 'off',
+            autoGenerateCacheBreakpointsMode,
+            autoGenerateCacheBreakpointsEffective: Boolean(automaticDiagnostics.enabled),
             cacheTtl: getCacheTtlLabel(),
             cacheControl: getCacheControl(),
+            shortCacheControl: getCacheControlForMarkerKind('short'),
             cachePolicy: safeJsonClone(result?.diagnostics || result || {}),
             upstreamExtraJsonEnabled: getUpstreamExtraJsonKeys().length > 0,
             upstreamExtraJson: safeJsonClone(upstreamExtraJson),
@@ -2843,6 +2915,8 @@ function getCaptureSummary(capture) {
         messages: Array.isArray(upstreamBody?.messages) ? upstreamBody.messages.length : 0,
         cacheTranslationEnabled: capture.gateway?.cacheTranslationEnabled ?? true,
         autoGenerateCacheBreakpoints: capture.gateway?.autoGenerateCacheBreakpoints ?? false,
+        autoGenerateCacheBreakpointsMode: capture.gateway?.autoGenerateCacheBreakpointsMode ?? 'off',
+        autoGenerateCacheBreakpointsEffective: capture.gateway?.autoGenerateCacheBreakpointsEffective ?? false,
         autoGeneratedBreakpointCount: capture.gateway?.cachePolicy?.autoGeneratedBreakpoints?.added ?? 0,
         cacheTtl: capture.gateway?.cacheTtl ?? null,
         inboundMode: capture.inbound?.mode ?? null,
@@ -2998,11 +3072,26 @@ async function handleConsoleApi(request, url) {
     }
 
     if (request.method === 'POST' && url.pathname === '/console/cache-ttl') {
-        const body = await readJsonRequest(request);
-        cacheTtl = normalizeCacheTtl(body?.ttl || '');
-        saveRuntimeSettings();
-        log('Updated cache TTL from console.', { cacheTtl: getCacheTtlLabel(), cacheControl: getCacheControl() });
-        return jsonResponse(getRuntimeState());
+        try {
+            const body = await readJsonRequest(request);
+
+            if (!isPlainObject(body) || !Object.prototype.hasOwnProperty.call(body, 'ttl')) {
+                throw new Error('ttl is required and must be auto, 5m, 1h, or manual.');
+            }
+
+            const nextCacheTtl = normalizeCacheTtl(body.ttl, { strict: true });
+
+            if (nextCacheTtl !== cacheTtl) {
+                cacheTtl = nextCacheTtl;
+                clearPrefixLock();
+            }
+
+            saveRuntimeSettings();
+            log('Updated cache TTL from console.', { cacheTtl: getCacheTtlLabel(), cacheControl: getCacheControl() });
+            return jsonResponse(getRuntimeState());
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
     }
 
     if (request.method === 'POST' && url.pathname === '/console/cache-translation') {
@@ -3014,18 +3103,39 @@ async function handleConsoleApi(request, url) {
     }
 
     if (request.method === 'POST' && url.pathname === '/console/auto-cache-breakpoints') {
-        const body = await readJsonRequest(request);
-        const nextEnabled = normalizeBoolean(body?.enabled, false);
+        try {
+            const body = await readJsonRequest(request);
 
-        if (nextEnabled !== autoGenerateCacheBreakpoints) {
-            autoGenerateCacheBreakpoints = nextEnabled;
-            cacheAnchorStore.clear('auto-breakpoints-changed');
-            clearPrefixLock();
-            saveRuntimeSettings();
+            if (!isPlainObject(body)) {
+                throw new Error('Request body must contain mode (auto, on, or off).');
+            }
+
+            let nextMode;
+
+            if (Object.prototype.hasOwnProperty.call(body, 'mode')) {
+                nextMode = normalizeAutoGenerateCacheBreakpointsMode(body.mode, { strict: true });
+            } else if (Object.prototype.hasOwnProperty.call(body, 'enabled')) {
+                if (typeof body.enabled !== 'boolean') {
+                    throw new Error('enabled must be a boolean when using the legacy interface.');
+                }
+
+                nextMode = body.enabled ? 'on' : 'off';
+            } else {
+                throw new Error('mode is required and must be auto, on, or off.');
+            }
+
+            if (nextMode !== autoGenerateCacheBreakpointsMode) {
+                autoGenerateCacheBreakpointsMode = nextMode;
+                cacheAnchorStore.clear('auto-breakpoints-changed');
+                clearPrefixLock();
+                saveRuntimeSettings();
+            }
+
+            log('Updated automatic cache breakpoint generation.', { autoGenerateCacheBreakpointsMode });
+            return jsonResponse(getRuntimeState());
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
         }
-
-        log('Updated automatic cache breakpoint generation.', { autoGenerateCacheBreakpoints });
-        return jsonResponse(getRuntimeState());
     }
 
     if (request.method === 'POST' && url.pathname === '/console/cache-policy') {
@@ -3263,10 +3373,16 @@ async function handleRequest(request) {
         }
 
         if (error instanceof CachePolicyError) {
-            log('Cache policy rejected request.', { path: url.pathname, code: error.code, message: error.message });
+            log('Cache policy rejected request.', {
+                path: url.pathname,
+                code: error.code,
+                message: error.message,
+                details: error.details,
+            });
             return jsonResponse({
                 error: error.message,
                 code: error.code,
+                details: error.details,
             }, error.statusCode || 400);
         }
 
