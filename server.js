@@ -11,6 +11,7 @@ import {
 
 const MARKER = '[[CACHE_BREAK]]';
 const MAX_BREAKPOINTS = 4;
+const SETTINGS_SCHEMA_VERSION = 9;
 const DEFAULT_UPSTREAM_BASE_URL = 'https://api.pioneer.ai';
 const SETTINGS_FILE = new URL('./gateway-settings.json', import.meta.url);
 const runtimeSettings = migrateRuntimeSettings(loadRuntimeSettings());
@@ -21,6 +22,7 @@ const host = process.env.HOST || '127.0.0.1';
 let channelProfiles = runtimeSettings.channels;
 let activeChannelId = runtimeSettings.activeChannelId;
 let cacheTranslationEnabled = normalizeBoolean(getRuntimeConfigValue('CACHE_TRANSLATION_ENABLED', runtimeSettings.cacheTranslationEnabled, true), true);
+let systemMessageHandlingMode = normalizeSystemMessageHandlingMode(runtimeSettings.systemMessageHandlingMode);
 let autoGenerateCacheBreakpointsMode = normalizeAutoGenerateCacheBreakpointsMode(runtimeSettings.autoGenerateCacheBreakpointsMode);
 let fixedHeadBreakpointCount = normalizeFixedHeadBreakpointCount(runtimeSettings.fixedHeadBreakpointCount);
 let cacheAnchorMode = normalizeCacheAnchorMode(runtimeSettings.cacheAnchorMode);
@@ -324,8 +326,9 @@ function migrateRuntimeSettings(rawSettings = {}) {
 
     return {
         ...rawSettings,
-        schemaVersion: 6,
+        schemaVersion: SETTINGS_SCHEMA_VERSION,
         cacheTtl: serializeCacheTtl(normalizeCacheTtl(rawSettings.cacheTtl ?? '1h')),
+        systemMessageHandlingMode: migrateSystemMessageHandlingMode(rawSettings),
         autoGenerateCacheBreakpointsMode: normalizeAutoGenerateCacheBreakpointsMode(
             Object.prototype.hasOwnProperty.call(rawSettings, 'autoGenerateCacheBreakpointsMode')
                 ? rawSettings.autoGenerateCacheBreakpointsMode
@@ -406,8 +409,9 @@ function getChannelState() {
 function saveRuntimeSettings() {
     syncActiveChannelFromRuntime();
     writeFileSync(SETTINGS_FILE, `${JSON.stringify({
-        schemaVersion: 6,
+        schemaVersion: SETTINGS_SCHEMA_VERSION,
         cacheTranslationEnabled,
+        systemMessageHandlingMode,
         autoGenerateCacheBreakpointsMode,
         captureRequests,
         cacheTtl: getCacheTtlLabel(),
@@ -471,6 +475,45 @@ function normalizeBoolean(value, defaultValue = false) {
     }
 
     return defaultValue;
+}
+
+function normalizeSystemMessageHandlingMode(value, { strict = false } = {}) {
+    const validModes = ['default', 'off', 'top'];
+
+    if (strict) {
+        if (typeof value !== 'string' || !validModes.includes(value)) {
+            throw new Error('mode must be default, off, or top.');
+        }
+
+        return value;
+    }
+
+    const normalized = String(value ?? 'default').trim().toLowerCase();
+
+    if (validModes.includes(normalized)) {
+        return normalized;
+    }
+
+    return 'default';
+}
+
+function migrateSystemMessageHandlingMode(rawSettings = {}) {
+    if (!Object.prototype.hasOwnProperty.call(rawSettings, 'systemMessageHandlingMode')) {
+        return normalizeBoolean(rawSettings.moveSystemMessagesToTop, false) ? 'off' : 'default';
+    }
+
+    const rawMode = String(rawSettings.systemMessageHandlingMode ?? '').trim().toLowerCase();
+    const schemaVersion = Number(rawSettings.schemaVersion) || 0;
+
+    if (rawMode === 'anthropic') {
+        return 'default';
+    }
+
+    if (rawMode === 'top' && schemaVersion < 9) {
+        return 'off';
+    }
+
+    return normalizeSystemMessageHandlingMode(rawMode);
 }
 
 function normalizeAutoGenerateCacheBreakpointsMode(value, { strict = false } = {}) {
@@ -897,6 +940,10 @@ function getRuntimeState() {
         activeChannel: getSafeChannelProfile(getActiveChannel()),
         channels: channelProfiles.map(getSafeChannelProfile),
         cacheTranslationEnabled,
+        systemMessageHandlingMode,
+        // Keep the legacy boolean for older console clients. Both non-default
+        // modes hoist system messages during OpenAI -> Anthropic conversion.
+        moveSystemMessagesToTop: systemMessageHandlingMode !== 'default',
         // Keep the legacy boolean for older console clients while exposing the
         // configured three-state mode as the canonical setting.
         autoGenerateCacheBreakpoints: autoGenerateCacheBreakpointsMode !== 'off',
@@ -1876,6 +1923,8 @@ function addRequestCapture({ request, originalBody, convertedBody, result, inbou
         gateway: {
             upstreamMode,
             cacheTranslationEnabled,
+            systemMessageHandlingMode,
+            moveSystemMessagesToTop: systemMessageHandlingMode !== 'default',
             autoGenerateCacheBreakpoints: autoGenerateCacheBreakpointsMode !== 'off',
             autoGenerateCacheBreakpointsMode,
             autoGenerateCacheBreakpointsEffective: Boolean(automaticDiagnostics.enabled),
@@ -2257,25 +2306,131 @@ function applyAnthropicCacheBreaks(body) {
     return result;
 }
 
-function convertOpenAiToAnthropicBody(body) {
+function appendAnthropicSystemContent(system, content) {
+    if (typeof content === 'string') {
+        if (!content) {
+            return false;
+        }
+
+        system.push({ type: 'text', text: content });
+        return true;
+    }
+
+    if (!Array.isArray(content) || content.length === 0) {
+        return false;
+    }
+
+    system.push(...content);
+    return true;
+}
+
+function getAnthropicContentBlocks(content) {
+    if (typeof content === 'string') {
+        return [{ type: 'text', text: content }];
+    }
+
+    return Array.isArray(content) ? [...content] : [];
+}
+
+function hasAnthropicMessageContent(content) {
+    return typeof content === 'string' ? content.length > 0 : Array.isArray(content) && content.length > 0;
+}
+
+function mergeConsecutiveAnthropicMessages(messages) {
+    const merged = [];
+
+    for (const message of messages) {
+        const previous = merged.at(-1);
+        const mergeable = isPlainObject(message) && (message.role === 'user' || message.role === 'assistant');
+        const previousMergeable = isPlainObject(previous)
+            && (previous.role === 'user' || previous.role === 'assistant');
+
+        if (!mergeable || !previousMergeable || previous.role !== message.role) {
+            merged.push(mergeable
+                ? {
+                    ...message,
+                    content: Array.isArray(message.content) ? [...message.content] : message.content,
+                }
+                : message);
+            continue;
+        }
+
+        const previousHasContent = hasAnthropicMessageContent(previous.content);
+        const currentHasContent = hasAnthropicMessageContent(message.content);
+
+        if (!currentHasContent) {
+            continue;
+        }
+
+        if (!previousHasContent) {
+            previous.content = Array.isArray(message.content) ? [...message.content] : message.content;
+            continue;
+        }
+
+        previous.content = [
+            ...getAnthropicContentBlocks(previous.content),
+            ...getAnthropicContentBlocks(message.content),
+        ];
+    }
+
+    return merged;
+}
+
+function hoistOpenAiSystemMessages(body) {
+    if (!Array.isArray(body?.messages)) {
+        return body;
+    }
+
+    const systemMessages = [];
+    const otherMessages = [];
+    let sawNonSystemMessage = false;
+    let changed = false;
+
+    for (const message of body.messages) {
+        if (message?.role === 'system') {
+            systemMessages.push(message);
+            changed ||= sawNonSystemMessage;
+        } else {
+            sawNonSystemMessage = true;
+            otherMessages.push(message);
+        }
+    }
+
+    if (!changed) {
+        return body;
+    }
+
+    return {
+        ...body,
+        messages: [...systemMessages, ...otherMessages],
+    };
+}
+
+function convertOpenAiToAnthropicBody(body, options = {}) {
     const system = [];
     const messages = [];
+    const handlingMode = normalizeSystemMessageHandlingMode(options.systemMessageHandlingMode);
+    const shouldMoveSystemMessagesToTop = handlingMode !== 'default';
+    let inLeadingSystemPrefix = true;
 
     for (const message of body.messages || []) {
         if (message.role === 'system') {
             const content = normalizeAnthropicContent(message.content);
 
-            if (typeof content === 'string') {
-                if (content) {
-                    system.push({ type: 'text', text: content });
-                }
+            if (shouldMoveSystemMessagesToTop || inLeadingSystemPrefix) {
+                appendAnthropicSystemContent(system, content);
             } else {
-                system.push(...content);
+                const hasContent = typeof content === 'string' ? Boolean(content) : content.length > 0;
+
+                if (hasContent) {
+                    messages.push({ role: 'user', content });
+                }
             }
             continue;
         }
 
         if (message.role === 'user' || message.role === 'assistant') {
+            inLeadingSystemPrefix = false;
             messages.push({
                 role: message.role,
                 content: normalizeAnthropicContent(message.content),
@@ -2538,7 +2693,7 @@ function convertAnthropicStreamToOpenAi(stream, model, capture = null) {
 }
 
 async function proxyChatCompletionsAnthropic(request, body) {
-    const baseBody = convertOpenAiToAnthropicBody(safeJsonClone(body));
+    const baseBody = convertOpenAiToAnthropicBody(safeJsonClone(body), { systemMessageHandlingMode });
     const extraJsonResult = applyUpstreamExtraJson(baseBody, 'anthropic');
 
     if (!Array.isArray(extraJsonResult.body?.messages)) {
@@ -2546,6 +2701,10 @@ async function proxyChatCompletionsAnthropic(request, body) {
             'Final upstream request body must include a messages array after channel body overrides.',
             'INVALID_FINAL_MESSAGES',
         );
+    }
+
+    if (systemMessageHandlingMode === 'default') {
+        extraJsonResult.body.messages = mergeConsecutiveAnthropicMessages(extraJsonResult.body.messages);
     }
 
     const cachePlan = planRequestCache(extraJsonResult.body, 'anthropic');
@@ -2574,6 +2733,7 @@ async function proxyChatCompletionsAnthropic(request, body) {
         removed: result.removed,
         cachePolicyAction: result.action ?? null,
         cacheTtl: getCacheTtlLabel(),
+        systemMessageHandlingMode,
         captureId: capture?.id ?? null,
     });
 
@@ -2805,7 +2965,10 @@ async function proxyChatCompletions(request) {
         );
     }
 
-    const cachePlan = planRequestCache(extraJsonResult.body, 'openai');
+    const preparedBody = systemMessageHandlingMode === 'top'
+        ? hoistOpenAiSystemMessages(extraJsonResult.body)
+        : extraJsonResult.body;
+    const cachePlan = planRequestCache(preparedBody, 'openai');
     const convertedBody = cachePlan.body;
     const result = getCachePlanResult(cachePlan);
     const prefixLockResult = applyPrefixLock(convertedBody, 'openai');
@@ -2826,6 +2989,7 @@ async function proxyChatCompletions(request) {
         overflowRemoved: result.overflowRemoved,
         cachePolicyAction: result.action ?? null,
         cacheTtl: getCacheTtlLabel(),
+        systemMessageHandlingMode,
         upstreamMode,
         captureId: capture?.id ?? null,
     });
@@ -3148,6 +3312,54 @@ async function handleConsoleApi(request, url) {
         saveRuntimeSettings();
         log('Updated cache translation setting from console.', { cacheTranslationEnabled });
         return jsonResponse(getRuntimeState());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/console/system-message-handling') {
+        try {
+            const body = await readJsonRequest(request);
+
+            if (!isPlainObject(body) || !Object.prototype.hasOwnProperty.call(body, 'mode')) {
+                throw new Error('mode is required and must be default, off, or top.');
+            }
+
+            const nextMode = normalizeSystemMessageHandlingMode(body.mode, { strict: true });
+
+            if (nextMode !== systemMessageHandlingMode) {
+                systemMessageHandlingMode = nextMode;
+                cacheAnchorStore.clear('system-message-handling-changed');
+                clearPrefixLock();
+            }
+
+            saveRuntimeSettings();
+            log('Updated system message handling from console.', { systemMessageHandlingMode });
+            return jsonResponse(getRuntimeState());
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/console/system-messages-to-top') {
+        try {
+            const body = await readJsonRequest(request);
+
+            if (!isPlainObject(body) || typeof body.enabled !== 'boolean') {
+                throw new Error('enabled is required and must be a boolean.');
+            }
+
+            const nextMode = body.enabled ? 'off' : 'default';
+
+            if (nextMode !== systemMessageHandlingMode) {
+                systemMessageHandlingMode = nextMode;
+                cacheAnchorStore.clear('system-message-handling-changed');
+                clearPrefixLock();
+            }
+
+            saveRuntimeSettings();
+            log('Updated system message handling through the legacy boolean API.', { systemMessageHandlingMode });
+            return jsonResponse(getRuntimeState());
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
     }
 
     if (request.method === 'POST' && url.pathname === '/console/auto-cache-breakpoints') {

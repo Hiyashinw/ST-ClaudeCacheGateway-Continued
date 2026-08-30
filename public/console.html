@@ -209,6 +209,10 @@
           <div class="set-control"><div class="seg" id="autoGenerateCacheBreakpointsSeg" aria-label="自动生成缓存断点模式"><button data-auto-breakpoints="auto">自动</button><button data-auto-breakpoints="on">开启</button><button data-auto-breakpoints="off">关闭</button></div></div>
         </div>
         <div class="set-row">
+          <div class="set-info"><div class="set-title">系统身份消息处理</div><div class="set-desc">“默认”保持 OpenAI-compatible 原始角色与顺序，转为 Anthropic native 时保留开头 SYSTEM、将中途 SYSTEM 原位转为 USER，并合并相邻同角色发言；“关闭Anthropic优化”保持 OpenAI-compatible 原样，但转换 Anthropic 时会把全部 SYSTEM 放到顶部；“统一将系统身份消息放至最顶部”会在两种上游格式中都统一上移 SYSTEM，缓存前缀更稳定，但可能破坏上下文语义。</div></div>
+          <div class="set-control"><div class="seg system-message-seg" id="systemMessageHandlingSeg" aria-label="系统身份消息处理模式"><button data-system-message-mode="default">默认</button><button data-system-message-mode="off">关闭Anthropic优化</button><button data-system-message-mode="top">统一将系统身份消息放至最顶部</button></div></div>
+        </div>
+        <div class="set-row">
           <div class="set-info"><div class="set-title">缓存有效期 TTL</div><div class="set-desc">自动不发送 ttl；5 分钟和 1 小时统一应用对应的 Claude 原生窗口；手动模式按两种 marker 分别使用 1h / 5m。</div></div>
           <div class="set-control"><div class="seg ttl-seg" id="cacheTtlSeg"><button data-ttl="auto">自动</button><button data-ttl="5m">5 分钟</button><button data-ttl="1h">1 小时</button><button data-ttl="manual">手动</button></div></div>
         </div>
@@ -444,6 +448,7 @@
         <ul>
           <li>“缓存转译”开启时，网关会处理两种缓存 marker、注入 <code>cache_control</code>，并允许 Prefix 锁定参与。</li>
           <li>关闭后，网关不做缓存标记转译，也不会执行 Prefix 锁定；但渠道、高级配置、上游格式转换仍然生效。</li>
+          <li>“系统身份消息处理”的默认模式不改 OpenAI-compatible 顺序，并在转为 Anthropic native 时执行保序映射与同角色合并；关闭 Anthropic 优化只让转换链统一上移 SYSTEM；全局上移模式则连 OpenAI-compatible 上游也会重排。</li>
           <li>TTL 选择“自动”时不发送 <code>ttl</code>；选择“5 分钟”或“1 小时”时，所有 marker 统一使用对应窗口。</li>
           <li>TTL 选择“手动”时，<code>[[CACHE_BREAK]]</code> 使用 <code>ttl: "1h"</code>，<code>[[CACHE_BREAK_SHORT]]</code> 使用 <code>ttl: "5m"</code>。1h 断点必须排在所有 5m 断点之前。</li>
         </ul>

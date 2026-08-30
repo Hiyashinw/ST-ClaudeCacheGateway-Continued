@@ -44,6 +44,23 @@ function automaticOpenAiBody(model = 'automatic-openai-model') {
     };
 }
 
+function interleavedSystemOpenAiBody(model = 'interleaved-system-model') {
+    return {
+        model,
+        max_tokens: 32,
+        messages: [
+            { role: 'system', content: 'Leading system' },
+            { role: 'user', content: 'First user' },
+            { role: 'user', content: 'Adjacent user' },
+            { role: 'assistant', content: 'First assistant' },
+            { role: 'assistant', content: 'Adjacent assistant' },
+            { role: 'system', content: 'Later system' },
+            { role: 'user', content: 'Second user' },
+            { role: 'user', content: 'Adjacent second user' },
+        ],
+    };
+}
+
 function automaticAnthropicBody(model = 'automatic-anthropic-model') {
     return {
         model,
@@ -428,6 +445,8 @@ async function startGatewayFixture({
     autoGenerateCacheBreakpoints,
     autoGenerateCacheBreakpointsMode,
     captureRequests,
+    systemMessageHandlingMode,
+    moveSystemMessagesToTop,
 }) {
     const upstream = await startMockUpstream();
     const temporaryDirectory = await mkdtemp(join(tmpdir(), 'st-cache-gateway-integration-'));
@@ -449,6 +468,8 @@ async function startGatewayFixture({
                 ...(autoGenerateCacheBreakpoints === undefined ? {} : { autoGenerateCacheBreakpoints }),
                 ...(autoGenerateCacheBreakpointsMode === undefined ? {} : { autoGenerateCacheBreakpointsMode }),
                 ...(captureRequests === undefined ? {} : { captureRequests }),
+                ...(systemMessageHandlingMode === undefined ? {} : { systemMessageHandlingMode }),
+                ...(moveSystemMessagesToTop === undefined ? {} : { moveSystemMessagesToTop }),
                 activeChannelId: 'integration-upstream',
                 channels: [{
                     id: 'integration-upstream',
@@ -588,6 +609,78 @@ test('OpenAI inbound -> OpenAI upstream sends the fixed-head final JSON', async 
     assertFinalUpstreamBody(request);
 });
 
+test('OpenAI inbound -> OpenAI upstream preserves message order except in global Top mode', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'default',
+    });
+    t.after(() => fixture.close());
+
+    const originalMessages = interleavedSystemOpenAiBody().messages;
+
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('openai-system-default'),
+    );
+    assert.deepEqual(fixture.requests[0].body.messages, originalMessages);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode: 'off' });
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('openai-system-off'),
+    );
+    assert.deepEqual(fixture.requests[1].body.messages, originalMessages);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode: 'top' });
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('openai-system-top'),
+    );
+    assert.deepEqual(fixture.requests[2].body.messages, [
+        { role: 'system', content: 'Leading system' },
+        { role: 'system', content: 'Later system' },
+        { role: 'user', content: 'First user' },
+        { role: 'user', content: 'Adjacent user' },
+        { role: 'assistant', content: 'First assistant' },
+        { role: 'assistant', content: 'Adjacent assistant' },
+        { role: 'user', content: 'Second user' },
+        { role: 'user', content: 'Adjacent second user' },
+    ]);
+});
+
+test('global Top hoists the final OpenAI messages after channel overrides without losing message metadata', async (t) => {
+    const overriddenMessages = [
+        { role: 'user', content: 'Override user', name: 'keep-user' },
+        { role: 'system', content: 'Override system one', name: 'keep-system-one' },
+        { role: 'assistant', content: 'Override assistant', name: 'keep-assistant' },
+        {
+            role: 'system',
+            content: [{ type: 'text', text: 'Override system two' }],
+            name: 'keep-system-two',
+        },
+    ];
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'top',
+        upstreamExtraJson: { messages: overriddenMessages },
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', interleavedSystemOpenAiBody('openai-top-after-override'));
+
+    assert.deepEqual(fixture.requests[0].body.messages, [
+        overriddenMessages[1],
+        overriddenMessages[3],
+        overriddenMessages[0],
+        overriddenMessages[2],
+    ]);
+});
+
 test('schema 3 settings migrate automatic cache breaks to Off and request capture to disabled', async (t) => {
     const fixture = await startGatewayFixture({ upstreamMode: 'openai', schemaVersion: 3 });
     t.after(() => fixture.close());
@@ -599,7 +692,7 @@ test('schema 3 settings migrate automatic cache breaks to Off and request captur
     assert.equal(state.cacheTtl, 'auto');
 });
 
-test('schema 6 migrates the old automatic breakpoint boolean and persists the canonical mode', async (t) => {
+test('schema 9 migrates the old automatic breakpoint boolean and persists the canonical mode', async (t) => {
     for (const testCase of [
         { name: 'legacy true becomes On', legacy: true, expected: 'on' },
         { name: 'legacy false becomes Off', legacy: false, expected: 'off' },
@@ -619,18 +712,191 @@ test('schema 6 migrates the old automatic breakpoint boolean and persists the ca
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 6);
+                assert.equal(savedSettings.schemaVersion, 9);
                 assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'autoGenerateCacheBreakpoints'),
                     false,
-                    'schema 6 must persist only the canonical three-state field',
+                    'schema 9 must persist only the canonical three-state field',
                 );
             } finally {
                 await fixture.close();
             }
         });
     }
+});
+
+test('schema 9 remaps schema 8 system-message modes to the corrected canonical meanings', async (t) => {
+    for (const testCase of [
+        { name: 'old Default becomes Default', legacy: 'default', expected: 'default' },
+        { name: 'old Anthropic optimization becomes Default', legacy: 'anthropic', expected: 'default' },
+        { name: 'old Top becomes Off', legacy: 'top', expected: 'off' },
+    ]) {
+        await t.test(testCase.name, async () => {
+            const fixture = await startGatewayFixture({
+                upstreamMode: 'anthropic',
+                schemaVersion: 8,
+                autoGenerateCacheBreakpointsMode: 'off',
+                systemMessageHandlingMode: testCase.legacy,
+            });
+
+            try {
+                const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+                assert.equal(state.systemMessageHandlingMode, testCase.expected);
+
+                await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
+                const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+                assert.equal(savedSettings.schemaVersion, 9);
+                assert.equal(savedSettings.systemMessageHandlingMode, testCase.expected);
+                assert.equal(
+                    Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'),
+                    false,
+                    'schema 9 must persist only the canonical mode',
+                );
+            } finally {
+                await fixture.close();
+            }
+        });
+    }
+});
+
+test('schema 9 migrates schema 7 system-message booleans and persists only the canonical mode', async (t) => {
+    for (const testCase of [
+        { name: 'legacy true becomes Off', legacy: true, expected: 'off' },
+        { name: 'legacy false becomes Default', legacy: false, expected: 'default' },
+        { name: 'missing legacy setting becomes Default', legacy: undefined, expected: 'default' },
+    ]) {
+        await t.test(testCase.name, async () => {
+            const fixture = await startGatewayFixture({
+                upstreamMode: 'anthropic',
+                schemaVersion: 7,
+                autoGenerateCacheBreakpointsMode: 'off',
+                moveSystemMessagesToTop: testCase.legacy,
+            });
+
+            try {
+                const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+                assert.equal(state.systemMessageHandlingMode, testCase.expected);
+
+                await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
+                const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+                assert.equal(savedSettings.schemaVersion, 9);
+                assert.equal(savedSettings.systemMessageHandlingMode, testCase.expected);
+                assert.equal(
+                    Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'),
+                    false,
+                    'schema 9 must not persist the legacy boolean field',
+                );
+            } finally {
+                await fixture.close();
+            }
+        });
+    }
+});
+
+test('system-message handling API strictly validates and persists every mode across restarts', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'default',
+    });
+    t.after(() => fixture.close());
+
+    for (const body of [
+        {},
+        [],
+        { mode: null },
+        { mode: true },
+        { mode: 'anthropic' },
+        { mode: 'optimized' },
+        { mode: 'Top' },
+        { mode: ' top ' },
+    ]) {
+        const response = await fetch(`${fixture.gatewayBaseUrl}/console/system-message-handling`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 400, `body ${JSON.stringify(body)} must be rejected`);
+    }
+
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.systemMessageHandlingMode, 'default', 'invalid updates must not mutate the setting');
+
+    for (const mode of ['off', 'top', 'default']) {
+        state = await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode });
+        assert.equal(state.systemMessageHandlingMode, mode);
+
+        const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+        assert.equal(savedSettings.schemaVersion, 9);
+        assert.equal(savedSettings.systemMessageHandlingMode, mode);
+        assert.equal(Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'), false);
+
+        await fixture.restart();
+        state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+        assert.equal(state.systemMessageHandlingMode, mode);
+    }
+});
+
+test('legacy system-message boolean API maps to canonical modes and keeps strict boolean validation', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'default',
+    });
+    t.after(() => fixture.close());
+
+    for (const body of [{}, [], { enabled: null }, { enabled: 1 }, { enabled: 'true' }]) {
+        const response = await fetch(`${fixture.gatewayBaseUrl}/console/system-messages-to-top`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 400, `body ${JSON.stringify(body)} must be rejected`);
+    }
+
+    let state = await postJson(fixture.gatewayBaseUrl, '/console/system-messages-to-top', { enabled: true });
+    assert.equal(state.systemMessageHandlingMode, 'off');
+    assert.equal(state.moveSystemMessagesToTop, true);
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/system-messages-to-top', { enabled: false });
+    assert.equal(state.systemMessageHandlingMode, 'default');
+    assert.equal(state.moveSystemMessagesToTop, false);
+
+    const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.equal(savedSettings.systemMessageHandlingMode, 'default');
+    assert.equal(Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'), false);
+});
+
+test('changing system-message handling clears learned anchors and Prefix Lock content', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'default',
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'single',
+            cacheAnchorIntervalBlocks: 3,
+        },
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('system-order-anchor-clear'));
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheAnchorState.contextCount, 1);
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode: 'off' });
+    assert.equal(state.cacheAnchorState.contextCount, 0);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/prefix-lock', { enabled: true });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('system-order-prefix-clear'));
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.prefixLockActive, true);
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode: 'top' });
+    assert.equal(state.prefixLockEnabled, true);
+    assert.equal(state.prefixLockActive, false);
+    assert.equal(state.prefixLockHash, null);
 });
 
 test('automatic breakpoint API validates mode atomically and accepts the legacy enabled boolean', async (t) => {
@@ -658,7 +924,7 @@ test('automatic breakpoint API validates mode atomically and accepts the legacy 
     assert.equal(legacyOff.autoGenerateCacheBreakpointsMode, 'off');
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 6);
+    assert.equal(savedSettings.schemaVersion, 9);
     assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, 'off');
     state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     assert.equal(state.autoGenerateCacheBreakpoints, false);
@@ -710,7 +976,7 @@ test('TTL modes send no ttl for Auto and native ttl values for 5m and 1h', async
     assertGatewayCacheTtl(fixture.requests[3], null);
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 6);
+    assert.equal(savedSettings.schemaVersion, 9);
     assert.equal(savedSettings.cacheTtl, 'auto');
 });
 
@@ -746,7 +1012,7 @@ test('Manual TTL maps long and short markers on all three final upstream request
         await t.test(testCase.name, async () => {
             const fixture = await startGatewayFixture({
                 upstreamMode: testCase.upstreamMode,
-                schemaVersion: 6,
+                schemaVersion: 7,
                 savedCacheTtl: 'manual',
                 environmentCacheTtl: null,
             });
@@ -784,7 +1050,7 @@ test('non-Manual TTL modes apply the global TTL equally to long and short marker
         await t.test(testCase.ttl, async () => {
             const fixture = await startGatewayFixture({
                 upstreamMode: 'openai',
-                schemaVersion: 6,
+                schemaVersion: 7,
                 savedCacheTtl: testCase.ttl,
                 environmentCacheTtl: null,
             });
@@ -809,7 +1075,7 @@ test('non-Manual TTL modes apply the global TTL equally to long and short marker
 test('Manual TTL rejects a short marker before a later long marker without contacting upstream', async (t) => {
     const fixture = await startGatewayFixture({
         upstreamMode: 'anthropic',
-        schemaVersion: 6,
+        schemaVersion: 7,
         savedCacheTtl: 'manual',
         environmentCacheTtl: null,
     });
@@ -882,7 +1148,7 @@ test('legacy default TTL aliases migrate to canonical Auto in state and saved se
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 6);
+                assert.equal(savedSettings.schemaVersion, 9);
                 assert.equal(savedSettings.cacheTtl, 'auto');
             } finally {
                 await fixture.close();
@@ -1028,7 +1294,7 @@ test('Anthropic native inbound auto-generates system and assistant candidates be
 test('rolling auto-generated breakpoints freeze the initial wire and replace only the oldest slot', async (t) => {
     const fixture = await startGatewayFixture({
         upstreamMode: 'openai',
-        schemaVersion: 6,
+        schemaVersion: 7,
         autoGenerateCacheBreakpointsMode: 'on',
         captureRequests: false,
         policy: {
@@ -1072,7 +1338,7 @@ test('rolling auto-generated breakpoints freeze the initial wire and replace onl
 test('Auto generation enables only when the final request has no explicit marker or cache control', async (t) => {
     const fixture = await startGatewayFixture({
         upstreamMode: 'openai',
-        schemaVersion: 6,
+        schemaVersion: 7,
         autoGenerateCacheBreakpointsMode: 'auto',
         captureRequests: true,
     });
@@ -1130,7 +1396,7 @@ test('request capture setting persists across a gateway restart while captures r
     assert.equal(beforeRestart.capturedRequests, 1);
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 6);
+    assert.equal(savedSettings.schemaVersion, 9);
     assert.equal(savedSettings.captureRequests, true, 'POST /console/capture must persist the setting');
 
     await fixture.restart();
@@ -1152,6 +1418,184 @@ test('OpenAI inbound -> Anthropic upstream converts before applying the fixed-he
     assert.equal(request.body.max_tokens, 32);
     assert.ok(request.headers['anthropic-version']);
     assertFinalUpstreamBody(request);
+});
+
+test('OpenAI inbound -> Anthropic applies the corrected system-message handling matrix in stable order', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'default',
+    });
+    t.after(() => fixture.close());
+
+    const initialState = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(initialState.systemMessageHandlingMode, 'default');
+
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('interleaved-system-default'),
+    );
+    assert.deepEqual(fixture.requests[0].body.system, [
+        { type: 'text', text: 'Leading system' },
+    ]);
+    assert.deepEqual(fixture.requests[0].body.messages, [
+        {
+            role: 'user',
+            content: [
+                { type: 'text', text: 'First user' },
+                { type: 'text', text: 'Adjacent user' },
+            ],
+        },
+        {
+            role: 'assistant',
+            content: [
+                { type: 'text', text: 'First assistant' },
+                { type: 'text', text: 'Adjacent assistant' },
+            ],
+        },
+        {
+            role: 'user',
+            content: [
+                { type: 'text', text: 'Later system' },
+                { type: 'text', text: 'Second user' },
+                { type: 'text', text: 'Adjacent second user' },
+            ],
+        },
+    ]);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode: 'off' });
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('interleaved-system-off'),
+    );
+    assert.deepEqual(fixture.requests[1].body.system, [
+        { type: 'text', text: 'Leading system' },
+        { type: 'text', text: 'Later system' },
+    ]);
+    assert.deepEqual(fixture.requests[1].body.messages, [
+        { role: 'user', content: 'First user' },
+        { role: 'user', content: 'Adjacent user' },
+        { role: 'assistant', content: 'First assistant' },
+        { role: 'assistant', content: 'Adjacent assistant' },
+        { role: 'user', content: 'Second user' },
+        { role: 'user', content: 'Adjacent second user' },
+    ]);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode: 'top' });
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('interleaved-system-top'),
+    );
+    assert.deepEqual(fixture.requests[2].body.system, [
+        { type: 'text', text: 'Leading system' },
+        { type: 'text', text: 'Later system' },
+    ]);
+    assert.deepEqual(fixture.requests[2].body.messages, [
+        { role: 'user', content: 'First user' },
+        { role: 'user', content: 'Adjacent user' },
+        { role: 'assistant', content: 'First assistant' },
+        { role: 'assistant', content: 'Adjacent assistant' },
+        { role: 'user', content: 'Second user' },
+        { role: 'user', content: 'Adjacent second user' },
+    ]);
+});
+
+test('Anthropic native inbound remains unchanged in every system-message handling mode', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'default',
+    });
+    t.after(() => fixture.close());
+
+    const system = [
+        { type: 'text', text: 'Native system first' },
+        { type: 'text', text: 'Native system second' },
+    ];
+    const messages = [
+        { role: 'user', content: 'Native user first' },
+        { role: 'user', content: 'Native user second' },
+        { role: 'assistant', content: 'Native assistant first' },
+        { role: 'assistant', content: 'Native assistant second' },
+    ];
+
+    for (const [index, mode] of ['default', 'off', 'top'].entries()) {
+        if (mode !== 'default') {
+            await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode });
+        }
+
+        await postJson(fixture.gatewayBaseUrl, '/v1/messages', {
+            model: `native-system-${mode}`,
+            max_tokens: 32,
+            system,
+            messages,
+        });
+
+        assert.equal(fixture.requests[index].path, '/v1/messages');
+        assert.deepEqual(fixture.requests[index].body.system, system);
+        assert.deepEqual(fixture.requests[index].body.messages, messages);
+    }
+});
+
+test('default Anthropic optimization preserves block order and cache controls while absorbing empty same-role messages', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'default',
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', {
+        model: 'anthropic-optimized-blocks',
+        max_tokens: 32,
+        messages: [
+            { role: 'system', content: 'Leading system' },
+            { role: 'user', content: '' },
+            {
+                role: 'user',
+                content: [
+                    { type: 'text', text: 'First user block', cache_control: { type: 'ephemeral' } },
+                    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA==' } },
+                ],
+            },
+            { role: 'user', content: MARKER },
+            {
+                role: 'assistant',
+                content: [
+                    { type: 'thinking', thinking: 'Keep this opaque block.', signature: 'test-signature' },
+                    { type: 'text', text: 'Assistant answer' },
+                ],
+            },
+            { role: 'assistant', content: '' },
+        ],
+    });
+
+    assert.deepEqual(fixture.requests[0].body.system, [
+        { type: 'text', text: 'Leading system' },
+    ]);
+    assert.deepEqual(fixture.requests[0].body.messages, [
+        {
+            role: 'user',
+            content: [
+                { type: 'text', text: 'First user block', cache_control: { type: 'ephemeral' } },
+                {
+                    type: 'image',
+                    source: { type: 'base64', media_type: 'image/png', data: 'AA==' },
+                    cache_control: { type: 'ephemeral' },
+                },
+            ],
+        },
+        {
+            role: 'assistant',
+            content: [
+                { type: 'thinking', thinking: 'Keep this opaque block.', signature: 'test-signature' },
+                { type: 'text', text: 'Assistant answer' },
+            ],
+        },
+    ]);
 });
 
 test('OpenAI inbound -> Anthropic non-stream response exposes thinking as reasoning_content', async (t) => {
@@ -1290,6 +1734,42 @@ test('OpenAI inbound -> Anthropic upstream selects breakpoints after channel JSO
     assert.equal(request.path, '/v1/messages');
     assert.equal(request.body.system[0].text, 'S');
     assertFinalUpstreamBody(request, ['S', 'E', 'F', 'G']);
+});
+
+test('default Anthropic optimization merges consecutive roles after channel JSON overrides the messages array', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'default',
+        upstreamExtraJson: {
+            messages: [
+                { role: 'user', content: 'Override user one' },
+                { role: 'user', content: [{ type: 'text', text: 'Override user two' }] },
+                { role: 'assistant', content: 'Override assistant one' },
+                { role: 'assistant', content: 'Override assistant two' },
+            ],
+        },
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', interleavedSystemOpenAiBody('optimized-after-override'));
+
+    assert.deepEqual(fixture.requests[0].body.messages, [
+        {
+            role: 'user',
+            content: [
+                { type: 'text', text: 'Override user one' },
+                { type: 'text', text: 'Override user two' },
+            ],
+        },
+        {
+            role: 'assistant',
+            content: [
+                { type: 'text', text: 'Override assistant one' },
+                { type: 'text', text: 'Override assistant two' },
+            ],
+        },
+    ]);
 });
 
 test('OpenAI inbound -> Anthropic rejects an invalid messages override before contacting upstream', async (t) => {

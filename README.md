@@ -23,6 +23,7 @@ API Key: 你的上游供应商 API Key
 
 - 接收 OpenAI-compatible `POST /v1/chat/completions` 请求。
 - 默认使用 Pioneer 的 OpenAI-compatible 上游格式，也可切换为 Anthropic native `/v1/messages`。
+- 系统身份消息处理提供“默认”“关闭Anthropic优化”或“统一将系统身份消息放至最顶部”三种方式；默认对 OpenAI-compatible 上游原样传输，并在转为 Anthropic native 时自动完成保序角色转换与同角色消息合并。
 - 支持 `[[CACHE_BREAK]]` 与 `[[CACHE_BREAK_SHORT]]` 两种手动标记；在手动 TTL 下可分别指定 1h 长缓存与 5m 短缓存。
 - 支持 Claude `cache_control` 注入，最多 4 个缓存断点。
 - 支持固定头缓存点，以及单锚点 / 滚动锚点保留策略。
@@ -109,7 +110,7 @@ http://127.0.0.1:8788/console
 
 - 网关概览：当前渠道、缓存转译、上游格式、TTL、Prefix 状态。
 - 渠道配置：切换 / 保存渠道 Profile。
-- 缓存策略：查看缓存标记、切换 TTL、配置固定头与缓存锚点、管理 Prefix 锁定。
+- 缓存策略：查看缓存标记、切换 TTL、配置系统身份消息处理方式、固定头与缓存锚点、管理 Prefix 锁定。
 - 请求日志：开启或关闭请求诊断、查看最终请求体和缓存结果；开关状态会保留到下次启动，日志正文仍只存于内存。
 - 高级配置：处理主体参数和请求头。
 
@@ -137,6 +138,16 @@ POST http://127.0.0.1:8788/v1/messages/count_tokens
 ```
 
 如果使用 Claude 原生入站，请把当前渠道的上游格式保持为 Anthropic native。
+
+## 系统身份消息处理
+
+控制台“缓存策略 → 缓存标记与 TTL”提供“系统身份消息处理”选项。它按所选模式处理 **OpenAI-compatible 入站**中的 `system` 消息；Anthropic native 入站本身已经使用顶层 `system`，不参与这一步角色转换。
+
+- **默认**：转发到 OpenAI-compatible 上游时，`system`、`user`、`assistant` 的角色和位置均保持原样；转为 Anthropic native 时，保留请求开头连续出现的 `system` 作为 Anthropic 顶层 `system`，一旦遇到 `user` 或 `assistant`，后续 `system` 会在原位置转换为 `user`，最后按原顺序合并相邻的同角色发言。优点是 OpenAI-compatible 链路完全保真，同时尽量保留 Anthropic 链路的上下文位置，并生成更符合 Anthropic 对话格式的消息结构；缺点是 Anthropic 链路中的中途系统内容会失去系统身份，连续同角色消息的原始边界也会被合并。
+- **关闭Anthropic优化**：转发到 OpenAI-compatible 上游时仍原样传输；转为 Anthropic native 时，将全部 `system` 集中到 Anthropic 顶层 `system`，不合并相邻的同角色发言。优点是中途系统内容仍以系统身份发送，也不会合并原有的 `user` / `assistant` 消息边界；缺点是会把中途插入的系统消息提前，可能破坏上下文语义，但通常更容易形成稳定的缓存前缀。
+- **统一将系统身份消息放至最顶部**：转发到 OpenAI-compatible 上游时，稳定地把全部 `system` 移到 `messages` 最前面；转为 Anthropic native 时，也将全部 `system` 集中到顶层 `system`，且不合并相邻的同角色发言。优点是所有 OpenAI-compatible 入站链路都能得到更稳定的系统前缀，有利于提高缓存命中率；缺点是所有链路都可能因中途系统消息被提前而改变上下文语义。
+
+切换处理方式会清空已学习的缓存锚点和 Prefix Lock 内容，下一次成功请求会按新的提示词结构重新学习。
 
 ## 缓存标记
 
@@ -237,7 +248,7 @@ A / F / O / P
 
 滚动模式以成功请求为提交边界：上游非 2xx、网络错误、请求取消和 `/count_tokens` 都不会学习、晋升或淘汰锚点。不同渠道、上游协议、模型和 TTL 的学习上下文彼此隔离，内存中最多保留 32 个最近使用的上下文。
 
-策略设置会持久化到 `gateway-settings.json`。旧配置会在运行时迁移到 `schemaVersion: 6`：固定头、锚点和滚动间隔缺省为 `0 / off / 3`；旧的自动断点布尔值 `true / false` 分别迁移为 `on / off`，缺省仍为 `off`；旧的空值、`default`、`provider-default` 和 `none` TTL 会迁移为 `auto`。已学习的锚点、轮换进度、上下文索引和诊断正文只保存在内存里；锚点在重启后重新学习，诊断开关则保持上次设置。不需要新增环境变量。
+策略设置会持久化到 `gateway-settings.json`。旧配置会在运行时迁移到 `schemaVersion: 9`：schema 8 的系统身份消息处理值 `default / anthropic` 都迁移为新的 `default`，`top` 迁移为 `off`；更早版本的 `moveSystemMessagesToTop` 布尔值 `false / true` 分别迁移为 `default / off`，缺少旧字段时使用 `default`。固定头、锚点和滚动间隔缺省为 `0 / off / 3`；旧的自动断点布尔值 `true / false` 分别迁移为 `on / off`，缺省仍为 `off`；旧的空值、`default`、`provider-default` 和 `none` TTL 会迁移为 `auto`。已学习的锚点、轮换进度、上下文索引和诊断正文只保存在内存里；锚点在重启后重新学习，诊断开关则保持上次设置。不需要新增环境变量。
 
 > 缓存锚点与 Prefix Lock 互斥，采用“最后启用者生效”：启用单锚点或滚动锚点会关闭并清空 Prefix Lock；启用 Prefix Lock 会把锚点模式切回“关闭”并清空已学习锚点。固定头策略本身可以继续保留。
 

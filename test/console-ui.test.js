@@ -35,7 +35,7 @@ function loadConsoleHelpers() {
     });
     vm.runInContext(`${withoutBootstrap}\n;globalThis.__helpers = {\n`
         + 'tableCell, countCharacters, getOrderedBodySegments, promptTokensFromUsage, getPromptTokenEstimate, '
-        + 'estimatedTokens, promptEstimateLabel\n};', context);
+        + 'estimatedTokens, promptEstimateLabel, systemMessageHandlingMode, systemMessageHandlingLabel\n};', context);
     return context.__helpers;
 }
 
@@ -166,4 +166,32 @@ test('tool and structured-output definitions join the denominator without contro
     const messageOnlyCharacters = helpers.countCharacters(body.messages[0].content);
     assert.ok(expectedCharacters > messageOnlyCharacters * 5, 'large tool schema must materially expand the denominator');
     assert.ok(expectedCharacters / messageOnlyCharacters > 5, 'the previous message-only multiplier would be substantially inflated');
+});
+
+test('system-message handling control exposes all three modes and their tradeoffs', () => {
+    const html = readFileSync(new URL('../public/console.html', import.meta.url), 'utf8');
+    const script = readFileSync(new URL('../public/console.js', import.meta.url), 'utf8');
+
+    assert.match(html, /系统身份消息处理/);
+    assert.match(html, /data-system-message-mode="default">默认/);
+    assert.match(html, /data-system-message-mode="off">关闭Anthropic优化/);
+    assert.match(html, /data-system-message-mode="top">统一将系统身份消息放至最顶部/);
+    assert.match(html, /合并相邻同角色发言/);
+    assert.match(html, /保持 OpenAI-compatible 原始角色与顺序/);
+    assert.match(html, /可能破坏上下文语义/);
+    assert.doesNotMatch(html, /moveSystemMessagesToTopSwitch/);
+    assert.match(script, /systemMessageHandlingMode/);
+    assert.match(script, /\/console\/system-message-handling/);
+});
+
+test('system-message handling helpers normalize canonical and legacy runtime state', () => {
+    assert.equal(helpers.systemMessageHandlingMode({}), 'default');
+    assert.equal(helpers.systemMessageHandlingMode({ moveSystemMessagesToTop: false }), 'default');
+    assert.equal(helpers.systemMessageHandlingMode({ moveSystemMessagesToTop: true }), 'off');
+    assert.equal(helpers.systemMessageHandlingMode({ systemMessageHandlingMode: 'anthropic' }), 'default');
+    assert.equal(helpers.systemMessageHandlingMode({ systemMessageHandlingMode: 'off' }), 'off');
+    assert.equal(helpers.systemMessageHandlingMode({ systemMessageHandlingMode: 'invalid' }), 'default');
+    assert.equal(helpers.systemMessageHandlingLabel('default'), '默认');
+    assert.equal(helpers.systemMessageHandlingLabel('off'), '关闭Anthropic优化');
+    assert.equal(helpers.systemMessageHandlingLabel('top'), '统一将系统身份消息放至最顶部');
 });
