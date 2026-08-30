@@ -364,8 +364,11 @@ tr:hover td { background-color: var(--bg-app); }
 .msg-left, .msg-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .msg-right { flex-shrink: 0; }
 .msg-caret { font-size: 11px; color: var(--text-muted); transition: transform 0.18s ease; }
-.msg-card.collapsed .msg-body { display: none; }
-.msg-card.collapsed .msg-card-head { border-bottom: 0; }
+.msg-card.collapsed:not(.has-cache-breakpoints) .msg-body { display: none; }
+.msg-card.collapsed.has-cache-breakpoints .msg-content-block { display: none; }
+.msg-card.collapsed.has-cache-breakpoints .msg-body { padding: 0 16px 10px; max-height: none; overflow: visible; }
+.msg-card.collapsed:not(.has-cache-breakpoints) .msg-card-head { border-bottom: 0; }
+.msg-card.collapsed.has-cache-breakpoints .msg-body > .cache-divider { margin: 10px 0 0; }
 .msg-card.collapsed .msg-caret { transform: rotate(-90deg); }
 .msg-role { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 800; letter-spacing: 0.04em; }
 .role-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
@@ -379,6 +382,10 @@ tr:hover td { background-color: var(--bg-app); }
 .msg-meta { white-space: nowrap; }
 .msg-index { color: var(--text-muted-light); }
 .msg-body { padding: 14px 16px; font-size: 13.5px; line-height: 1.6; color: var(--text-main); white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow-y: auto; }
+.msg-content-block + .msg-content-block { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
+.msg-content-block > .msg-index { display: block; margin-bottom: 4px; }
+.msg-content-text { white-space: pre-wrap; word-break: break-word; }
+.msg-body > .cache-divider { margin: 12px 0; }
 .msg-card.is-prefix { border-color: #c7d2cb; }
 .msg-card.is-prefix .msg-card-head { background-color: var(--success-soft); border-bottom-color: #c7d2cb; }
 .cache-divider { display: flex; align-items: center; gap: 12px; margin: 4px 0; padding: 10px 16px; border-radius: 10px; background: repeating-linear-gradient(45deg, var(--success-soft), var(--success-soft) 10px, #e0f1ea 10px, #e0f1ea 20px); border: 1px dashed var(--success); }

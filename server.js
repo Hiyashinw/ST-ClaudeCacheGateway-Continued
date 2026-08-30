@@ -2713,6 +2713,14 @@ async function proxyChatCompletionsAnthropic(request, body) {
     let anthropicBody = convertedBody;
     const prefixLockResult = applyPrefixLock(anthropicBody, 'anthropic');
     anthropicBody = prefixLockResult.body;
+
+    // Cache and Prefix Lock post-processing can rebuild message boundaries.
+    // Re-apply the default Anthropic invariant to the actual wire body so
+    // consecutive user/assistant turns never escape unmerged.
+    if (systemMessageHandlingMode === 'default') {
+        anthropicBody.messages = mergeConsecutiveAnthropicMessages(anthropicBody.messages);
+    }
+
     assertCachePlan(anthropicBody, {
         marker: MARKER,
         maxBreakpoints: MAX_BREAKPOINTS,

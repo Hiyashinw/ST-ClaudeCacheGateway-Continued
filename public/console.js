@@ -1117,13 +1117,14 @@ function selectedBreakpoints(capture, segments = []) {
 
 function getOrderedBodySegments(body, mode) {
   const segments = [];
-  const add = (role, value, path, label, cacheOwner = value, serializedText) => {
+  const add = (role, value, path, label, cacheOwner = value, serializedText, metadata = {}) => {
     const cacheControl = hasCacheControl(value)
       ? value.cache_control
       : hasCacheControl(cacheOwner)
         ? cacheOwner.cache_control
         : null;
     segments.push({
+      ...metadata,
       role,
       value,
       path,
@@ -1177,10 +1178,26 @@ function getOrderedBodySegments(body, mode) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   messages.forEach((message, messageIndex) => {
     const role = message?.role || 'message';
+    const messagePath = `messages[${messageIndex}]`;
     if (Array.isArray(message?.content)) {
-      message.content.forEach((block, blockIndex) => add(role, block, `messages[${messageIndex}].content[${blockIndex}]`, `messages[${messageIndex}] · block ${blockIndex}`));
+      if (!message.content.length) {
+        add(role, '', messagePath, messagePath, message, '', { messageIndex, messagePath, contentBlockIndex: null });
+      }
+      message.content.forEach((block, blockIndex) => add(
+        role,
+        block,
+        `${messagePath}.content[${blockIndex}]`,
+        `${messagePath} · block ${blockIndex}`,
+        block,
+        undefined,
+        { messageIndex, messagePath, contentBlockIndex: blockIndex },
+      ));
     } else {
-      add(role, message?.content ?? message, `messages[${messageIndex}]`, `messages[${messageIndex}]`, message);
+      add(role, message?.content ?? message, messagePath, messagePath, message, undefined, {
+        messageIndex,
+        messagePath,
+        contentBlockIndex: null,
+      });
     }
   });
 
@@ -1198,6 +1215,40 @@ function getOrderedBodySegments(body, mode) {
   return segments;
 }
 
+function groupBodySegmentsForDisplay(segments) {
+  const groups = [];
+
+  for (const [segmentIndex, segment] of segments.entries()) {
+    const isMessage = Number.isInteger(segment?.messageIndex) && segment.messageIndex >= 0;
+    const previous = groups[groups.length - 1];
+
+    if (isMessage && previous?.messageIndex === segment.messageIndex) {
+      previous.segments.push(segment);
+      previous.endIndex = segmentIndex;
+      previous.label = `${previous.path} · ${previous.segments.length} blocks`;
+      continue;
+    }
+
+    groups.push({
+      role: segment.role,
+      path: isMessage ? segment.messagePath : segment.path,
+      label: isMessage && Number.isInteger(segment.contentBlockIndex)
+        ? `${segment.messagePath} · 1 block`
+        : segment.label,
+      messageIndex: isMessage ? segment.messageIndex : null,
+      startIndex: segmentIndex,
+      endIndex: segmentIndex,
+      segments: [segment],
+    });
+  }
+
+  return groups;
+}
+
+function displayGroupCharacterCount(group) {
+  return (group?.segments || []).reduce((sum, segment) => sum + countCharacters(segment?.text), 0);
+}
+
 function pathMatches(segmentPath, cachePath) {
   if (!cachePath) return false;
   return cachePath === segmentPath || cachePath === `${segmentPath}.cache_control` || cachePath.startsWith(`${segmentPath}.`);
@@ -1213,23 +1264,31 @@ function nonNegativeNumber(value) {
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
-function promptTokensFromUsage(usage) {
+function promptTokensFromUsage(usage, upstreamMode = 'openai') {
   const inputTokens = nonNegativeNumber(usage?.inputTokens);
   if (inputTokens === null) return null;
 
+  // OpenAI's prompt_tokens/inputTokens is already the complete input count.
+  // Anthropic reports uncached, cache-read and cache-created input separately.
+  if (upstreamMode !== 'anthropic') return inputTokens;
+
+  const rawCacheRead = usage?.anthropicCacheReadInputTokens;
+  const cacheReadTokens = rawCacheRead === null || rawCacheRead === undefined
+    ? 0
+    : nonNegativeNumber(rawCacheRead);
   const rawCacheCreation = usage?.anthropicCacheCreationInputTokens;
   const cacheCreationTokens = rawCacheCreation === null || rawCacheCreation === undefined
     ? 0
     : nonNegativeNumber(rawCacheCreation);
-  if (cacheCreationTokens === null) return null;
+  if (cacheReadTokens === null || cacheCreationTokens === null) return null;
 
-  return inputTokens + cacheCreationTokens + cacheCreationTokens;
+  return inputTokens + cacheReadTokens + cacheCreationTokens;
 }
 
-function getPromptTokenEstimate(segments, usage) {
+function getPromptTokenEstimate(segments, usage, upstreamMode = 'openai') {
   const characterCounts = segments.map((segment) => countCharacters(segment?.text ?? segment?.value ?? segment));
   const totalCharacters = characterCounts.reduce((sum, count) => sum + count, 0);
-  const promptTokens = promptTokensFromUsage(usage);
+  const promptTokens = promptTokensFromUsage(usage, upstreamMode);
   const tokensPerCharacter = totalCharacters > 0 && promptTokens !== null
     ? promptTokens / totalCharacters
     : null;
@@ -1247,14 +1306,29 @@ function promptEstimateLabel(characterCount, tokenCount) {
     : `${characterCount}字符 | 约${tokenCount}token`;
 }
 
+function inputPromptTokenLabel(tokenCount) {
+  return tokenCount === null ? '暂不可用' : `${tokenCount} token`;
+}
+
 function tokenMultiplierLabel(tokensPerCharacter) {
   if (tokensPerCharacter === null) return '暂不可估（缺少有效 usage 或字符）';
   return `${Number(tokensPerCharacter.toFixed(4))} token/字符`;
 }
 
-function renderMessageCard(root, segment, index, isPrefix, tokensPerCharacter = null) {
+function breakpointsForSegment(segment, breakpoints) {
+  const matches = breakpoints.filter((breakpoint) => pathMatches(segment.path, breakpoint.path));
+  if (!matches.length && segment.cache) {
+    matches.push({ path: `${segment.path}.cache_control`, reason: null, reasons: [], prefixHash: null });
+  }
+  return matches;
+}
+
+function renderMessageCard(root, group, index, isPrefix, tokensPerCharacter = null, options = {}) {
+  const segments = group.segments || [group];
+  const segmentBreakpoints = segments.map((segment) => breakpointsForSegment(segment, options.breakpoints || []));
+  const hasCacheBreakpoints = segmentBreakpoints.some((matches) => matches.length > 0);
   const card = document.createElement('div');
-  card.className = `msg-card ${isPrefix ? 'is-prefix' : ''}`.trim();
+  card.className = `msg-card ${isPrefix ? 'is-prefix' : ''} ${hasCacheBreakpoints ? 'has-cache-breakpoints' : ''}`.trim();
   const head = document.createElement('div');
   head.className = 'msg-card-head';
   const left = document.createElement('span');
@@ -1262,21 +1336,45 @@ function renderMessageCard(root, segment, index, isPrefix, tokensPerCharacter = 
   const role = document.createElement('span');
   role.className = 'msg-role';
   const dot = document.createElement('span');
-  dot.className = `role-dot ${segment.role}`;
+  dot.className = `role-dot ${group.role}`;
   role.appendChild(dot);
-  role.append(document.createTextNode(String(segment.role).toUpperCase()));
+  role.append(document.createTextNode(String(group.role).toUpperCase()));
   left.appendChild(role);
-  appendText(left, 'span', `#${index} · ${segment.label || segment.path}`, 'msg-index');
+  appendText(left, 'span', `#${index} · ${group.label || group.path}`, 'msg-index');
   const right = document.createElement('span');
   right.className = 'msg-right';
-  const characterCount = countCharacters(segment.text);
+  const characterCount = displayGroupCharacterCount(group);
   appendText(right, 'span', promptEstimateLabel(characterCount, estimatedTokens(characterCount, tokensPerCharacter)), 'msg-meta');
   appendText(right, 'span', '▾', 'msg-caret');
   head.append(left, right);
   head.onclick = () => card.classList.toggle('collapsed');
-  const body = appendText(card, 'div', segment.text || '（空内容）', 'msg-body');
+  const body = document.createElement('div');
+  body.className = 'msg-body';
   body.onclick = (event) => event.stopPropagation();
-  card.prepend(head);
+  const showBlockLabels = segments.some((segment) => Number.isInteger(segment.contentBlockIndex));
+
+  for (const [segmentIndex, segment] of segments.entries()) {
+    const block = document.createElement('div');
+    block.className = 'msg-content-block';
+    block.dataset.path = segment.path;
+    if (showBlockLabels) appendText(block, 'div', `block ${segment.contentBlockIndex} · ${segment.path}`, 'msg-index');
+    appendText(block, 'div', segment.text || '（空内容）', 'msg-content-text');
+    body.appendChild(block);
+
+    for (const breakpoint of segmentBreakpoints[segmentIndex]) {
+      const ordinal = Math.max(1, (options.breakpoints || []).indexOf(breakpoint) + 1);
+      renderCacheDivider(
+        body,
+        options.cache || {},
+        breakpoint,
+        ordinal,
+        Math.max(1, (options.breakpoints || []).length),
+        segment.cacheTtl ?? options.cacheTtl,
+      );
+    }
+  }
+
+  card.append(head, body);
   root.appendChild(card);
 }
 
@@ -1330,34 +1428,26 @@ function renderRequestBodyStream(root, capture, prefixOnly = false) {
   const mode = capture?.upstream?.mode || capture?.gateway?.upstreamMode;
   const cache = capture?.upstream?.cache || {};
   const segments = getOrderedBodySegments(body, mode);
-  const promptEstimate = getPromptTokenEstimate(segments, capture?.response?.usage);
+  const promptEstimate = getPromptTokenEstimate(segments, capture?.response?.usage, mode);
   const breakpoints = selectedBreakpoints(capture, segments);
   const firstCachePath = cache.firstCacheControlPath;
   let cacheIndex = segments.findIndex((segment) => segment.cache || pathMatches(segment.path, firstCachePath) || breakpoints.some((breakpoint) => pathMatches(segment.path, breakpoint.path)));
   if (cacheIndex < 0 && prefixOnly) cacheIndex = segments.length - 1;
   const visible = prefixOnly && cacheIndex >= 0 ? segments.slice(0, cacheIndex + 1) : segments;
+  const displayGroups = groupBodySegmentsForDisplay(visible);
 
-  if (!visible.length) {
+  if (!displayGroups.length) {
     appendText(root, 'div', '没有可视化请求体。可在“原始 JSON”中查看完整诊断。', 'empty-hint');
     return;
   }
 
-  visible.forEach((segment, index) => {
-    const isPrefix = cacheIndex >= 0 && index <= cacheIndex;
-    renderMessageCard(root, segment, index, isPrefix, promptEstimate.tokensPerCharacter);
-    const matches = breakpoints.filter((breakpoint) => pathMatches(segment.path, breakpoint.path));
-    if (!matches.length && segment.cache) matches.push({ path: `${segment.path}.cache_control`, reason: null, reasons: [], prefixHash: null });
-    for (const breakpoint of matches) {
-      const ordinal = Math.max(1, breakpoints.indexOf(breakpoint) + 1);
-      renderCacheDivider(
-        root,
-        cache,
-        breakpoint,
-        ordinal,
-        Math.max(1, breakpoints.length),
-        segment.cacheTtl ?? capture?.gateway?.cacheTtl,
-      );
-    }
+  displayGroups.forEach((group, index) => {
+    const isPrefix = cacheIndex >= 0 && group.endIndex <= cacheIndex;
+    renderMessageCard(root, group, index, isPrefix, promptEstimate.tokensPerCharacter, {
+      breakpoints,
+      cache,
+      cacheTtl: capture?.gateway?.cacheTtl,
+    });
   });
 }
 
@@ -1369,7 +1459,11 @@ function renderDetail() {
     item.upstream?.body || item.gateway?.transformedBody,
     item.upstream?.mode || item.gateway?.upstreamMode,
   );
-  const promptEstimate = getPromptTokenEstimate(promptSegments, usage);
+  const promptEstimate = getPromptTokenEstimate(
+    promptSegments,
+    usage,
+    item.upstream?.mode || item.gateway?.upstreamMode,
+  );
   $('drawerTitle').textContent = item.upstream?.body?.model || item.gateway?.transformedBody?.model || item.id;
   $('drawerEyebrow').textContent = channelName(state.runtime);
   $('detailId').textContent = `ID: ${item.id}`;
@@ -1384,7 +1478,7 @@ function renderDetail() {
     ['候选断点', cachePolicyCandidateCount(getCaptureCachePolicy(item)) ?? '未记录'],
     ['Prefix 动作', item.gateway?.prefixLock?.action || 'disabled'],
     ['Usage', hasUsage(usage) ? '已返回' : '未返回'],
-    ['提示词总量', promptEstimateLabel(promptEstimate.totalCharacters, estimatedTokens(promptEstimate.totalCharacters, promptEstimate.tokensPerCharacter))],
+    ['输入提示词', inputPromptTokenLabel(promptEstimate.promptTokens)],
     ['Token 倍率', tokenMultiplierLabel(promptEstimate.tokensPerCharacter)],
     ['当前渠道', channelName(state.runtime)],
   ]);

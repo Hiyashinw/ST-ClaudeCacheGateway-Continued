@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 
+const consoleCss = readFileSync(new URL('../public/console.css', import.meta.url), 'utf8');
+
 function fakeElement(tagName) {
     return {
         tagName,
@@ -16,6 +18,9 @@ function fakeElement(tagName) {
         },
         append(...children) {
             this.children.push(...children);
+        },
+        replaceChildren(...children) {
+            this.children = [...children];
         },
     };
 }
@@ -31,15 +36,30 @@ function loadConsoleHelpers() {
 
     const context = vm.createContext({
         console,
-        document: { createElement: fakeElement },
+        document: {
+            createElement: fakeElement,
+            createTextNode: (value) => ({ nodeType: 3, textContent: String(value) }),
+        },
     });
     vm.runInContext(`${withoutBootstrap}\n;globalThis.__helpers = {\n`
-        + 'tableCell, countCharacters, getOrderedBodySegments, promptTokensFromUsage, getPromptTokenEstimate, '
-        + 'estimatedTokens, promptEstimateLabel, systemMessageHandlingMode, systemMessageHandlingLabel\n};', context);
+        + 'tableCell, countCharacters, getOrderedBodySegments, groupBodySegmentsForDisplay, displayGroupCharacterCount, '
+        + 'promptTokensFromUsage, getPromptTokenEstimate, renderRequestBodyStream, '
+        + 'estimatedTokens, promptEstimateLabel, inputPromptTokenLabel, systemMessageHandlingMode, systemMessageHandlingLabel\n};', context);
     return context.__helpers;
 }
 
 const helpers = loadConsoleHelpers();
+
+function elementsByClass(root, className) {
+    const matches = [];
+    const visit = (node) => {
+        if (!node || typeof node !== 'object') return;
+        if (String(node.className || '').split(/\s+/).includes(className)) matches.push(node);
+        for (const child of node.children || []) visit(child);
+    };
+    visit(root);
+    return matches;
+}
 
 test('request-log container cells keep explicit empty strings empty', () => {
     const row = fakeElement('tr');
@@ -51,7 +71,7 @@ test('request-log container cells keep explicit empty strings empty', () => {
     assert.equal(row.children[0], cell);
 });
 
-test('prompt token multiplier uses input plus twice the Anthropic cache-creation tokens', () => {
+test('Anthropic prompt tokens include uncached, cache-read and cache-created input', () => {
     const segments = Array.from({ length: 5 }, () => ({ text: '字'.repeat(2000) }));
     const usage = {
         inputTokens: 4000,
@@ -61,13 +81,144 @@ test('prompt token multiplier uses input plus twice the Anthropic cache-creation
         cacheReadTokens: 16000,
     };
 
-    assert.equal(helpers.promptTokensFromUsage(usage), 20000);
-    const estimate = helpers.getPromptTokenEstimate(segments, usage);
+    assert.equal(helpers.promptTokensFromUsage(usage, 'anthropic'), 28000);
+    const estimate = helpers.getPromptTokenEstimate(segments, usage, 'anthropic');
     assert.equal(estimate.totalCharacters, 10000);
-    assert.equal(estimate.tokensPerCharacter, 2);
+    assert.equal(estimate.tokensPerCharacter, 2.8);
     assert.deepEqual(Array.from(estimate.characterCounts), [2000, 2000, 2000, 2000, 2000]);
-    assert.equal(helpers.estimatedTokens(estimate.characterCounts[0], estimate.tokensPerCharacter), 4000);
-    assert.equal(helpers.promptEstimateLabel(2000, 4000), '2000字符 | 约4000token');
+    assert.equal(helpers.estimatedTokens(estimate.characterCounts[0], estimate.tokensPerCharacter), 5600);
+    assert.equal(helpers.promptEstimateLabel(2000, 5600), '2000字符 | 约5600token');
+    assert.equal(helpers.inputPromptTokenLabel(estimate.promptTokens), '28000 token');
+    assert.equal(helpers.inputPromptTokenLabel(null), '暂不可用');
+});
+
+test('OpenAI prompt tokens do not add Anthropic cache fields', () => {
+    const usage = {
+        inputTokens: 4000,
+        anthropicCacheCreationInputTokens: 8000,
+        anthropicCacheReadInputTokens: 16000,
+    };
+
+    assert.equal(helpers.promptTokensFromUsage(usage, 'openai'), 4000);
+    assert.equal(helpers.promptTokensFromUsage(usage), 4000);
+    assert.equal(helpers.getPromptTokenEstimate([{ text: '字'.repeat(2000) }], usage, 'openai').tokensPerCharacter, 2);
+});
+
+test('Anthropic message content blocks form one display card without changing the token denominator', () => {
+    const body = {
+        system: [{ type: 'text', text: '系统规则' }],
+        messages: [
+            {
+                role: 'user',
+                content: [
+                    { type: 'text', text: '第一段' },
+                    { type: 'text', text: '第二段', cache_control: { type: 'ephemeral' } },
+                    { type: 'tool_result', tool_use_id: 'tool-1', content: '工具结果' },
+                ],
+            },
+            { role: 'assistant', content: [{ type: 'text', text: '回答' }] },
+        ],
+    };
+    const segments = helpers.getOrderedBodySegments(body, 'anthropic');
+    const groups = helpers.groupBodySegmentsForDisplay(segments);
+    const messageGroups = groups.filter((group) => group.messageIndex !== null);
+
+    assert.equal(segments.length, 5);
+    assert.equal(groups.length, 3, 'top-level system keeps its own card and each message gets one card');
+    assert.equal(messageGroups.length, 2);
+    assert.deepEqual(Array.from(messageGroups[0].segments, (segment) => segment.path), [
+        'messages[0].content[0]',
+        'messages[0].content[1]',
+        'messages[0].content[2]',
+    ]);
+    assert.equal(messageGroups[0].role, 'user');
+    assert.equal(messageGroups[0].label, 'messages[0] · 3 blocks');
+
+    const flatCharacterCount = helpers.getPromptTokenEstimate(segments, { inputTokens: 100 }, 'anthropic').totalCharacters;
+    const groupedCharacterCount = groups.reduce(
+        (sum, group) => sum + helpers.displayGroupCharacterCount(group),
+        0,
+    );
+    assert.equal(groupedCharacterCount, flatCharacterCount, 'grouping must count every block exactly once');
+});
+
+test('request-body renderer keeps block paths and cache dividers inside one message card', () => {
+    const capture = {
+        upstream: {
+            mode: 'anthropic',
+            body: {
+                messages: [{
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: '第一段' },
+                        { type: 'text', text: '第二段', cache_control: { type: 'ephemeral' } },
+                        { type: 'text', text: '第三段' },
+                    ],
+                }, {
+                    role: 'assistant',
+                    content: [{ type: 'text', text: '无断点回答' }],
+                }],
+            },
+            cache: {
+                breakpoints: [{ path: 'messages[0].content[1].cache_control' }],
+                prefixHash: '1234567890abcdef',
+            },
+        },
+        gateway: {
+            upstreamMode: 'anthropic',
+            cacheTtl: 'auto',
+            cachePolicy: {
+                selectedBreakpoints: [{
+                    path: 'messages[0].content[1]',
+                    reason: 'existing-cache-control',
+                    prefixHash: '1234567890abcdef',
+                }],
+            },
+        },
+        response: { usage: { inputTokens: 10 } },
+    };
+    const root = fakeElement('div');
+
+    helpers.renderRequestBodyStream(root, capture);
+
+    const cards = elementsByClass(root, 'msg-card');
+    assert.equal(cards.length, 2);
+    assert.ok(elementsByClass(cards[0], 'has-cache-breakpoints').length === 1);
+    assert.ok(elementsByClass(cards[1], 'has-cache-breakpoints').length === 0);
+    assert.equal(elementsByClass(cards[1], 'cache-divider').length, 0);
+    const blocks = elementsByClass(cards[0], 'msg-content-block');
+    assert.equal(blocks.length, 3);
+    assert.deepEqual(blocks.map((block) => block.dataset.path), [
+        'messages[0].content[0]',
+        'messages[0].content[1]',
+        'messages[0].content[2]',
+    ]);
+    const dividers = elementsByClass(cards[0], 'cache-divider');
+    assert.equal(dividers.length, 1);
+    assert.ok(elementsByClass(dividers[0], 'cache-sub')[0].textContent.includes('messages[0].content[1]'));
+    const messageBody = elementsByClass(cards[0], 'msg-body')[0];
+    assert.ok(messageBody.children.includes(dividers[0]), 'divider must remain outside the hidden content block');
+    assert.equal(blocks.some((block) => elementsByClass(block, 'cache-divider').length > 0), false);
+});
+
+test('collapsed message cards keep cache dividers visible while ordinary bodies stay hidden', () => {
+    assert.match(consoleCss, /\.msg-card\.collapsed:not\(\.has-cache-breakpoints\) \.msg-body\s*\{\s*display:\s*none;/);
+    assert.match(consoleCss, /\.msg-card\.collapsed\.has-cache-breakpoints \.msg-content-block\s*\{\s*display:\s*none;/);
+    assert.doesNotMatch(consoleCss, /\.msg-card\.collapsed \.msg-body\s*\{\s*display:\s*none;/);
+});
+
+test('display grouping never hides genuinely adjacent same-role messages', () => {
+    const segments = helpers.getOrderedBodySegments({
+        messages: [
+            { role: 'user', content: [{ type: 'text', text: '第一条用户消息' }] },
+            { role: 'user', content: [{ type: 'text', text: '第二条用户消息' }] },
+        ],
+    }, 'anthropic');
+    const groups = helpers.groupBodySegmentsForDisplay(segments);
+
+    assert.equal(groups.length, 2);
+    assert.deepEqual(Array.from(groups, (group) => group.messageIndex), [0, 1]);
+    assert.deepEqual(Array.from(groups, (group) => group.path), ['messages[0]', 'messages[1]']);
 });
 
 test('character counting uses Unicode code points and unavailable usage stays explicit', () => {
@@ -91,9 +242,17 @@ test('character counting uses Unicode code points and unavailable usage stays ex
 
 test('invalid usage fields cannot produce a misleading multiplier', () => {
     assert.equal(helpers.promptTokensFromUsage({ anthropicCacheCreationInputTokens: 20 }), null);
-    assert.equal(helpers.promptTokensFromUsage({ inputTokens: 10, anthropicCacheCreationInputTokens: -1 }), null);
-    assert.equal(helpers.promptTokensFromUsage({ inputTokens: 10, anthropicCacheCreationInputTokens: 'invalid' }), null);
+    assert.equal(helpers.promptTokensFromUsage({ inputTokens: 10, anthropicCacheCreationInputTokens: -1 }, 'anthropic'), null);
+    assert.equal(helpers.promptTokensFromUsage({ inputTokens: 10, anthropicCacheCreationInputTokens: 'invalid' }, 'anthropic'), null);
+    assert.equal(helpers.promptTokensFromUsage({ inputTokens: 10, anthropicCacheReadInputTokens: -1 }, 'anthropic'), null);
+    assert.equal(helpers.promptTokensFromUsage({ inputTokens: 10, anthropicCacheReadInputTokens: 'invalid' }, 'anthropic'), null);
+    assert.equal(helpers.promptTokensFromUsage({
+        inputTokens: 10,
+        anthropicCacheCreationInputTokens: 'ignored by OpenAI',
+        anthropicCacheReadInputTokens: -1,
+    }, 'openai'), 10);
     assert.equal(helpers.promptTokensFromUsage({ inputTokens: 10 }), 10);
+    assert.equal(helpers.promptTokensFromUsage({ inputTokens: 10 }, 'anthropic'), 10);
 });
 
 test('tool and structured-output definitions join the denominator without control parameters', () => {

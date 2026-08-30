@@ -1598,6 +1598,49 @@ test('default Anthropic optimization preserves block order and cache controls wh
     ]);
 });
 
+test('default Anthropic optimization re-merges adjacent roles after Prefix Lock rebuilds the wire body', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 9,
+        systemMessageHandlingMode: 'default',
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/console/prefix-lock', { enabled: true });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', {
+        model: 'anthropic-prefix-role-merge',
+        max_tokens: 32,
+        messages: [
+            { role: 'system', content: 'System' },
+            { role: 'user', content: 'User 0' },
+            { role: 'assistant', content: 'Assistant 0' },
+            { role: 'user', content: 'User 1' },
+            { role: 'assistant', content: `Locked assistant${MARKER}` },
+            { role: 'user', content: 'Tail user' },
+        ],
+    });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', {
+        model: 'anthropic-prefix-role-merge',
+        max_tokens: 32,
+        messages: [
+            { role: 'system', content: 'System' },
+            { role: 'user', content: `Current user${MARKER}` },
+            { role: 'assistant', content: 'Current assistant' },
+            { role: 'user', content: 'Current tail' },
+        ],
+    });
+
+    const messages = fixture.requests[1].body.messages;
+    assert.equal(messages.some((message, index) => index > 0 && message.role === messages[index - 1].role), false);
+    assert.deepEqual(messages.at(-2), {
+        role: 'assistant',
+        content: [
+            { type: 'text', text: 'Locked assistant', cache_control: { type: 'ephemeral' } },
+            { type: 'text', text: 'Current assistant' },
+        ],
+    });
+});
+
 test('OpenAI inbound -> Anthropic non-stream response exposes thinking as reasoning_content', async (t) => {
     const fixture = await startGatewayFixture({ upstreamMode: 'anthropic' });
     t.after(() => fixture.close());

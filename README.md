@@ -44,7 +44,7 @@ API Key: 你的上游供应商 API Key
 - **冻结队列式滚动锚点**：首次冻结全部已选非固定点；达到配置的逻辑内容块间隔后，只用一个新点替换最老点，其余位置不变。每次成功请求最多替换一个，失败请求不会推进状态。
 - **自动生成、选择与清理断点**：支持自动判断、始终开启和完全关闭三种生成模式；需要生成时，会在最终 SYSTEM 末尾和每个 ASSISTANT 消息后预生成 marker。随后统一规范化 inline、独立 marker、content array 和 Anthropic system 候选，自动去重、删除未选 marker 与空消息，并在固定头、单锚点尾点、冻结滚动点及调用方已有控制之间分配最多四点预算。
 - **三条实际请求链路**：统一处理并验证 OpenAI 入站 → OpenAI 上游、OpenAI 入站 → Anthropic 上游、Anthropic 入站 → Anthropic 上游的最终请求体。
-- **更完整的诊断**：可查看候选路径、入选原因、上下文短哈希、锚点动作或暂停原因、最终上游请求体以及上游返回的缓存 token 用量；每个提示词模块还会同时显示字符数和基于实际 usage 的 token 估计。
+- **更完整的诊断**：可查看候选路径、入选原因、上下文短哈希、锚点动作或暂停原因、最终上游请求体以及上游返回的缓存 token 用量；每条 message 显示为一张角色卡，内部保留各 content block、原始路径和缓存断点，每个提示词模块还会同时显示字符数和基于实际 usage 的 token 估计。
 
 ## 安装与启动
 
@@ -469,7 +469,7 @@ x-forwarded-for
 - Prefix hash / suffix hash
 - 上游状态码
 - 上游返回的缓存 read / creation token 用量
-- 每个可视化提示词模块的字符数和 token 估计。倍率按当前请求的 `(inputTokens + anthropicCacheCreationInputTokens + anthropicCacheCreationInputTokens) / 全部模块字符数` 计算；没有有效 usage 时只显示字符数并明确标为暂不可估
+- 每个可视化提示词模块的字符数和 token 估计。OpenAI-compatible 上游直接使用完整的 `inputTokens`；Anthropic native 上游使用 `inputTokens + anthropicCacheReadInputTokens + anthropicCacheCreationInputTokens`，再除以全部模块字符数得到倍率。没有有效 usage 时只显示字符数并明确标为暂不可估
 
 诊断记录可能包含私密提示词、聊天内容、世界书内容和最终上游请求体。不要公开分享导出的诊断 JSON。需要特别注意：虽然旧记录会在重启后清空，但诊断开关本身会保持开启，应用重启后可能继续捕获新的请求；排查完成后请主动关闭诊断并清空记录。
 
