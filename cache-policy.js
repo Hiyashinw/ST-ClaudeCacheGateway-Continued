@@ -1347,14 +1347,18 @@ export class AnchorStore {
             }
         } else {
             const observedHashes = new Set(statePlan.observedCandidateHashes);
-            const related = [...this.contexts.values()].filter((item) => (
+            const compatibleAncestors = [...this.contexts.values()].filter((item) => (
                 item.scopeKey === statePlan.scopeKey
                 && item.anchorMode === statePlan.anchorMode
-                && item.anchors.some((anchor) => observedHashes.has(anchor.prefixHash))
+                && item.anchors.length > 0
+                && item.anchors.every((anchor) => observedHashes.has(anchor.prefixHash))
             ));
-            const newestRelated = related.sort((left, right) => right.frontierDepth - left.frontierDepth)[0];
 
-            if (newestRelated && newestRelated.frontierDepth >= statePlan.nextContext.frontierDepth) {
+            // A context committed after this cold plan was built already owns
+            // the same append-only prefix. Creating another context here would
+            // replace the entire frozen queue on the next match. Partial overlap
+            // is deliberately allowed because it represents a real prefix fork.
+            if (compatibleAncestors.length > 0) {
                 return false;
             }
         }
@@ -1391,7 +1395,14 @@ function candidateForAnchor(anchor, candidateByHash) {
     return candidateByHash.get(anchor.prefixHash) || null;
 }
 
-function buildAnchorDecision({ store, scopeInfo, candidates, policy }) {
+function buildAnchorDecision({
+    store,
+    scopeInfo,
+    candidates,
+    policy,
+    maxAnchorCount,
+    callerOwnedTargets,
+}) {
     const mode = policy.cacheAnchorMode;
 
     if (mode === 'off') {
@@ -1463,34 +1474,66 @@ function buildAnchorDecision({ store, scopeInfo, candidates, policy }) {
         };
     }
 
-    const current = matchedAnchors[matchedAnchors.length - 1];
+    const callerOwnedMatched = matchedAnchors
+        .filter((item) => callerOwnedTargets.has(item.candidate.target));
+    const activeAnchors = matchedAnchors
+        .filter((item) => !callerOwnedTargets.has(item.candidate.target));
+    const capacityEvictions = [];
+
+    while (activeAnchors.length > maxAnchorCount) {
+        capacityEvictions.push(activeAnchors.shift());
+    }
+
+    const rollingResetReason = resetReason
+        || (callerOwnedMatched.length > 0 ? 'caller-control-reserved' : null)
+        || (capacityEvictions.length > 0 ? 'anchor-capacity-reduced' : null);
+
+    if (activeAnchors.length === 0) {
+        return {
+            action: 'reset',
+            required: [],
+            active: [],
+            nextAnchors: [],
+            pendingEviction: null,
+            matchedContext: match.context,
+            resetReason: rollingResetReason,
+            canPersist: false,
+            needsSeed: true,
+        };
+    }
+
+    const current = activeAnchors[activeAnchors.length - 1];
     const promotion = candidates.find((candidate) => (
-        candidate.logicalIndex > current.candidate.logicalIndex
+        !callerOwnedTargets.has(candidate.target)
+        && candidate.logicalIndex > current.candidate.logicalIndex
         && candidate.logicalIndex - current.candidate.logicalIndex >= policy.cacheAnchorIntervalBlocks
     ));
 
     if (!promotion) {
         return {
-            action: resetReason ? 'reset' : 'match',
-            required: matchedAnchors.map((item) => ({ candidate: item.candidate, reason: 'active-anchor' })),
-            active: matchedAnchors,
-            nextAnchors: matchedAnchors.map((item) => item.anchor),
-            pendingEviction: null,
+            action: rollingResetReason ? 'reset' : 'match',
+            required: activeAnchors.map((item) => ({ candidate: item.candidate, reason: 'active-anchor' })),
+            active: activeAnchors,
+            nextAnchors: activeAnchors.map((item) => item.anchor),
+            pendingEviction: capacityEvictions[0] || null,
             matchedContext: match.context,
-            resetReason,
+            resetReason: rollingResetReason,
             canPersist: true,
         };
     }
 
     const combined = [
-        ...matchedAnchors.map((item) => ({ ...item, reason: 'active-anchor' })),
+        ...activeAnchors.map((item) => ({ ...item, reason: 'active-anchor' })),
         {
             anchor: { prefixHash: promotion.prefixHash, logicalIndex: promotion.logicalIndex },
             candidate: promotion,
             reason: 'promoted-anchor',
         },
     ];
-    const pendingEviction = combined.length > 2 ? combined[0] : null;
+    // A full rolling queue makes room before selecting the new boundary, so a
+    // promotion changes only its oldest slot instead of moving every tail slot.
+    const promotedEviction = combined.length > maxAnchorCount ? combined.shift() : null;
+    const pendingEviction = capacityEvictions[0] || promotedEviction;
 
     if (pendingEviction) {
         pendingEviction.reason = 'pending-eviction';
@@ -1499,11 +1542,11 @@ function buildAnchorDecision({ store, scopeInfo, candidates, policy }) {
     return {
         action: 'promote',
         required: combined.map((item) => ({ candidate: item.candidate, reason: item.reason })),
-        active: matchedAnchors,
-        nextAnchors: combined.slice(-2).map((item) => item.anchor),
+        active: activeAnchors,
+        nextAnchors: combined.map((item) => item.anchor),
         pendingEviction,
         matchedContext: match.context,
-        resetReason,
+        resetReason: rollingResetReason,
         canPersist: true,
     };
 }
@@ -1873,11 +1916,17 @@ export function planCacheBreaks(body, options = {}) {
             selectCandidate(candidate, 'fixed-head');
         }
 
+        const fixedTargets = new Set(fixedCandidates.map((candidate) => candidate.target));
+        const callerOwnedTargets = new Set(existing.controls.map((record) => record.target));
+        const reservedBreakpointCount = selectedTargets.size;
+
         anchorDecision = buildAnchorDecision({
             store: options.store,
             scopeInfo,
             candidates,
             policy,
+            maxAnchorCount: Math.max(0, maxBreakpoints - reservedBreakpointCount),
+            callerOwnedTargets,
         });
 
         if (!anchorDecision.needsSeed) {
@@ -1901,26 +1950,38 @@ export function planCacheBreaks(body, options = {}) {
             }
         }
 
-        for (let index = candidates.length - 1; index >= 0 && selectedTargets.size < maxBreakpoints; index--) {
-            selectCandidate(candidates[index], 'tail');
+        // Tail selection initializes a rolling queue once. After that, only an
+        // interval promotion may introduce a new cache boundary.
+        if (policy.cacheAnchorMode !== 'rolling' || anchorDecision.needsSeed) {
+            for (let index = candidates.length - 1; index >= 0 && selectedTargets.size < maxBreakpoints; index--) {
+                selectCandidate(candidates[index], 'tail');
+            }
         }
 
         if (anchorDecision.needsSeed) {
-            const fixedTargets = new Set(fixedCandidates.map((candidate) => candidate.target));
-            const learned = candidates.find((candidate) => (
+            const learnedCandidates = candidates.filter((candidate) => (
                 selectedTargets.has(candidate.target) && !fixedTargets.has(candidate.target)
             ));
+            const learned = policy.cacheAnchorMode === 'rolling'
+                ? learnedCandidates.filter((candidate) => !callerOwnedTargets.has(candidate.target))
+                : learnedCandidates.slice(0, 1);
 
-            if (learned) {
-                const currentReasons = selectionReasons.get(learned.target) || [];
-                selectionReasons.set(learned.target, [
-                    'learned-anchor',
-                    ...currentReasons.filter((reason) => reason !== 'learned-anchor'),
-                ]);
+            if (learned.length > 0) {
+                for (const candidate of learned) {
+                    const currentReasons = selectionReasons.get(candidate.target) || [];
+                    selectionReasons.set(candidate.target, [
+                        'learned-anchor',
+                        ...currentReasons.filter((reason) => reason !== 'learned-anchor'),
+                    ]);
+                }
+
                 anchorDecision = {
                     ...anchorDecision,
-                    required: [{ candidate: learned, reason: 'learned-anchor' }],
-                    nextAnchors: [{ prefixHash: learned.prefixHash, logicalIndex: learned.logicalIndex }],
+                    required: learned.map((candidate) => ({ candidate, reason: 'learned-anchor' })),
+                    nextAnchors: learned.map((candidate) => ({
+                        prefixHash: candidate.prefixHash,
+                        logicalIndex: candidate.logicalIndex,
+                    })),
                     canPersist: true,
                     needsSeed: false,
                 };

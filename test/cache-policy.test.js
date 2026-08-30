@@ -1274,7 +1274,7 @@ test('anchor contexts are isolated by channel, protocol, model, and cache TTL', 
     }
 });
 
-test('rolling anchors reproduce the gradual F/I/L window rotation', () => {
+test('rolling anchors fill by interval, then freeze instead of selecting a moving tail', () => {
     const store = new AnchorStore();
     const policy = {
         fixedHeadBreakpointCount: 1,
@@ -1283,9 +1283,9 @@ test('rolling anchors reproduce the gradual F/I/L window rotation', () => {
     };
     const calls = [
         ['ABCDEF', ['A', 'F'], [1, 6], 'learn'],
-        ['ABCDEFGHIJ', ['A', 'F', 'I', 'J'], [1, 6, 9, 10], 'promote'],
+        ['ABCDEFGHIJ', ['A', 'F', 'I', 'J'], [1, 6, 9], 'promote'],
         ['ABCDEFGHIJKLM', ['A', 'F', 'I', 'L', 'M'], [1, 6, 9, 12], 'promote'],
-        ['ABCDEFGHIJKLMN', ['A', 'F', 'I', 'L', 'M'], [1, 9, 12, 13], 'match'],
+        ['ABCDEFGHIJKLMN', ['A', 'F', 'I', 'L', 'M'], [1, 6, 9, 12], 'match'],
     ];
 
     for (const [letters, marks, expected, action] of calls) {
@@ -1295,35 +1295,50 @@ test('rolling anchors reproduce the gradual F/I/L window rotation', () => {
         assert.equal(plan.commit(), true);
     }
 
-    assert.equal(store.getStats().activeAnchorCount, 2);
+    assert.equal(store.getStats().activeAnchorCount, 3);
 });
 
-test('rolling-anchor seed comes from the earliest point in the selected latest-four window', () => {
+test('rolling mode freezes every initially selected non-fixed point and rotates only the oldest slot', () => {
     const store = new AnchorStore();
     const policy = {
-        fixedHeadBreakpointCount: 0,
+        fixedHeadBreakpointCount: 1,
         cacheAnchorMode: 'rolling',
         cacheAnchorIntervalBlocks: 3,
     };
     const first = planCacheBreaks(blockBody('ABCDEFG'), { policy, store });
-    const seed = first.diagnostics.candidates.find((candidate) => candidate.logicalIndex === 4);
     const initiallyLearned = first.diagnostics.candidates
         .filter((candidate) => candidate.reasons.includes('learned-anchor'));
     const initiallyPromoted = first.diagnostics.candidates
         .filter((candidate) => candidate.reasons.includes('promoted-anchor'));
 
-    assert.deepEqual(selectedLogicalIndexes(first), [4, 5, 6, 7]);
-    assert.deepEqual(seed.reasons, ['learned-anchor', 'tail']);
-    assert.equal(initiallyLearned.length, 1);
+    assert.deepEqual(selectedLogicalIndexes(first), [1, 5, 6, 7]);
+    assert.deepEqual(initiallyLearned.map((candidate) => candidate.logicalIndex), [5, 6, 7]);
+    assert.ok(initiallyLearned.every((candidate) => candidate.reasons.includes('tail')));
     assert.equal(initiallyPromoted.length, 0);
-    assert.deepEqual(first.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [4]);
+    assert.deepEqual(first.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [5, 6, 7]);
     assert.equal(first.commit(), true);
 
-    const promoted = planCacheBreaks(blockBody('ABCDEFGHIJ'), { policy, store });
-    const nextAnchor = promoted.diagnostics.candidates.find((candidate) => candidate.logicalIndex === 7);
-    assert.deepEqual(selectedLogicalIndexes(promoted), [4, 7, 9, 10]);
-    assert.equal(nextAnchor.reasons.includes('promoted-anchor'), true);
-    assert.deepEqual(promoted.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [4, 7]);
+    const grownBelowInterval = planCacheBreaks(blockBody('ABCDEFGHI'), { policy, store });
+    assert.deepEqual(selectedLogicalIndexes(grownBelowInterval), [1, 5, 6, 7]);
+    assert.equal(grownBelowInterval.diagnostics.action, 'match');
+    assert.deepEqual(grownBelowInterval.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [5, 6, 7]);
+    assert.equal(grownBelowInterval.commit(), true);
+
+    const firstRotation = planCacheBreaks(blockBody('ABCDEFGHIJ'), { policy, store });
+    assert.deepEqual(selectedLogicalIndexes(firstRotation), [1, 6, 7, 10]);
+    assert.equal(firstRotation.diagnostics.action, 'promote');
+    assert.equal(firstRotation.diagnostics.pendingEvictionAnchorCount, 1);
+    assert.equal(
+        firstRotation.diagnostics.candidates.find((candidate) => candidate.logicalIndex === 10)
+            .reasons.includes('promoted-anchor'),
+        true,
+    );
+    assert.deepEqual(firstRotation.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [6, 7, 10]);
+    assert.equal(firstRotation.commit(), true);
+
+    const secondRotation = planCacheBreaks(blockBody('ABCDEFGHIJKLM'), { policy, store });
+    assert.deepEqual(selectedLogicalIndexes(secondRotation), [1, 7, 10, 13]);
+    assert.deepEqual(secondRotation.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [7, 10, 13]);
 });
 
 test('a rolling plan promotes at most one anchor even when several intervals are available', () => {
@@ -1344,7 +1359,165 @@ test('a rolling plan promotes at most one anchor even when several intervals are
     assert.deepEqual(longPlan.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [6, 9]);
 });
 
-test('rolling promotion pauses when existing controls consume overlap budget', () => {
+test('rolling capacity excludes an unrelated caller control and still rotates its oldest marker slot', () => {
+    const store = new AnchorStore();
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const withCallerToolControl = (letters) => {
+        const body = blockBody(letters);
+        body.tools = [{
+            name: 'caller-controlled-tool',
+            cache_control: { type: 'ephemeral' },
+        }];
+        return body;
+    };
+    const first = planCacheBreaks(withCallerToolControl('ABCDEFG'), { policy, store });
+
+    assert.deepEqual(selectedLogicalIndexes(first), [1, 6, 7]);
+    assert.deepEqual(first.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [6, 7]);
+    assert.equal(first.diagnostics.cacheControlCount, 4);
+    assert.equal(first.commit(), true);
+
+    const rotated = planCacheBreaks(withCallerToolControl('ABCDEFGHIJ'), { policy, store });
+    assert.equal(rotated.diagnostics.action, 'promote');
+    assert.equal(rotated.diagnostics.pauseReason, null);
+    assert.deepEqual(selectedLogicalIndexes(rotated), [1, 7, 10]);
+    assert.deepEqual(rotated.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [7, 10]);
+    assert.equal(rotated.diagnostics.cacheControlCount, 4);
+});
+
+test('rolling reserves a caller-owned marker candidate while gateway-owned slots keep rotating', () => {
+    const store = new AnchorStore();
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const withCallerCandidate = (letters) => {
+        const body = blockBody(letters);
+        body.messages[1].content[0].cache_control = { type: 'ephemeral' };
+        return body;
+    };
+    const first = planCacheBreaks(withCallerCandidate('ABCDEFG'), { policy, store });
+
+    assert.deepEqual(selectedLogicalIndexes(first), [1, 2, 6, 7]);
+    assert.deepEqual(first.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [6, 7]);
+    assert.equal(first.commit(), true);
+
+    const firstRotation = planCacheBreaks(withCallerCandidate('ABCDEFGHIJ'), { policy, store });
+    assert.equal(firstRotation.diagnostics.action, 'promote');
+    assert.equal(firstRotation.diagnostics.pauseReason, null);
+    assert.deepEqual(selectedLogicalIndexes(firstRotation), [1, 2, 7, 10]);
+    assert.deepEqual(firstRotation.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [7, 10]);
+    assert.equal(firstRotation.commit(), true);
+
+    const secondRotation = planCacheBreaks(withCallerCandidate('ABCDEFGHIJKLM'), { policy, store });
+    assert.deepEqual(selectedLogicalIndexes(secondRotation), [1, 2, 10, 13]);
+    assert.deepEqual(secondRotation.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [10, 13]);
+});
+
+test('rolling promotion skips a later caller-owned marker candidate', () => {
+    const store = new AnchorStore();
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const withCallerJ = (letters, marks) => {
+        const body = blockBody(letters, marks);
+        body.messages[9].content[0].cache_control = { type: 'ephemeral' };
+        return body;
+    };
+    const first = planCacheBreaks(
+        withCallerJ('ABCDEFGHIJ', ['A', 'F', 'G', 'J']),
+        { policy, store },
+    );
+
+    assert.deepEqual(selectedLogicalIndexes(first), [1, 6, 7, 10]);
+    assert.deepEqual(first.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [6, 7]);
+    assert.equal(first.commit(), true);
+
+    const promoted = planCacheBreaks(
+        withCallerJ('ABCDEFGHIJKLM', ['A', 'F', 'G', 'J', 'M']),
+        { policy, store },
+    );
+    assert.equal(promoted.diagnostics.action, 'promote');
+    assert.deepEqual(selectedLogicalIndexes(promoted), [1, 7, 10, 13]);
+    assert.deepEqual(promoted.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [7, 13]);
+    assert.equal(
+        promoted.diagnostics.candidates.find((candidate) => candidate.logicalIndex === 10)
+            .reasons.includes('promoted-anchor'),
+        false,
+    );
+    assert.equal(
+        promoted.diagnostics.candidates.find((candidate) => candidate.logicalIndex === 13)
+            .reasons.includes('promoted-anchor'),
+        true,
+    );
+});
+
+test('rolling reclassifies an active anchor that later becomes caller-owned', () => {
+    const store = new AnchorStore();
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const first = planCacheBreaks(blockBody('ABCDEFG'), { policy, store });
+    assert.deepEqual(first.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [5, 6, 7]);
+    assert.equal(first.commit(), true);
+
+    const callerOwnsF = blockBody('ABCDEFGHI');
+    callerOwnsF.messages[5].content[0].cache_control = { type: 'ephemeral' };
+    const reclassified = planCacheBreaks(callerOwnsF, { policy, store });
+    assert.equal(reclassified.diagnostics.pauseReason, null);
+    assert.deepEqual(selectedLogicalIndexes(reclassified), [1, 5, 6, 7]);
+    assert.deepEqual(reclassified.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [5, 7]);
+    assert.equal(reclassified.commit(), true);
+
+    const reachesInterval = blockBody('ABCDEFGHIJ');
+    reachesInterval.messages[5].content[0].cache_control = { type: 'ephemeral' };
+    const rotated = planCacheBreaks(reachesInterval, { policy, store });
+    assert.equal(rotated.diagnostics.action, 'promote');
+    assert.equal(rotated.diagnostics.pauseReason, null);
+    assert.deepEqual(selectedLogicalIndexes(rotated), [1, 6, 7, 10]);
+    assert.deepEqual(rotated.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [7, 10]);
+});
+
+test('rolling relearns from the tail when every active anchor becomes caller-owned', () => {
+    const store = new AnchorStore();
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const first = planCacheBreaks(blockBody('ABCDEFG', ['A', 'F', 'G']), { policy, store });
+    assert.deepEqual(first.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [6, 7]);
+    assert.equal(first.commit(), true);
+
+    const allCallerOwned = blockBody('ABCDEFGHIJ', ['A', 'F', 'G', 'J']);
+    allCallerOwned.messages[5].content[0].cache_control = { type: 'ephemeral' };
+    allCallerOwned.messages[6].content[0].cache_control = { type: 'ephemeral' };
+    const relearned = planCacheBreaks(allCallerOwned, { policy, store });
+    assert.equal(relearned.diagnostics.pauseReason, null);
+    assert.deepEqual(selectedLogicalIndexes(relearned), [1, 6, 7, 10]);
+    assert.deepEqual(relearned.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [10]);
+    assert.equal(relearned.commit(), true);
+
+    const nextInterval = blockBody('ABCDEFGHIJKLM', ['A', 'F', 'G', 'J', 'M']);
+    nextInterval.messages[5].content[0].cache_control = { type: 'ephemeral' };
+    nextInterval.messages[6].content[0].cache_control = { type: 'ephemeral' };
+    const rotated = planCacheBreaks(nextInterval, { policy, store });
+    assert.equal(rotated.diagnostics.action, 'promote');
+    assert.equal(rotated.diagnostics.pauseReason, null);
+    assert.deepEqual(selectedLogicalIndexes(rotated), [1, 6, 7, 13]);
+    assert.deepEqual(rotated.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [13]);
+});
+
+test('rolling promotion adapts when a new unrelated control reduces the marker capacity', () => {
     const store = new AnchorStore();
     const policy = {
         fixedHeadBreakpointCount: 1,
@@ -1355,16 +1528,17 @@ test('rolling promotion pauses when existing controls consume overlap budget', (
     planCacheBreaks(blockBody('ABCDEFGHIJ', ['A', 'F', 'I', 'J']), { policy, store }).commit();
     const nextBody = blockBody('ABCDEFGHIJKLM', ['A', 'F', 'I', 'L', 'M']);
     nextBody.messages[1].content[0].cache_control = { type: 'ephemeral' };
-    const paused = planCacheBreaks(nextBody, { policy, store });
+    const promoted = planCacheBreaks(nextBody, { policy, store });
 
-    assert.equal(paused.diagnostics.action, 'rotation-paused');
-    assert.equal(paused.diagnostics.pauseReason, 'anchor-overlap-budget');
-    assert.equal(paused.diagnostics.pendingEvictionAnchorCount, 0);
-    assert.deepEqual(selectedLogicalIndexes(paused), [1, 6, 9]);
-    assert.equal(paused.diagnostics.cacheControlCount, 4);
-    assert.equal(paused.commit(), true);
+    assert.equal(promoted.diagnostics.action, 'promote');
+    assert.equal(promoted.diagnostics.pauseReason, null);
+    assert.equal(promoted.diagnostics.pendingEvictionAnchorCount, 1);
+    assert.deepEqual(selectedLogicalIndexes(promoted), [1, 9, 12]);
+    assert.deepEqual(promoted.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [9, 12]);
+    assert.equal(promoted.diagnostics.cacheControlCount, 4);
+    assert.equal(promoted.commit(), true);
     assert.equal(store.getStats().activeAnchorCount, 2);
-    assert.equal(store.getStats().lastPauseReason, 'anchor-overlap-budget');
+    assert.equal(store.getStats().lastPauseReason, null);
 });
 
 test('zero anchor budget records status only after a successful commit', () => {
@@ -1420,6 +1594,42 @@ test('AnchorStore applies strict frontier extension but rejects a delayed regres
     const extending = planCacheBreaks(blockBody('ABCDEFGHIJKL', ['A', 'F', 'I', 'L']), { policy, store });
     assert.equal(extending.commit(), true);
     assert.equal(delayedShort.commit(), false, 'a late shorter request must not roll anchors back');
+});
+
+test('AnchorStore rejects a stale append-only cold start without blocking a divergent prefix branch', () => {
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const store = new AnchorStore();
+    const earlierColdStart = planCacheBreaks(blockBody('ABCDEFG'), { policy, store });
+    const laterAppendOnlyColdStart = planCacheBreaks(blockBody('ABCDEFGHIJ'), { policy, store });
+
+    assert.equal(earlierColdStart.statePlan.operation, 'create');
+    assert.equal(laterAppendOnlyColdStart.statePlan.operation, 'create');
+    assert.equal(earlierColdStart.commit(), true);
+    assert.equal(
+        laterAppendOnlyColdStart.commit(),
+        false,
+        'a stale append-only plan must not create a second, wholesale-shifted rolling context',
+    );
+    assert.equal(store.getStats().contextCount, 1);
+
+    const continued = planCacheBreaks(blockBody('ABCDEFGHIJ'), { policy, store });
+    assert.deepEqual(selectedLogicalIndexes(continued), [1, 6, 7, 10]);
+    assert.deepEqual(continued.statePlan.nextAnchors.map((anchor) => anchor.logicalIndex), [6, 7, 10]);
+
+    const branchStore = new AnchorStore();
+    const branchBase = planCacheBreaks(blockBody('ABCDEFG'), { policy, store: branchStore });
+    const divergentBranch = planCacheBreaks(blockBody('ABCDEXGHIJ'), { policy, store: branchStore });
+    assert.equal(branchBase.commit(), true);
+    assert.equal(
+        divergentBranch.commit(),
+        true,
+        'a plan that shares an early boundary but diverges later must keep its isolated context',
+    );
+    assert.equal(branchStore.getStats().contextCount, 2);
 });
 
 test('AnchorStore enforces its LRU context cap after successful commits', () => {

@@ -372,7 +372,10 @@ tr:hover td { background-color: var(--bg-app); }
 .role-dot.user { background-color: var(--success); }
 .role-dot.assistant { background-color: var(--primary-coral); }
 .role-dot.tool { background-color: var(--warning); }
+.role-dot.definition { background-color: var(--warning); }
+.role-dot.definition { background-color: #8b5cf6; }
 .msg-index, .msg-meta { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.msg-meta { white-space: nowrap; }
 .msg-index { color: var(--text-muted-light); }
 .msg-body { padding: 14px 16px; font-size: 13.5px; line-height: 1.6; color: var(--text-main); white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow-y: auto; }
 .msg-card.is-prefix { border-color: #c7d2cb; }
@@ -500,6 +503,8 @@ tr:hover td { background-color: var(--bg-app); }
   .tabs { overflow-x: auto; padding-bottom: 4px; }
   .detail-tabs { margin-left: -22px; margin-right: -22px; padding-left: 22px; padding-right: 22px; }
   .tab { flex: 0 0 auto; }
+  .msg-card-head { align-items: flex-start; flex-wrap: wrap; }
+  .msg-right { margin-left: auto; }
   #detailPre { min-height: 52vh; }
   .kv { grid-template-columns: 1fr; gap: 4px; }
 }

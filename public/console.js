@@ -201,10 +201,6 @@ function cacheClass(value, status) {
   return 'cache-unknown';
 }
 
-function tokenLabel(value) {
-  return value === null || value === undefined ? '-' : value;
-}
-
 function hasUsage(usage) {
   return usage && Object.values(usage).some((value) => value !== null && value !== undefined);
 }
@@ -830,7 +826,7 @@ function tableCell(row, value, className, label) {
   const td = document.createElement('td');
   if (className) td.className = className;
   if (label) td.dataset.label = label;
-  td.textContent = text(value);
+  td.textContent = value === '' ? '' : text(value);
   row.appendChild(td);
   return td;
 }
@@ -882,25 +878,36 @@ function renderRequests() {
 
     const prefix = tableCell(tr, '', 'td-mono', 'Prefix / 锚点');
     prefix.append(document.createTextNode(`Prefix ${prefixActionLabel(item)}`));
-    prefix.appendChild(document.createElement('br'));
-    appendText(prefix, 'small', compactHash(item.prefixHash));
+    if (item.prefixHash) {
+      prefix.appendChild(document.createElement('br'));
+      appendText(prefix, 'small', compactHash(item.prefixHash));
+    }
     const policyDiagnostics = getCaptureCachePolicy(item);
     if (policyDiagnostics.action || policyDiagnostics.reason || policyDiagnostics.contextHash) {
       prefix.appendChild(document.createElement('br'));
-      appendText(prefix, 'small', `锚点 ${policyDiagnostics.action || '-'}${policyDiagnostics.reason ? ` · ${policyDiagnostics.reason}` : ''} · ${compactHash(policyDiagnostics.contextHash)}`);
+      const anchorDetails = [policyDiagnostics.action, policyDiagnostics.reason, policyDiagnostics.contextHash ? compactHash(policyDiagnostics.contextHash) : null]
+        .filter(Boolean)
+        .join(' · ');
+      appendText(prefix, 'small', `锚点 ${anchorDetails}`);
     }
 
     const stats = tableCell(tr, '', '', 'Usage');
     appendText(stats, 'span', upstreamStatsLabel(item), `badge ${upstreamStatsClass(item)}`.trim());
-    if (item.cacheReadTokens !== null || item.cacheWriteTokens !== null) {
+    if (item.cacheReadTokens !== null && item.cacheReadTokens !== undefined
+      || item.cacheWriteTokens !== null && item.cacheWriteTokens !== undefined) {
       stats.appendChild(document.createElement('br'));
-      appendText(stats, 'small', `读 ${tokenLabel(item.cacheReadTokens)} / 写 ${tokenLabel(item.cacheWriteTokens)}`);
+      const tokenParts = [];
+      if (item.cacheReadTokens !== null && item.cacheReadTokens !== undefined) tokenParts.push(`读 ${item.cacheReadTokens}`);
+      if (item.cacheWriteTokens !== null && item.cacheWriteTokens !== undefined) tokenParts.push(`写 ${item.cacheWriteTokens}`);
+      appendText(stats, 'small', tokenParts.join(' / '));
     }
 
     const channel = tableCell(tr, '', '', '渠道');
     channel.append(document.createTextNode(channelName(state.runtime)));
-    channel.appendChild(document.createElement('br'));
-    appendText(channel, 'small', item.upstreamMode ? upstreamModeLabel(item.upstreamMode) : '');
+    if (item.upstreamMode) {
+      channel.appendChild(document.createElement('br'));
+      appendText(channel, 'small', upstreamModeLabel(item.upstreamMode));
+    }
 
     rows.appendChild(tr);
   }
@@ -1087,7 +1094,7 @@ function selectedBreakpoints(capture, segments = []) {
 
 function getOrderedBodySegments(body, mode) {
   const segments = [];
-  const add = (role, value, path, label, cacheOwner = value) => {
+  const add = (role, value, path, label, cacheOwner = value, serializedText) => {
     const cacheControl = hasCacheControl(value)
       ? value.cache_control
       : hasCacheControl(cacheOwner)
@@ -1102,11 +1109,39 @@ function getOrderedBodySegments(body, mode) {
       cacheTtl: cacheControl
         ? (Object.prototype.hasOwnProperty.call(cacheControl, 'ttl') ? cacheControl.ttl : 'auto')
         : null,
-      text: contentText(value),
+      text: serializedText === undefined ? contentText(value) : serializedText,
     });
   };
 
+  const serializeDefinition = (value) => {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? contentText(value) : serialized;
+  };
+
+  const addDefinition = (value, path, label) => {
+    if (value === null || value === undefined) return;
+    add('definition', value, path, label, value, serializeDefinition(value));
+  };
+
+  const addDefinitionCollection = (value, path, label) => {
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => {
+        const name = entry?.function?.name || entry?.name;
+        addDefinition(entry, `${path}[${index}]`, `${path}[${index}]${name ? ` · ${name}` : ` · ${label} ${index + 1}`}`);
+      });
+      return;
+    }
+    addDefinition(value, path, `${path} · ${label}`);
+  };
+
   if (!body || typeof body !== 'object') return segments;
+
+  // Tool and function definitions are part of the model input and precede the
+  // conversational prompt in both cache semantics and the diagnostic view.
+  addDefinitionCollection(body.tools, 'tools', '工具定义');
+  addDefinitionCollection(body.functions, 'functions', '旧版函数定义');
+  addDefinition(body.tool_choice, 'tool_choice', 'tool_choice · 工具选择策略');
+  addDefinition(body.function_call, 'function_call', 'function_call · 旧版函数调用策略');
 
   if (mode === 'anthropic') {
     if (Array.isArray(body.system)) {
@@ -1126,6 +1161,17 @@ function getOrderedBodySegments(body, mode) {
     }
   });
 
+  // Structured-output schemas also consume prompt tokens. Keep an explicit
+  // allow-list so transport, sampling and generation controls remain excluded.
+  const responseFormatLabel = body.response_format?.json_schema
+    ? 'response_format · JSON Schema'
+    : 'response_format · 响应格式';
+  addDefinition(body.response_format, 'response_format', responseFormatLabel);
+  addDefinition(body.json_schema, 'json_schema', 'json_schema · JSON Schema');
+  addDefinition(body.response_schema, 'response_schema', 'response_schema · 响应 Schema');
+  addDefinition(body.output_schema, 'output_schema', 'output_schema · 输出 Schema');
+  addDefinition(body.output_config?.format, 'output_config.format', 'output_config.format · 输出格式');
+
   return segments;
 }
 
@@ -1134,11 +1180,56 @@ function pathMatches(segmentPath, cachePath) {
   return cachePath === segmentPath || cachePath === `${segmentPath}.cache_control` || cachePath.startsWith(`${segmentPath}.`);
 }
 
-function approxTokens(value) {
-  return Math.max(1, Math.round(contentText(value).length / 4));
+function countCharacters(value) {
+  return Array.from(contentText(value)).length;
 }
 
-function renderMessageCard(root, segment, index, isPrefix) {
+function nonNegativeNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function promptTokensFromUsage(usage) {
+  const inputTokens = nonNegativeNumber(usage?.inputTokens);
+  if (inputTokens === null) return null;
+
+  const rawCacheCreation = usage?.anthropicCacheCreationInputTokens;
+  const cacheCreationTokens = rawCacheCreation === null || rawCacheCreation === undefined
+    ? 0
+    : nonNegativeNumber(rawCacheCreation);
+  if (cacheCreationTokens === null) return null;
+
+  return inputTokens + cacheCreationTokens + cacheCreationTokens;
+}
+
+function getPromptTokenEstimate(segments, usage) {
+  const characterCounts = segments.map((segment) => countCharacters(segment?.text ?? segment?.value ?? segment));
+  const totalCharacters = characterCounts.reduce((sum, count) => sum + count, 0);
+  const promptTokens = promptTokensFromUsage(usage);
+  const tokensPerCharacter = totalCharacters > 0 && promptTokens !== null
+    ? promptTokens / totalCharacters
+    : null;
+
+  return { characterCounts, totalCharacters, promptTokens, tokensPerCharacter };
+}
+
+function estimatedTokens(characterCount, tokensPerCharacter) {
+  return tokensPerCharacter === null ? null : Math.round(characterCount * tokensPerCharacter);
+}
+
+function promptEstimateLabel(characterCount, tokenCount) {
+  return tokenCount === null
+    ? `${characterCount}字符 | token 暂不可估`
+    : `${characterCount}字符 | 约${tokenCount}token`;
+}
+
+function tokenMultiplierLabel(tokensPerCharacter) {
+  if (tokensPerCharacter === null) return '暂不可估（缺少有效 usage 或字符）';
+  return `${Number(tokensPerCharacter.toFixed(4))} token/字符`;
+}
+
+function renderMessageCard(root, segment, index, isPrefix, tokensPerCharacter = null) {
   const card = document.createElement('div');
   card.className = `msg-card ${isPrefix ? 'is-prefix' : ''}`.trim();
   const head = document.createElement('div');
@@ -1155,7 +1246,8 @@ function renderMessageCard(root, segment, index, isPrefix) {
   appendText(left, 'span', `#${index} · ${segment.label || segment.path}`, 'msg-index');
   const right = document.createElement('span');
   right.className = 'msg-right';
-  appendText(right, 'span', `≈ ${approxTokens(segment.value)} tok`, 'msg-meta');
+  const characterCount = countCharacters(segment.text);
+  appendText(right, 'span', promptEstimateLabel(characterCount, estimatedTokens(characterCount, tokensPerCharacter)), 'msg-meta');
   appendText(right, 'span', '▾', 'msg-caret');
   head.append(left, right);
   head.onclick = () => card.classList.toggle('collapsed');
@@ -1215,6 +1307,7 @@ function renderRequestBodyStream(root, capture, prefixOnly = false) {
   const mode = capture?.upstream?.mode || capture?.gateway?.upstreamMode;
   const cache = capture?.upstream?.cache || {};
   const segments = getOrderedBodySegments(body, mode);
+  const promptEstimate = getPromptTokenEstimate(segments, capture?.response?.usage);
   const breakpoints = selectedBreakpoints(capture, segments);
   const firstCachePath = cache.firstCacheControlPath;
   let cacheIndex = segments.findIndex((segment) => segment.cache || pathMatches(segment.path, firstCachePath) || breakpoints.some((breakpoint) => pathMatches(segment.path, breakpoint.path)));
@@ -1228,7 +1321,7 @@ function renderRequestBodyStream(root, capture, prefixOnly = false) {
 
   visible.forEach((segment, index) => {
     const isPrefix = cacheIndex >= 0 && index <= cacheIndex;
-    renderMessageCard(root, segment, index, isPrefix);
+    renderMessageCard(root, segment, index, isPrefix, promptEstimate.tokensPerCharacter);
     const matches = breakpoints.filter((breakpoint) => pathMatches(segment.path, breakpoint.path));
     if (!matches.length && segment.cache) matches.push({ path: `${segment.path}.cache_control`, reason: null, reasons: [], prefixHash: null });
     for (const breakpoint of matches) {
@@ -1249,6 +1342,11 @@ function renderDetail() {
   const item = state.selected;
   if (!item) return;
   const usage = item.response?.usage || {};
+  const promptSegments = getOrderedBodySegments(
+    item.upstream?.body || item.gateway?.transformedBody,
+    item.upstream?.mode || item.gateway?.upstreamMode,
+  );
+  const promptEstimate = getPromptTokenEstimate(promptSegments, usage);
   $('drawerTitle').textContent = item.upstream?.body?.model || item.gateway?.transformedBody?.model || item.id;
   $('drawerEyebrow').textContent = channelName(state.runtime);
   $('detailId').textContent = `ID: ${item.id}`;
@@ -1259,9 +1357,11 @@ function renderDetail() {
     ['注入断点', item.gateway?.conversion?.injected ?? 0, (item.gateway?.conversion?.injected ?? 0) > 0 ? 'success' : ''],
     ['转换标记', item.gateway?.conversion?.removed ?? 0],
     ['缓存点数量', item.upstream?.cache?.cacheControlCount ?? 0],
-    ['候选断点', cachePolicyCandidateCount(getCaptureCachePolicy(item)) ?? '-'],
+    ['候选断点', cachePolicyCandidateCount(getCaptureCachePolicy(item)) ?? '未记录'],
     ['Prefix 动作', item.gateway?.prefixLock?.action || 'disabled'],
     ['Usage', hasUsage(usage) ? '已返回' : '未返回'],
+    ['提示词总量', promptEstimateLabel(promptEstimate.totalCharacters, estimatedTokens(promptEstimate.totalCharacters, promptEstimate.tokensPerCharacter))],
+    ['Token 倍率', tokenMultiplierLabel(promptEstimate.tokensPerCharacter)],
     ['当前渠道', channelName(state.runtime)],
   ]);
 

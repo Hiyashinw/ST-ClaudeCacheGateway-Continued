@@ -193,6 +193,19 @@ function writeJson(response, status, body) {
     response.end(JSON.stringify(body));
 }
 
+function writeAnthropicSse(response, events) {
+    response.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+    });
+
+    for (const event of events) {
+        response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+
+    response.end();
+}
+
 async function startMockUpstream() {
     const requests = [];
     const server = createServer(async (request, response) => {
@@ -234,6 +247,84 @@ async function startMockUpstream() {
             }
 
             if (request.url === '/v1/messages') {
+                if (['anthropic-thinking-model', 'anthropic-thinking-length-model'].includes(body?.model)) {
+                    const stopReason = body.model === 'anthropic-thinking-length-model' ? 'max_tokens' : 'end_turn';
+                    const content = [
+                        { type: 'thinking', thinking: 'First thought. ', signature: 'opaque-thinking-signature' },
+                        { type: 'redacted_thinking', data: 'opaque-redacted-thinking' },
+                        { type: 'thinking', thinking: 'Second thought.', signature: 'opaque-second-signature' },
+                        { type: 'text', text: 'Visible ' },
+                        { type: 'text', text: 'answer.' },
+                    ];
+
+                    if (body.stream) {
+                        writeAnthropicSse(response, [
+                            {
+                                type: 'message_start',
+                                message: {
+                                    id: 'msg_thinking_stream',
+                                    type: 'message',
+                                    role: 'assistant',
+                                    model: body.model,
+                                    content: [],
+                                    usage: { input_tokens: 2, output_tokens: 0 },
+                                },
+                            },
+                            {
+                                type: 'content_block_start',
+                                index: 0,
+                                content_block: { type: 'thinking', thinking: '', signature: '' },
+                            },
+                            {
+                                type: 'content_block_delta',
+                                index: 0,
+                                delta: { type: 'thinking_delta', thinking: 'Stream thought.' },
+                            },
+                            {
+                                type: 'content_block_delta',
+                                index: 0,
+                                delta: { type: 'signature_delta', signature: 'opaque-stream-signature' },
+                            },
+                            { type: 'content_block_stop', index: 0 },
+                            {
+                                type: 'content_block_start',
+                                index: 1,
+                                content_block: { type: 'redacted_thinking', data: 'opaque-stream-redacted' },
+                            },
+                            { type: 'content_block_stop', index: 1 },
+                            {
+                                type: 'content_block_start',
+                                index: 2,
+                                content_block: { type: 'text', text: '' },
+                            },
+                            {
+                                type: 'content_block_delta',
+                                index: 2,
+                                delta: { type: 'text_delta', text: 'Visible stream answer.' },
+                            },
+                            { type: 'content_block_stop', index: 2 },
+                            {
+                                type: 'message_delta',
+                                delta: { stop_reason: stopReason, stop_sequence: null },
+                                usage: { output_tokens: 4 },
+                            },
+                            { type: 'message_stop' },
+                        ]);
+                        return;
+                    }
+
+                    writeJson(response, 200, {
+                        id: 'msg_thinking',
+                        type: 'message',
+                        role: 'assistant',
+                        model: body.model,
+                        content,
+                        stop_reason: stopReason,
+                        usage: { input_tokens: 2, output_tokens: 4 },
+                    });
+                    return;
+                }
+
                 writeJson(response, 200, {
                     id: 'msg_mock',
                     type: 'message',
@@ -474,6 +565,14 @@ function postJson(baseUrl, path, body) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
     });
+}
+
+function parseSseData(text) {
+    return text
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice('data: '.length))
+        .map((data) => data === '[DONE]' ? data : JSON.parse(data));
 }
 
 test('OpenAI inbound -> OpenAI upstream sends the fixed-head final JSON', async (t) => {
@@ -926,6 +1025,50 @@ test('Anthropic native inbound auto-generates system and assistant candidates be
     assertFinalUpstreamBody(fixture.requests[0], ['Native system last', 'N-A3', 'N-A4', 'N-A5']);
 });
 
+test('rolling auto-generated breakpoints freeze the initial wire and replace only the oldest slot', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 6,
+        autoGenerateCacheBreakpointsMode: 'on',
+        captureRequests: false,
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+        },
+    });
+    t.after(() => fixture.close());
+
+    const first = automaticOpenAiBody('rolling-frozen-wire');
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', first);
+    assertFinalUpstreamBody(fixture.requests[0], ['System last', 'A3', 'A4', 'A5']);
+
+    const belowInterval = structuredClone(first);
+    belowInterval.messages.push(
+        { role: 'user', content: [{ type: 'text', text: 'U6' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'A6' }] },
+    );
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', belowInterval);
+    assertFinalUpstreamBody(
+        fixture.requests[1],
+        ['System last', 'A3', 'A4', 'A5'],
+    );
+
+    const reachesInterval = structuredClone(belowInterval);
+    reachesInterval.messages.push(
+        { role: 'user', content: [{ type: 'text', text: 'U7' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'A7' }] },
+    );
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', reachesInterval);
+    assertFinalUpstreamBody(
+        fixture.requests[2],
+        ['System last', 'A4', 'A5', 'A7'],
+    );
+
+    const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheAnchorState.activeAnchorCount, 3);
+});
+
 test('Auto generation enables only when the final request has no explicit marker or cache control', async (t) => {
     const fixture = await startGatewayFixture({
         upstreamMode: 'openai',
@@ -1009,6 +1152,126 @@ test('OpenAI inbound -> Anthropic upstream converts before applying the fixed-he
     assert.equal(request.body.max_tokens, 32);
     assert.ok(request.headers['anthropic-version']);
     assertFinalUpstreamBody(request);
+});
+
+test('OpenAI inbound -> Anthropic non-stream response exposes thinking as reasoning_content', async (t) => {
+    const fixture = await startGatewayFixture({ upstreamMode: 'anthropic' });
+    t.after(() => fixture.close());
+
+    const requestBody = {
+        model: 'anthropic-thinking-model',
+        max_tokens: 32,
+        messages: [{ role: 'user', content: 'Think before answering.' }],
+    };
+    const response = await fetchJson(`${fixture.gatewayBaseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'anthropic-beta': 'interleaved-thinking-2025-05-14',
+        },
+        body: JSON.stringify(requestBody),
+    });
+
+    assert.deepEqual(response.choices[0].message, {
+        role: 'assistant',
+        content: 'Visible answer.',
+        reasoning_content: 'First thought. Second thought.',
+    });
+    assert.equal(response.choices[0].finish_reason, 'stop');
+    assert.equal(
+        JSON.stringify(response.choices[0].message).includes('opaque-'),
+        false,
+        'opaque signatures and redacted thinking must not be rendered as visible reasoning',
+    );
+    assert.equal(fixture.requests[0].headers['anthropic-beta'], 'interleaved-thinking-2025-05-14');
+
+    const nativeResponse = await postJson(fixture.gatewayBaseUrl, '/v1/messages', requestBody);
+    assert.deepEqual(
+        nativeResponse.content.map((block) => block.type),
+        ['thinking', 'redacted_thinking', 'thinking', 'text', 'text'],
+        'Anthropic native responses must continue to pass every thinking block through unchanged',
+    );
+    assert.equal(nativeResponse.content[0].signature, 'opaque-thinking-signature');
+    assert.equal(nativeResponse.content[1].data, 'opaque-redacted-thinking');
+});
+
+test('OpenAI inbound -> Anthropic stream separates thinking_delta from visible content', async (t) => {
+    const fixture = await startGatewayFixture({ upstreamMode: 'anthropic', captureRequests: true });
+    t.after(() => fixture.close());
+
+    const requestBody = {
+        model: 'anthropic-thinking-model',
+        max_tokens: 32,
+        stream: true,
+        messages: [{ role: 'user', content: 'Think before answering.' }],
+    };
+    const response = await fetch(`${fixture.gatewayBaseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(requestBody),
+    });
+    const streamText = await response.text();
+    const payloads = parseSseData(streamText);
+    const chunks = payloads.filter((payload) => payload !== '[DONE]');
+    const reasoning = chunks.map((chunk) => chunk.choices[0].delta.reasoning_content || '').join('');
+    const content = chunks.map((chunk) => chunk.choices[0].delta.content || '').join('');
+    const finishChunks = chunks.filter((chunk) => chunk.choices[0].finish_reason !== null);
+
+    assert.equal(response.headers.get('content-type'), 'text/event-stream');
+    assert.equal(reasoning, 'Stream thought.');
+    assert.equal(content, 'Visible stream answer.');
+    assert.equal(finishChunks.length, 1);
+    assert.deepEqual(finishChunks[0].choices[0], {
+        index: 0,
+        delta: {},
+        finish_reason: 'stop',
+    });
+    assert.equal(payloads.at(-2), finishChunks[0]);
+    assert.equal(payloads.at(-1), '[DONE]');
+    assert.equal(
+        JSON.stringify(chunks).includes('opaque-'),
+        false,
+        'signature_delta and redacted_thinking must not be exposed as reasoning text',
+    );
+    assert.ok(
+        chunks.every((chunk) => !(
+            typeof chunk.choices[0].delta.reasoning_content === 'string'
+            && typeof chunk.choices[0].delta.content === 'string'
+        )),
+        'each converted delta must contain either reasoning or visible content, never both',
+    );
+
+    const captureList = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    assert.equal(captureList.requests.length, 1);
+    const capture = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(captureList.requests[0].id)}`,
+    );
+    assert.equal(capture.response.usage.outputTokens, 4, 'message_delta usage must still be captured');
+
+    const truncatedResponse = await fetch(`${fixture.gatewayBaseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...requestBody, model: 'anthropic-thinking-length-model' }),
+    });
+    const truncatedPayloads = parseSseData(await truncatedResponse.text());
+    const truncatedFinishChunks = truncatedPayloads
+        .filter((payload) => payload !== '[DONE]')
+        .filter((chunk) => chunk.choices[0].finish_reason !== null);
+    assert.equal(truncatedFinishChunks.length, 1);
+    assert.equal(truncatedFinishChunks[0].choices[0].finish_reason, 'length');
+    assert.deepEqual(truncatedFinishChunks[0].choices[0].delta, {});
+    assert.equal(truncatedPayloads.at(-2), truncatedFinishChunks[0]);
+    assert.equal(truncatedPayloads.at(-1), '[DONE]');
+
+    const nativeResponse = await fetch(`${fixture.gatewayBaseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(requestBody),
+    });
+    const nativeStreamText = await nativeResponse.text();
+    assert.match(nativeStreamText, /"type":"thinking_delta","thinking":"Stream thought\."/);
+    assert.match(nativeStreamText, /"type":"signature_delta","signature":"opaque-stream-signature"/);
+    assert.match(nativeStreamText, /"type":"redacted_thinking","data":"opaque-stream-redacted"/);
 });
 
 test('OpenAI inbound -> Anthropic upstream selects breakpoints after channel JSON is merged', async (t) => {

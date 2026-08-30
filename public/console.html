@@ -226,13 +226,13 @@
           </div>
         </div>
         <div class="set-row">
-          <div class="set-info"><div class="set-title">缓存锚点</div><div class="set-desc">单锚点会保留首次入选的非固定头第一点；滚动锚点会从该点开始随上下文增长逐步晋升。</div></div>
+          <div class="set-info"><div class="set-title">缓存锚点</div><div class="set-desc">单锚点会保留首次入选的非固定头第一点；滚动锚点会冻结首次实际入选的全部非固定点，轮换时只替换最老一点。</div></div>
           <div class="set-control">
             <label class="compact-field" for="cacheAnchorMode"><span>模式</span><select id="cacheAnchorMode"><option value="off">关闭</option><option value="single">单锚点</option><option value="rolling">滚动锚点</option></select></label>
           </div>
         </div>
         <div class="set-row">
-          <div class="set-info"><div class="set-title">滚动间隔</div><div class="set-desc">从最新锚点起累计的非空逻辑内容块数；达到间隔后的第一个候选断点会参与晋升。</div></div>
+          <div class="set-info"><div class="set-title">滚动间隔</div><div class="set-desc">从最新冻结点起累计的非空逻辑内容块数；达到间隔后的第一个候选断点会替换最老滚动点。</div></div>
           <div class="set-control">
             <label class="compact-field" for="cacheAnchorIntervalBlocks"><span>内容块</span><input id="cacheAnchorIntervalBlocks" type="number" min="1" max="1000" step="1" inputmode="numeric" value="3"></label>
           </div>
@@ -420,8 +420,8 @@
         <ul>
           <li>固定头缓存点设为 1 时，最前面的候选断点不会再随总断点数量增长而被挤掉。</li>
           <li>单锚点会记住新上下文最终入选断点中、排除固定头后的第一个 marker 断点；只要该点之前的完整前缀不变，就持续保留。</li>
-          <li>滚动锚点按设定的内容块间隔晋升新锚点，并在成功请求之间渐进淘汰最老锚点，适合持续增长的长上下文。</li>
-          <li>间隔 3 的轮换示例：<code>ABCDE / FGH / I / J → ABCDE（E 后锚点待淘汰） / FGH / IJK / L → ABCDEFGH / IJK / L / M</code>。字母表示连续内容，斜杠用于分组；每个分组末尾（包括行末）都有缓存断点。</li>
+          <li>滚动锚点会冻结首次实际入选的全部非固定点；普通上下文增长不会移动其中任何一点。达到设定间隔后，只用一个新点替换最老滚动点，其余位置保持不变。</li>
+          <li>固定头为 A、间隔为 3 的轮换示例：<code>A / E / F / G → A / E / F / G（间隔未到） → A / F / G / J（只替换 E）</code>。</li>
           <li>固定头、锚点、普通尾点以及调用方已有的 <code>cache_control</code> 共用上游 4 点预算。例如固定头为 1、单锚点占 1 点时，长示例只会选择 <code>A / F / O / P</code>，不会再加入第五个 N 点。</li>
           <li>策略设置会持久保存，但已学习锚点只存在内存中；重启、更改策略或前缀变化后会重新学习。</li>
           <li>锚点模式与 Prefix Lock 互斥，最后启用的功能生效。</li>

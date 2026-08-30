@@ -2328,10 +2328,34 @@ function getOpenAiUsageFromAnthropic(usage = {}) {
     };
 }
 
+function convertAnthropicStopReasonToOpenAi(stopReason) {
+    switch (stopReason) {
+        case 'end_turn':
+        case 'stop_sequence':
+            return 'stop';
+        case 'max_tokens':
+            return 'length';
+        case 'tool_use':
+            return 'tool_calls';
+        default:
+            return stopReason ?? null;
+    }
+}
+
 function convertAnthropicResponseToOpenAi(json, model) {
-    const text = Array.isArray(json?.content)
-        ? json.content.filter((block) => block?.type === 'text').map((block) => block.text || '').join('')
-        : '';
+    const content = Array.isArray(json?.content) ? json.content : [];
+    const text = content
+        .filter((block) => block?.type === 'text')
+        .map((block) => block.text || '')
+        .join('');
+    const thinkingBlocks = content.filter((block) => block?.type === 'thinking');
+    const message = { role: 'assistant', content: text };
+
+    if (thinkingBlocks.length > 0) {
+        message.reasoning_content = thinkingBlocks
+            .map((block) => block.thinking || '')
+            .join('');
+    }
 
     return {
         id: json?.id || `chatcmpl-${Date.now()}`,
@@ -2340,8 +2364,8 @@ function convertAnthropicResponseToOpenAi(json, model) {
         model: json?.model || model,
         choices: [{
             index: 0,
-            message: { role: 'assistant', content: text },
-            finish_reason: json?.stop_reason || 'stop',
+            message,
+            finish_reason: convertAnthropicStopReasonToOpenAi(json?.stop_reason) || 'stop',
         }],
         usage: getOpenAiUsageFromAnthropic(json?.usage || {}),
     };
@@ -2369,6 +2393,30 @@ function convertAnthropicSseLine(line, model, capture = null) {
                 created: Math.floor(Date.now() / 1000),
                 model,
                 choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }],
+            })}`;
+        }
+
+        if (event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta') {
+            return `data: ${JSON.stringify({
+                id: 'chatcmpl-anthropic-stream',
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{ index: 0, delta: { reasoning_content: event.delta.thinking }, finish_reason: null }],
+            })}`;
+        }
+
+        if (event.type === 'message_delta' && event.delta?.stop_reason) {
+            return `data: ${JSON.stringify({
+                id: 'chatcmpl-anthropic-stream',
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{
+                    index: 0,
+                    delta: {},
+                    finish_reason: convertAnthropicStopReasonToOpenAi(event.delta.stop_reason),
+                }],
             })}`;
         }
 
