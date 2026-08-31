@@ -59,11 +59,11 @@ API Key: 你的上游供应商 API Key
 
 从这组实测看，DeepSeek 和 Claude 系列模型的适配与优化效果最好：首轮完成缓存创建后，后续请求的缓存命中率可以达到 80% 以上。GPT 系列模型刚开始时通常只能保证系统提示词等稳定前缀命中；经过多轮对话、缓存锚点逐渐稳定后，聊天记录才更可能一并命中缓存。
 
-**DeepSeek V4 Pro：后续多轮命中率约 80%–95%。**
+**DeepSeek V4 Pro：后续多轮命中率约 80% – 95%。**
 
 ![DeepSeek V4 Pro 缓存效果实测](docs/images/cache-hit-deepseek-v4-pro.png)
 
-**Claude Sonnet 5：后续多轮命中率约为 80%–90%。**
+**Claude Sonnet 5：后续多轮命中率约为 80% – 90%。**
 
 ![Claude Sonnet 5 缓存效果实测](docs/images/cache-hit-claude-sonnet-5.png)
 
