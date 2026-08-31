@@ -447,6 +447,10 @@ async function startGatewayFixture({
     captureRequests,
     systemMessageHandlingMode,
     moveSystemMessagesToTop,
+    autoConvertLastAnchorTo5m,
+    ignoreLastAnchorsMode,
+    ignoreLastAnchorCount,
+    environmentCacheTranslationEnabled = 'true',
 }) {
     const upstream = await startMockUpstream();
     const temporaryDirectory = await mkdtemp(join(tmpdir(), 'st-cache-gateway-integration-'));
@@ -459,6 +463,7 @@ async function startGatewayFixture({
         await Promise.all([
             copyFile(join(PROJECT_DIR, 'server.js'), join(temporaryDirectory, 'server.js')),
             copyFile(join(PROJECT_DIR, 'cache-policy.js'), join(temporaryDirectory, 'cache-policy.js')),
+            copyFile(join(PROJECT_DIR, 'default-gateway-settings.json'), join(temporaryDirectory, 'default-gateway-settings.json')),
             writeFile(join(temporaryDirectory, 'package.json'), '{"type":"module"}\n'),
             writeFile(settingsPath, `${JSON.stringify({
                 schemaVersion,
@@ -470,6 +475,9 @@ async function startGatewayFixture({
                 ...(captureRequests === undefined ? {} : { captureRequests }),
                 ...(systemMessageHandlingMode === undefined ? {} : { systemMessageHandlingMode }),
                 ...(moveSystemMessagesToTop === undefined ? {} : { moveSystemMessagesToTop }),
+                ...(autoConvertLastAnchorTo5m === undefined ? {} : { autoConvertLastAnchorTo5m }),
+                ...(ignoreLastAnchorsMode === undefined ? {} : { ignoreLastAnchorsMode }),
+                ...(ignoreLastAnchorCount === undefined ? {} : { ignoreLastAnchorCount }),
                 activeChannelId: 'integration-upstream',
                 channels: [{
                     id: 'integration-upstream',
@@ -509,8 +517,10 @@ async function startGatewayFixture({
             PORT: String(port),
             UPSTREAM_BASE_URL: upstream.baseUrl,
             UPSTREAM_MODE: upstreamMode,
-            CACHE_TRANSLATION_ENABLED: 'true',
         });
+        if (environmentCacheTranslationEnabled !== null && environmentCacheTranslationEnabled !== undefined) {
+            environment.CACHE_TRANSLATION_ENABLED = String(environmentCacheTranslationEnabled);
+        }
 
         if (environmentCacheTtl !== null) {
             environment.CACHE_TTL = environmentCacheTtl;
@@ -2005,3 +2015,284 @@ test('cache policy API is atomic and mutually exclusive with Prefix Lock', async
     });
     assert.equal(invalid.status, 400, 'partial policy updates must be rejected');
 });
+
+test('per-block hashes compare successive requests and expose token summary statistics', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 9,
+        captureRequests: true,
+    });
+    t.after(() => fixture.close());
+
+    const firstBody = markerBody('block-hash-model', 'ABC');
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', firstBody);
+
+    const secondBody = markerBody('block-hash-model', 'ABC');
+    secondBody.messages[1].content[0].text = `B changed${MARKER}`;
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', secondBody);
+
+    const thirdBody = markerBody('block-hash-model', 'ABCD');
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', thirdBody);
+
+    const list = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    assert.equal(list.requests.length, 3);
+    const latest = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(list.requests[0].id)}`,
+    );
+    const comparison = latest.upstream.blockHashComparison;
+    assert.equal(comparison.compared, true);
+    assert.ok(comparison.entries.length >= 4);
+    assert.ok(comparison.changedBlockCount >= 1);
+    assert.ok(comparison.entries.some((entry) => entry.changed && entry.isNew && entry.path.includes('messages[3]')));
+    assert.equal(latest.upstream.cache.blockHashCompared, true);
+    assert.equal(latest.gateway.cachePolicy.blockHashCompared, true);
+    assert.ok(Array.isArray(latest.gateway.cachePolicy.blockHashes));
+    assert.equal(list.requests[0].inputTokens, 1);
+    assert.equal(list.requests[0].outputTokens, 1);
+});
+
+test('automatic last-anchor TTL conversion changes only the newest gateway anchor to 5m', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 9,
+        savedCacheTtl: '1h',
+        environmentCacheTtl: null,
+        autoConvertLastAnchorTo5m: true,
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+        },
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('last-anchor-ttl', 'ABCDEFG'));
+    const controls = findPromptCacheControls(fixture.requests[0].body);
+    assert.deepEqual(controls.map((control) => control.ttl), ['1h', '1h', '1h', '5m']);
+
+    const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.autoConvertLastAnchorTo5m, true);
+});
+
+test('numeric ignored-tail mode excludes the newest x candidates from gateway selection', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 9,
+        ignoreLastAnchorsMode: 'fixed',
+        ignoreLastAnchorCount: 4,
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+        },
+    });
+    t.after(() => fixture.close());
+
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        markerBody('ignored-tail-model', 'ABCDEFGHIJKLMNOPQRST'),
+    );
+    const selected = findCacheControlledTexts(fixture.requests[0].body.messages);
+    assert.deepEqual(selected, ['A', 'N', 'O', 'P']);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: true });
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        markerBody('ignored-tail-model', 'ABCDEFGHIJKLMNOPQRST'),
+    );
+    const captures = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    const detail = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(captures.requests[0].id)}`,
+    );
+    assert.equal(detail.gateway.cachePolicy.ignoredAnchorCount, 4);
+    assert.equal(detail.gateway.cachePolicy.ignoredCandidateCount, 4);
+    assert.deepEqual(detail.gateway.cachePolicy.ignoredCandidateLogicalIndexes, [17, 18, 19, 20]);
+});
+
+test('evaluation mode starts at zero and applies a stable result after three conversations', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 9,
+        captureRequests: false,
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+        },
+    });
+    t.after(() => fixture.close());
+
+    const started = await postJson(fixture.gatewayBaseUrl, '/console/anchor-ignore-evaluation', { action: 'start' });
+    assert.equal(started.anchorIgnoreEvaluation.active, true);
+    assert.equal(started.anchorIgnoreEvaluation.x, 0);
+    assert.equal(started.anchorIgnoreEvaluation.requestsRemaining, 3);
+    assert.match(started.evaluationNotice, /3/);
+
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        markerBody('evaluation-old-scope', 'ABCDEFGHIJKLMNOPQRST'),
+    );
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        markerBody('evaluation-model', 'ABCDEFGHIJKLMNOPQRST'),
+    );
+    const restarted = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(restarted.anchorIgnoreEvaluation.requestsCompleted, 1);
+    assert.match(restarted.anchorIgnoreEvaluation.notice, /重新开始/);
+
+    for (let index = 0; index < 2; index += 1) {
+        await postJson(
+            fixture.gatewayBaseUrl,
+            '/v1/chat/completions',
+            markerBody('evaluation-model', 'ABCDEFGHIJKLMNOPQRST'),
+        );
+    }
+
+    const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.ignoreLastAnchorsMode, 'fixed');
+    assert.equal(state.ignoreLastAnchorCount, 0);
+    assert.equal(state.anchorIgnoreEvaluation.result, 0);
+    assert.equal(state.anchorIgnoreEvaluation.active, false);
+
+    const saved = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.equal(saved.ignoreLastAnchorsMode, 'fixed');
+    assert.equal(saved.ignoreLastAnchorCount, 0);
+});
+
+test('evaluation preserves an exact result above five until explicitly confirmed', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 9,
+        captureRequests: false,
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+        },
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/console/anchor-ignore-evaluation', { action: 'start' });
+    const first = markerBody('evaluation-overflow-model', 'ABCDEFGHIJKLMNOPQRST');
+    const changed = markerBody('evaluation-overflow-model', 'ABCDEFGHIJKLMNOPQRST');
+    changed.messages[0].content[0].text = `A changed${MARKER}`;
+    const third = markerBody('evaluation-overflow-model', 'ABCDEFGHIJKLMNOPQRST');
+    for (const body of [first, changed, third]) {
+        await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', body);
+    }
+
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.ignoreLastAnchorsMode, 'evaluation');
+    assert.equal(state.ignoreLastAnchorCount, 0, 'pending review must keep the effective x at zero');
+    assert.equal(state.anchorIgnoreEvaluation.result, 20);
+    assert.equal(state.anchorIgnoreEvaluation.pendingReview, true);
+
+    const rejected = await fetch(`${fixture.gatewayBaseUrl}/console/anchor-ignore-evaluation`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'accept' }),
+    });
+    assert.equal(rejected.status, 400);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/anchor-ignore-evaluation', {
+        action: 'accept',
+        confirmOutOfRange: true,
+    });
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.ignoreLastAnchorsMode, 'fixed');
+    assert.equal(state.ignoreLastAnchorCount, 20);
+
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.ignoreLastAnchorsMode, 'fixed');
+    assert.equal(state.ignoreLastAnchorCount, 20);
+
+    const unconfirmedPolicy = await fetch(`${fixture.gatewayBaseUrl}/console/cache-policy`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+            ignoreLastAnchorsMode: 'fixed',
+            ignoreLastAnchorCount: 21,
+        }),
+    });
+    assert.equal(unconfirmedPolicy.status, 400);
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/cache-policy', {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+        ignoreLastAnchorsMode: 'fixed',
+        ignoreLastAnchorCount: 21,
+        confirmOutOfRange: true,
+    });
+    assert.equal(state.ignoreLastAnchorCount, 21);
+});
+
+test('default settings fill missing global fields without importing channel profiles', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 9,
+        environmentCacheTranslationEnabled: null,
+        environmentCacheTtl: null,
+    });
+    t.after(() => fixture.close());
+
+    const defaults = {
+        schemaVersion: 9,
+        cacheTranslationEnabled: false,
+        systemMessageHandlingMode: 'top',
+        autoGenerateCacheBreakpointsMode: 'on',
+        captureRequests: true,
+        cacheTtl: '5m',
+        fixedHeadBreakpointCount: 2,
+        cacheAnchorMode: 'single',
+        cacheAnchorIntervalBlocks: 7,
+        autoConvertLastAnchorTo5m: true,
+        ignoreLastAnchorsMode: 'fixed',
+        ignoreLastAnchorCount: 2,
+        activeChannelId: 'should-not-be-imported',
+        channels: [{ id: 'should-not-be-imported', name: 'bad', baseUrl: 'http://127.0.0.1:1', upstreamMode: 'openai' }],
+    };
+    await writeFile(join(dirname(fixture.settingsPath), 'default-gateway-settings.json'), JSON.stringify(defaults, null, 2));
+    const saved = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    for (const key of [
+        'cacheTranslationEnabled',
+        'systemMessageHandlingMode',
+        'autoGenerateCacheBreakpointsMode',
+        'captureRequests',
+        'cacheTtl',
+        'fixedHeadBreakpointCount',
+        'cacheAnchorMode',
+        'cacheAnchorIntervalBlocks',
+        'autoConvertLastAnchorTo5m',
+        'ignoreLastAnchorsMode',
+        'ignoreLastAnchorCount',
+    ]) {
+        delete saved[key];
+    }
+    await writeFile(fixture.settingsPath, JSON.stringify(saved, null, 2));
+    await fixture.restart();
+
+    const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheTranslationEnabled, false);
+    assert.equal(state.systemMessageHandlingMode, 'top');
+    assert.equal(state.autoGenerateCacheBreakpointsMode, 'on');
+    assert.equal(state.captureRequests, true);
+    assert.equal(state.cacheTtl, '5m');
+    assert.equal(state.fixedHeadBreakpointCount, 2);
+    assert.equal(state.cacheAnchorMode, 'single');
+    assert.equal(state.cacheAnchorIntervalBlocks, 7);
+    assert.equal(state.autoConvertLastAnchorTo5m, true);
+    assert.equal(state.ignoreLastAnchorCount, 2);
+    assert.equal(state.activeChannelId, 'integration-upstream');
+    assert.ok(state.channels.some((channel) => channel.id === 'integration-upstream'));
+    assert.equal(state.channels.some((channel) => channel.id === 'should-not-be-imported'), false);
+});
+

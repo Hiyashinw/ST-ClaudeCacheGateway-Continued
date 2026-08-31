@@ -43,8 +43,8 @@ function loadConsoleHelpers() {
     });
     vm.runInContext(`${withoutBootstrap}\n;globalThis.__helpers = {\n`
         + 'tableCell, countCharacters, getOrderedBodySegments, groupBodySegmentsForDisplay, displayGroupCharacterCount, '
-        + 'promptTokensFromUsage, getPromptTokenEstimate, renderRequestBodyStream, '
-        + 'estimatedTokens, promptEstimateLabel, inputPromptTokenLabel, systemMessageHandlingMode, systemMessageHandlingLabel\n};', context);
+        + 'promptTokensFromUsage, usageStatistics, usageRateLabel, renderUsageLines, getPromptTokenEstimate, renderRequestBodyStream, '
+        + 'getBlockHashEntries, estimatedTokens, promptEstimateLabel, inputPromptTokenLabel, systemMessageHandlingMode, systemMessageHandlingLabel\n};', context);
     return context.__helpers;
 }
 
@@ -354,3 +354,102 @@ test('system-message handling helpers normalize canonical and legacy runtime sta
     assert.equal(helpers.systemMessageHandlingLabel('off'), '关闭Anthropic优化');
     assert.equal(helpers.systemMessageHandlingLabel('top'), '统一将系统身份消息放至最顶部');
 });
+
+test('Usage statistics expose input, output and cache hit rate without the old read badge', () => {
+    const anthropic = helpers.usageStatistics({
+        inputTokens: 100,
+        outputTokens: 20,
+        anthropicCacheReadInputTokens: 900,
+        anthropicCacheCreationInputTokens: 0,
+    }, 'anthropic');
+    assert.equal(anthropic.inputTokens, 1000);
+    assert.equal(anthropic.outputTokens, 20);
+    assert.equal(anthropic.cacheHitRatePercent, 90);
+    assert.equal(helpers.usageRateLabel(90), '90%');
+
+    const root = fakeElement('div');
+    helpers.renderUsageLines(root, {
+        inputTokens: 39579,
+        outputTokens: 376,
+        cacheWriteTokens: 0,
+        cacheReadTokens: 39552,
+        cacheHitRatePercent: 99.93,
+    }, 'compact');
+    assert.equal(elementsByClass(root, 'usage-line').length, 3);
+    assert.deepEqual(
+        elementsByClass(root, 'usage-value').map((entry) => entry.textContent),
+        ['39579', '376', '0', '39552', '99.93%'],
+    );
+
+    const html = readFileSync(new URL('../public/console.html', import.meta.url), 'utf8');
+    const script = readFileSync(new URL('../public/console.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(html, /有缓存读取/);
+    assert.doesNotMatch(script, /有缓存读取/);
+    assert.match(html, /detailUsageStats/);
+    assert.match(script, /缓存命中率/);
+    assert.doesNotMatch(script, /upstreamStatsLabel/);
+});
+
+test('block hash entries are available to the diagnostic renderer', () => {
+    const entries = helpers.getBlockHashEntries({
+        upstream: {
+            blockHashes: [{ path: 'messages[0].content[0]', hash: 'abc', changed: true }],
+        },
+    });
+    assert.deepEqual(entries, [{ path: 'messages[0].content[0]', hash: 'abc', changed: true }]);
+});
+
+test('changed prompt blocks render their short hash in the message header only', () => {
+    const root = fakeElement('div');
+    helpers.renderRequestBodyStream(root, {
+        upstream: {
+            mode: 'openai',
+            body: {
+                messages: [{ role: 'user', content: [{ type: 'text', text: 'changed block' }] }],
+            },
+            blockHashes: [{
+                path: 'messages[0].content[0]',
+                hash: 'abcdef1234567890',
+                previousHash: '0000000000000000',
+                changed: true,
+            }],
+        },
+        response: { usage: { inputTokens: 10 } },
+    });
+    const changed = elementsByClass(root, 'changed')
+        .filter((entry) => String(entry.className).includes('msg-head-hash'));
+    assert.equal(changed.length, 1);
+    assert.equal(changed[0].dataset.hashChanged, 'true');
+    assert.equal(changed[0].textContent, 'Hash abcdef1234');
+    assert.equal(elementsByClass(root, 'msg-block-hash').length, 0);
+    assert.equal(elementsByClass(root, 'hash-changed').length, 0);
+});
+
+test('multi-block messages expose every block hash in one header and bold only changed entries', () => {
+    const root = fakeElement('div');
+    helpers.renderRequestBodyStream(root, {
+        upstream: {
+            mode: 'openai',
+            body: {
+                messages: [{
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: 'stable' },
+                        { type: 'text', text: 'new' },
+                    ],
+                }],
+            },
+            blockHashes: [
+                { path: 'messages[0].content[0]', hash: '1111111111abcdef', changed: false },
+                { path: 'messages[0].content[1]', hash: '2222222222abcdef', changed: true, compared: true },
+            ],
+        },
+        response: { usage: { inputTokens: 10 } },
+    });
+
+    const hashes = elementsByClass(root, 'msg-head-hash');
+    assert.deepEqual(hashes.map((entry) => entry.textContent), ['b0 1111111111', 'b1 2222222222']);
+    assert.equal(hashes[0].dataset.hashChanged, 'false');
+    assert.equal(hashes[1].dataset.hashChanged, 'true');
+});
+

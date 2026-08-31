@@ -3,14 +3,19 @@ import assert from 'node:assert/strict';
 
 import {
     AnchorStore,
+    ANCHOR_EVALUATION_REQUESTS,
     CachePolicyError,
     MARKER,
     SHORT_MARKER,
     assertCachePlan,
     canonicalStringify,
     countCacheControls,
+    createAnchorEvaluationState,
     hashCanonical,
+    hashPromptBlock,
+    normalizeCacheEnhancements,
     normalizeCachePolicy,
+    recordAnchorEvaluation,
     planCacheBreaks,
     preprocessAutomaticCacheBreaks,
 } from '../cache-policy.js';
@@ -91,6 +96,119 @@ test('canonical hashing is key-order independent and returns full SHA-256', () =
     assert.equal(canonicalStringify({ b: 2, a: { d: 4, c: 3 } }), '{"a":{"c":3,"d":4},"b":2}');
     assert.equal(hashCanonical({ b: 2, a: 1 }), hashCanonical({ a: 1, b: 2 }));
     assert.match(hashCanonical({ value: 1 }), /^[a-f0-9]{64}$/);
+});
+
+test('cache enhancements normalize aliases and block hashes ignore cache metadata', () => {
+    assert.deepEqual(normalizeCacheEnhancements({
+        autoConvertLastAnchorToShortTtl: true,
+        anchorIgnoreMode: 'numeric',
+        ignoredAnchorCount: '4',
+    }), {
+        autoConvertLastAnchorTo5m: true,
+        ignoreLastAnchorsMode: 'fixed',
+        ignoreLastAnchorCount: 4,
+    });
+    assert.equal(
+        hashPromptBlock(
+            { type: 'text', text: 'same', cache_control: { type: 'ephemeral', ttl: '1h' } },
+        ),
+        hashPromptBlock(
+            { type: 'text', text: 'same', cache_control: { type: 'ephemeral', ttl: '5m' } },
+        ),
+    );
+});
+
+test('anchor evaluation starts at zero and applies x=0 after three stable requests', () => {
+    let state = createAnchorEvaluationState();
+    let last = null;
+    const snapshot = {
+        blocks: [
+            { path: 'messages[0]', identity: 'system:1', hash: 'stable-a' },
+            { path: 'messages[1]', identity: 'user:1', hash: 'stable-b' },
+        ],
+        anchors: [{ path: 'messages[1]', logicalIndex: 2, blockIndex: 1 }],
+    };
+
+    assert.equal(state.x, 0);
+    assert.equal(state.requiredRequests, 3);
+    for (let index = 0; index < ANCHOR_EVALUATION_REQUESTS; index += 1) {
+        last = recordAnchorEvaluation(state, snapshot);
+        state = last.state;
+    }
+
+    assert.equal(state.x, 0);
+    assert.equal(state.cyclesCompleted, 1);
+    assert.equal(state.active, false);
+    assert.equal(state.result, 0);
+    assert.equal(state.pendingReview, false);
+    assert.equal(last.reason, 'all-blocks-stable');
+});
+
+test('anchor evaluation ignores the changed block anchor and every later anchor', () => {
+    let state = createAnchorEvaluationState();
+    const snapshots = ['stable-b', 'changed-b', 'stable-b'].map((middleHash) => ({
+        blocks: [
+            { path: 'messages[0]', identity: 'system:1', hash: 'stable-a' },
+            { path: 'messages[1]', identity: 'user:1', hash: middleHash },
+            { path: 'messages[2]', identity: 'assistant:1', hash: 'stable-c' },
+            { path: 'messages[3]', identity: 'user:2', hash: 'stable-d' },
+        ],
+        anchors: [
+            { path: 'messages[0]', logicalIndex: 1, blockIndex: 0 },
+            { path: 'messages[1]', logicalIndex: 2, blockIndex: 1 },
+            { path: 'messages[2]', logicalIndex: 3, blockIndex: 2 },
+            { path: 'messages[3]', logicalIndex: 4, blockIndex: 3 },
+        ],
+    }));
+
+    let last = null;
+    for (const snapshot of snapshots) {
+        last = recordAnchorEvaluation(state, snapshot);
+        state = last.state;
+    }
+
+    assert.equal(last.reason, 'block-prefix-changed');
+    assert.equal(last.changedBlockIndex, 1);
+    assert.equal(state.result, 3);
+    assert.equal(state.pendingReview, false);
+});
+
+test('new blocks participate in evaluation and exact results above five wait for review', () => {
+    let state = createAnchorEvaluationState();
+    const block = (index, hash = `hash-${index}`) => ({
+        path: `messages[${index}]`,
+        identity: `message:${index}`,
+        hash,
+    });
+    const anchors = Array.from({ length: 7 }, (_, index) => ({
+        path: `messages[${index}]`,
+        logicalIndex: index + 1,
+        blockIndex: index,
+    }));
+    const snapshots = [
+        { blocks: [block(0, 'old')], anchors: [anchors[0]] },
+        { blocks: [block(0, 'old'), block(1), block(2)], anchors: anchors.slice(0, 3) },
+        { blocks: Array.from({ length: 7 }, (_, index) => block(index, index === 0 ? 'old' : undefined)), anchors },
+    ];
+
+    for (const snapshot of snapshots) {
+        state = recordAnchorEvaluation(state, snapshot).state;
+    }
+
+    assert.equal(state.result, 6);
+    assert.equal(state.pendingReview, true);
+    assert.equal(state.active, false);
+    assert.equal(state.warning, 'evaluation-result-out-of-range');
+});
+
+test('evaluation with missing block hashes does not silently apply x=0', () => {
+    let state = createAnchorEvaluationState();
+    for (let index = 0; index < ANCHOR_EVALUATION_REQUESTS; index += 1) {
+        state = recordAnchorEvaluation(state, { blocks: [], anchors: [] }).state;
+    }
+    assert.equal(state.result, null);
+    assert.equal(state.pendingReview, true);
+    assert.equal(state.warning, 'evaluation-data-unavailable');
 });
 
 test('automatic preprocessing is disabled by default and never mutates its caller', () => {
@@ -1664,3 +1782,101 @@ test('recursive cache-control counting covers definitions as well as prompt bloc
 
     assert.equal(countCacheControls(body), 2);
 });
+
+test('rolling plans expose and preserve the initially fixed last anchor until eviction', () => {
+    const store = new AnchorStore();
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const first = planCacheBreaks(blockBody('ABCDEFG'), { policy, store });
+    const initialLast = first.statePlan.initialLastAnchor;
+    assert.equal(first.commit(), true);
+
+    const grown = planCacheBreaks(blockBody('ABCDEFGHI'), { policy, store });
+    assert.deepEqual(grown.statePlan.initialLastAnchor, initialLast);
+    assert.equal(grown.diagnostics.protectedLastAnchorHeld, true);
+    assert.equal(grown.diagnostics.protectedLastAnchorPendingEviction, false);
+});
+
+test('rolling protection releases the initial last point only when it is the pending eviction', () => {
+    const store = new AnchorStore();
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const first = planCacheBreaks(blockBody('ABCDEFG'), { policy, store });
+    first.commit();
+    const firstRotation = planCacheBreaks(blockBody('ABCDEFGHIJ'), { policy, store });
+    assert.equal(firstRotation.diagnostics.protectedLastAnchor.logicalIndex, 7);
+    assert.equal(firstRotation.diagnostics.protectedLastAnchorHeld, true);
+    assert.equal(firstRotation.diagnostics.protectedLastAnchorPendingEviction, false);
+    firstRotation.commit();
+
+    const secondRotation = planCacheBreaks(blockBody('ABCDEFGHIJKLM'), { policy, store });
+    assert.equal(secondRotation.diagnostics.protectedLastAnchor.logicalIndex, 7);
+    assert.equal(secondRotation.diagnostics.protectedLastAnchorHeld, true);
+    secondRotation.commit();
+
+    const release = planCacheBreaks(blockBody('ABCDEFGHIJKLMNOPQ'), { policy, store });
+    assert.equal(release.diagnostics.protectedLastAnchorPendingEviction, true);
+});
+
+test('last-anchor short TTL conversion is valid in native order', () => {
+    const plan = planCacheBreaks(blockBody('ABCDEFG'), {
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+            autoConvertLastAnchorTo5m: true,
+        },
+        cacheControl: { type: 'ephemeral', ttl: '1h' },
+        store: new AnchorStore(),
+    });
+    const controls = [];
+    for (const message of plan.body.messages) {
+        for (const block of message.content || []) {
+            if (block.cache_control) controls.push(block.cache_control);
+        }
+    }
+    assert.deepEqual(controls.map((control) => control.ttl), ['1h', '1h', '1h', '5m']);
+    assert.equal(plan.diagnostics.lastAnchorTtlConversion.applied, true);
+});
+
+test('ignored tail diagnostics mark exactly the requested newest candidates', () => {
+    const plan = planCacheBreaks(blockBody('ABCDEFGHIJKLMNOPQRST'), {
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+            ignoreLastAnchorsMode: 'fixed',
+            ignoreLastAnchorCount: 4,
+        },
+        store: new AnchorStore(),
+    });
+    assert.deepEqual(plan.diagnostics.ignoredCandidateLogicalIndexes, [17, 18, 19, 20]);
+    assert.deepEqual(
+        plan.diagnostics.candidates.filter((candidate) => candidate.ignored).map((candidate) => candidate.logicalIndex),
+        [17, 18, 19, 20],
+    );
+});
+
+test('ignored tail slicing can consume fixed-head candidates and clamp to the available suffix', () => {
+    const plan = planCacheBreaks(blockBody('ABCDE'), {
+        policy: {
+            fixedHeadBreakpointCount: 4,
+            cacheAnchorMode: 'off',
+            cacheAnchorIntervalBlocks: 3,
+            ignoreLastAnchorsMode: 'fixed',
+            ignoreLastAnchorCount: 99,
+        },
+    });
+
+    assert.equal(plan.diagnostics.ignoredAnchorCount, 99);
+    assert.equal(plan.diagnostics.ignoredCandidateCount, 5);
+    assert.deepEqual(plan.diagnostics.ignoredCandidateLogicalIndexes, [1, 2, 3, 4, 5]);
+    assert.equal(plan.diagnostics.cacheControlCount, 0);
+});
+

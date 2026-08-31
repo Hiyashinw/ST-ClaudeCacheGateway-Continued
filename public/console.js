@@ -170,6 +170,20 @@ function integerInRange(value, minimum, maximum, fallback) {
   return Number.isInteger(number) && number >= minimum && number <= maximum ? number : fallback;
 }
 
+function nonNegativeInteger(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : fallback;
+}
+
+function booleanValue(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  if (value === null || value === undefined || value === '') return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'on', 'enabled'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off', 'disabled'].includes(normalized)) return false;
+  return fallback;
+}
+
 function cacheAnchorModeLabel(value) {
   if (value === 'single') return '单锚点';
   if (value === 'rolling') return '滚动锚点';
@@ -193,8 +207,34 @@ function getCachePolicy(runtime = state.runtime) {
     1000,
     3,
   );
+  const autoConvertLastAnchorTo5m = booleanValue(
+    runtime?.autoConvertLastAnchorTo5m
+      ?? runtime?.autoConvertLastAnchorToShortTtl
+      ?? nested.autoConvertLastAnchorTo5m,
+    false,
+  );
+  const rawIgnoreMode = runtime?.ignoreLastAnchorsMode
+    ?? runtime?.anchorIgnoreMode
+    ?? nested.ignoreLastAnchorsMode
+    ?? 'fixed';
+  const ignoreLastAnchorsMode = ['fixed', 'evaluation'].includes(rawIgnoreMode) ? rawIgnoreMode : 'fixed';
+  const ignoreLastAnchorCount = nonNegativeInteger(
+    runtime?.ignoreLastAnchorCount
+      ?? runtime?.ignoredAnchorCount
+      ?? runtime?.configuredIgnoreLastAnchorCount
+      ?? nested.ignoreLastAnchorCount,
+    0,
+  );
 
-  return { fixedHeadBreakpointCount, cacheAnchorMode, cacheAnchorIntervalBlocks, anchorState };
+  return {
+    fixedHeadBreakpointCount,
+    cacheAnchorMode,
+    cacheAnchorIntervalBlocks,
+    autoConvertLastAnchorTo5m,
+    ignoreLastAnchorsMode,
+    ignoreLastAnchorCount,
+    anchorState,
+  };
 }
 
 function cachePolicyLabel(policy = getCachePolicy()) {
@@ -228,20 +268,6 @@ function hasUsage(usage) {
 function formatUsage(usage) {
   if (!hasUsage(usage)) return '暂无 usage。';
   return JSON.stringify(usage, null, 2);
-}
-
-function upstreamStatsLabel(item) {
-  if (item?.responseStatus && item.responseStatus >= 400) return '请求失败';
-  if (item?.cacheReadTokens !== null && item?.cacheReadTokens !== undefined) return '有缓存读取';
-  if (item?.cacheWriteTokens !== null && item?.cacheWriteTokens !== undefined) return '有缓存写入';
-  if (item?.cacheResult && item.cacheResult !== 'unknown') return '有 usage';
-  return '未返回';
-}
-
-function upstreamStatsClass(item) {
-  if (item?.responseStatus && item.responseStatus >= 400) return 'danger';
-  if (upstreamStatsLabel(item) === '未返回') return '';
-  return 'success';
 }
 
 function cacheInjectLabel(item) {
@@ -706,6 +732,9 @@ function readCachePolicyForm() {
     fixedHeadBreakpointCount: integerInRange($('fixedHeadBreakpointCount')?.value, 0, CACHE_BREAKPOINT_LIMIT, 0),
     cacheAnchorMode: ['off', 'single', 'rolling'].includes($('cacheAnchorMode')?.value) ? $('cacheAnchorMode').value : 'off',
     cacheAnchorIntervalBlocks: integerInRange($('cacheAnchorIntervalBlocks')?.value, 1, 1000, 3),
+    autoConvertLastAnchorTo5m: Boolean($('autoConvertLastAnchorTo5m')?.checked),
+    ignoreLastAnchorsMode: ['fixed', 'evaluation'].includes($('ignoreLastAnchorsMode')?.value) ? $('ignoreLastAnchorsMode').value : 'fixed',
+    ignoreLastAnchorCount: nonNegativeInteger($('ignoreLastAnchorCount')?.value, 0),
   };
 }
 
@@ -770,6 +799,34 @@ function renderCache() {
   $('fixedHeadBreakpointCount').value = String(policy.fixedHeadBreakpointCount);
   $('cacheAnchorMode').value = policy.cacheAnchorMode;
   $('cacheAnchorIntervalBlocks').value = String(policy.cacheAnchorIntervalBlocks);
+  $('autoConvertLastAnchorTo5m').checked = policy.autoConvertLastAnchorTo5m;
+  $('ignoreLastAnchorsMode').value = policy.ignoreLastAnchorsMode;
+  $('ignoreLastAnchorCount').value = String(policy.ignoreLastAnchorCount);
+  const evaluation = runtime.anchorIgnoreEvaluation || {};
+  const evaluationActive = policy.ignoreLastAnchorsMode === 'evaluation' && Boolean(evaluation.active);
+  const evaluationResult = Number.isInteger(evaluation.result) ? evaluation.result : null;
+  $('ignoreLastAnchorCount').disabled = policy.ignoreLastAnchorsMode === 'evaluation';
+  $('anchorIgnoreEvaluationStart').textContent = evaluation.pendingReview ? '重新评估' : evaluationActive ? '评估中' : '开始评估';
+  $('anchorIgnoreEvaluationStart').disabled = evaluationActive;
+  $('anchorIgnoreEvaluationAccept').hidden = !evaluation.pendingReview || evaluationResult === null;
+  $('anchorIgnoreEvaluationAccept').textContent = evaluationResult === null ? '填入结果' : `仍填入 x=${evaluationResult}`;
+  const evaluationStatus = $('anchorIgnoreEvaluationStatus');
+  if (evaluationStatus) {
+    const messages = [];
+    if (evaluationActive) {
+      messages.push(`评估进行中：已完成 ${evaluation.requestsCompleted || 0} / ${evaluation.requiredRequests || 3} 次对话，当前 x=0，还需 ${evaluation.requestsRemaining ?? 3} 次。`);
+    } else if (evaluation.pendingReview) {
+      messages.push(evaluation.notice || `评估结果为 x=${evaluation.result ?? evaluation.x}，请检查预设后决定是否填入。`);
+    } else if (evaluation.notice) {
+      messages.push(evaluation.notice);
+    } else if (policy.ignoreLastAnchorsMode === 'fixed' && policy.ignoreLastAnchorCount > 5) {
+      messages.push(`当前 x=${policy.ignoreLastAnchorCount}，已超出建议范围 0–5。`);
+    }
+    evaluationStatus.textContent = messages.join(' ');
+    const warning = evaluation.pendingReview
+      || (policy.ignoreLastAnchorsMode === 'fixed' && policy.ignoreLastAnchorCount > 5);
+    evaluationStatus.className = `anchor-ignore-status ${warning ? 'warning' : evaluationActive ? 'success' : ''}`.trim();
+  }
   const noAnchorCapacity = policy.cacheAnchorMode !== 'off' && policy.fixedHeadBreakpointCount >= CACHE_BREAKPOINT_LIMIT;
   $('cachePolicyBadge').textContent = noAnchorCapacity ? '锚点无配额' : cachePolicyLabel(policy);
   $('cachePolicyBadge').classList.toggle('off', policy.fixedHeadBreakpointCount === 0 && policy.cacheAnchorMode === 'off');
@@ -822,6 +879,10 @@ function renderAdvanced() {
       fixedHeadBreakpointCount: getCachePolicy(runtime).fixedHeadBreakpointCount,
       cacheAnchorMode: getCachePolicy(runtime).cacheAnchorMode,
       cacheAnchorIntervalBlocks: getCachePolicy(runtime).cacheAnchorIntervalBlocks,
+      autoConvertLastAnchorTo5m: getCachePolicy(runtime).autoConvertLastAnchorTo5m,
+      ignoreLastAnchorsMode: getCachePolicy(runtime).ignoreLastAnchorsMode,
+      ignoreLastAnchorCount: getCachePolicy(runtime).ignoreLastAnchorCount,
+      anchorIgnoreEvaluation: runtime.anchorIgnoreEvaluation,
       anchorState: getCachePolicy(runtime).anchorState,
     },
     anthropicInboundEnabled: runtime.anthropicInboundEnabled,
@@ -913,17 +974,19 @@ function renderRequests() {
         .join(' · ');
       appendText(prefix, 'small', `锚点 ${anchorDetails}`);
     }
+    if (item.changedBlockCount > 0) {
+      prefix.appendChild(document.createElement('br'));
+      appendText(prefix, 'small', `块哈希变更 ${item.changedBlockCount}`);
+    }
 
     const stats = tableCell(tr, '', '', 'Usage');
-    appendText(stats, 'span', upstreamStatsLabel(item), `badge ${upstreamStatsClass(item)}`.trim());
-    if (item.cacheReadTokens !== null && item.cacheReadTokens !== undefined
-      || item.cacheWriteTokens !== null && item.cacheWriteTokens !== undefined) {
-      stats.appendChild(document.createElement('br'));
-      const tokenParts = [];
-      if (item.cacheReadTokens !== null && item.cacheReadTokens !== undefined) tokenParts.push(`读 ${item.cacheReadTokens}`);
-      if (item.cacheWriteTokens !== null && item.cacheWriteTokens !== undefined) tokenParts.push(`写 ${item.cacheWriteTokens}`);
-      appendText(stats, 'small', tokenParts.join(' / '));
-    }
+    renderUsageLines(stats, {
+      inputTokens: nonNegativeNumber(item.inputTokens),
+      outputTokens: nonNegativeNumber(item.outputTokens),
+      cacheWriteTokens: nonNegativeNumber(item.cacheWriteTokens),
+      cacheReadTokens: nonNegativeNumber(item.cacheReadTokens),
+      cacheHitRatePercent: nonNegativeNumber(item.cacheHitRatePercent),
+    }, 'compact');
 
     const channel = tableCell(tr, '', '', '渠道');
     channel.append(document.createTextNode(channelName(state.runtime)));
@@ -968,6 +1031,7 @@ async function refreshAll() {
 function selectedSummary() {
   const item = state.selected;
   const usage = item?.response?.usage || {};
+  const mode = item?.upstream?.mode || item?.gateway?.upstreamMode || 'openai';
   return {
     id: item?.id,
     capturedAt: item?.capturedAt,
@@ -980,6 +1044,8 @@ function selectedSummary() {
     prefixLock: item?.gateway?.prefixLock,
     upstreamExtraJson: item?.gateway?.upstreamExtraJsonApplied,
     usage,
+    usageStatistics: usageStatistics(usage, mode),
+    blockHashComparison: item?.upstream?.blockHashComparison,
   };
 }
 
@@ -1079,6 +1145,10 @@ function selectedBreakpoints(capture, segments = []) {
       reason: entry?.reason || entry?.selectionReason || entry?.kind || null,
       reasons: Array.isArray(entry?.reasons) ? entry.reasons : [],
       prefixHash: entry?.prefixHash || entry?.hash || null,
+      blockHash: entry?.blockHash || null,
+      previousHash: entry?.previousHash || null,
+      changed: Boolean(entry?.changed),
+      ttlOverride: entry?.ttlOverride || null,
     };
   }).filter((entry) => entry.path) : [];
   const diagnosticSelected = Array.isArray(diagnostics.selectedBreakpoints)
@@ -1113,6 +1183,19 @@ function selectedBreakpoints(capture, segments = []) {
     seen.add(key);
     return true;
   });
+}
+
+function getBlockHashEntries(capture) {
+  const raw = capture?.upstream?.blockHashes
+    || capture?.upstream?.cache?.blockHashes
+    || capture?.upstream?.blockHashComparison?.entries
+    || capture?.gateway?.cachePolicy?.blockHashes
+    || [];
+  return Array.isArray(raw) ? raw.filter((entry) => entry?.path) : [];
+}
+
+function blockHashByPath(capture) {
+  return new Map(getBlockHashEntries(capture).map((entry) => [entry.path, entry]));
 }
 
 function getOrderedBodySegments(body, mode) {
@@ -1285,6 +1368,76 @@ function promptTokensFromUsage(usage, upstreamMode = 'openai') {
   return inputTokens + cacheReadTokens + cacheCreationTokens;
 }
 
+function usageStatistics(usage = {}, upstreamMode = 'openai') {
+  const inputTokens = promptTokensFromUsage(usage, upstreamMode);
+  const outputTokens = nonNegativeNumber(usage?.outputTokens);
+  const cacheReadTokens = nonNegativeNumber(
+    upstreamMode === 'anthropic'
+      ? usage?.anthropicCacheReadInputTokens ?? usage?.cacheReadTokens
+      : usage?.cachedTokens ?? usage?.cacheReadTokens,
+  );
+  const cacheWriteTokens = nonNegativeNumber(
+    upstreamMode === 'anthropic'
+      ? usage?.anthropicCacheCreationInputTokens ?? usage?.cacheWriteTokens
+      : usage?.cacheWriteTokens,
+  );
+  const denominator = inputTokens !== null
+    ? inputTokens
+    : (cacheReadTokens || 0) + (cacheWriteTokens || 0);
+  const cacheHitRate = cacheReadTokens !== null && denominator > 0
+    ? cacheReadTokens / denominator
+    : null;
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    cacheHitRate,
+    cacheHitRatePercent: cacheHitRate === null ? null : Number((cacheHitRate * 100).toFixed(2)),
+  };
+}
+
+function usageRateLabel(value) {
+  return value === null || value === undefined ? '暂不可用' : `${Number(value.toFixed(2))}%`;
+}
+
+function usageNumberLabel(value) {
+  return value === null || value === undefined ? '暂不可用' : String(value);
+}
+
+function appendUsagePair(root, label, value) {
+  const pair = document.createElement('span');
+  pair.className = 'usage-pair';
+  appendText(pair, 'span', `${label} `, 'usage-label');
+  appendText(pair, 'strong', usageNumberLabel(value), 'usage-value');
+  root.appendChild(pair);
+}
+
+function renderUsageLines(root, stats, variant = '') {
+  clearNode(root);
+  root.className = `usage-lines ${variant}`.trim();
+
+  const first = document.createElement('div');
+  first.className = 'usage-line';
+  appendUsagePair(first, '输入', stats.inputTokens);
+  appendText(first, 'span', '/', 'usage-separator');
+  appendUsagePair(first, '输出', stats.outputTokens);
+
+  const second = document.createElement('div');
+  second.className = 'usage-line';
+  appendUsagePair(second, '缓存创建', stats.cacheWriteTokens);
+  appendText(second, 'span', '/', 'usage-separator');
+  appendUsagePair(second, '缓存命中', stats.cacheReadTokens);
+
+  const third = document.createElement('div');
+  third.className = 'usage-line';
+  appendText(third, 'span', '缓存命中率 ', 'usage-label');
+  appendText(third, 'strong', usageRateLabel(stats.cacheHitRatePercent), 'usage-value');
+
+  root.append(first, second, third);
+  return stats;
+}
+
 function getPromptTokenEstimate(segments, usage, upstreamMode = 'openai') {
   const characterCounts = segments.map((segment) => countCharacters(segment?.text ?? segment?.value ?? segment));
   const totalCharacters = characterCounts.reduce((sum, count) => sum + count, 0);
@@ -1323,6 +1476,45 @@ function breakpointsForSegment(segment, breakpoints) {
   return matches;
 }
 
+function blockHashInfoForSegment(segment, hashByPath) {
+  return hashByPath?.get(segment.path)
+    || hashByPath?.get(`${segment.path}.content`)
+    || null;
+}
+
+function renderHeaderBlockHashes(root, segments, hashByPath) {
+  const entries = segments
+    .map((segment, index) => ({
+      segment,
+      index,
+      info: blockHashInfoForSegment(segment, hashByPath),
+    }))
+    .filter((entry) => entry.info?.hash);
+  if (!entries.length) return;
+
+  const hashes = document.createElement('span');
+  hashes.className = 'msg-head-hashes';
+  const multiple = entries.length > 1;
+
+  for (const { segment, index, info } of entries) {
+    const blockIndex = Number.isInteger(segment.contentBlockIndex) ? segment.contentBlockIndex : index;
+    const label = multiple ? `b${blockIndex}` : 'Hash';
+    const hash = appendText(
+      hashes,
+      'span',
+      `${label} ${compactHash(info.hash)}`,
+      `msg-head-hash ${info.changed ? 'changed' : ''}`.trim(),
+    );
+    hash.dataset.hash = String(info.hash);
+    hash.dataset.hashChanged = info.changed ? 'true' : 'false';
+    hash.title = info.previousHash
+      ? `当前 SHA-256: ${info.hash}\n上次 SHA-256: ${info.previousHash}`
+      : `当前 SHA-256: ${info.hash}${info.compared ? '\n上次请求中不存在此块' : '\n首次请求基线'}`;
+  }
+
+  root.appendChild(hashes);
+}
+
 function renderMessageCard(root, group, index, isPrefix, tokensPerCharacter = null, options = {}) {
   const segments = group.segments || [group];
   const segmentBreakpoints = segments.map((segment) => breakpointsForSegment(segment, options.breakpoints || []));
@@ -1343,6 +1535,7 @@ function renderMessageCard(root, group, index, isPrefix, tokensPerCharacter = nu
   appendText(left, 'span', `#${index} · ${group.label || group.path}`, 'msg-index');
   const right = document.createElement('span');
   right.className = 'msg-right';
+  renderHeaderBlockHashes(right, segments, options.blockHashByPath);
   const characterCount = displayGroupCharacterCount(group);
   appendText(right, 'span', promptEstimateLabel(characterCount, estimatedTokens(characterCount, tokensPerCharacter)), 'msg-meta');
   appendText(right, 'span', '▾', 'msg-caret');
@@ -1419,6 +1612,12 @@ function renderBreakpointDiagnostics(root, capture) {
   if (diagnostics.contextHash) metadata.push(`上下文 ${compactHash(diagnostics.contextHash)}`);
   if (diagnostics.action) metadata.push(`动作 ${diagnostics.action}`);
   if (diagnostics.reason) metadata.push(`原因 ${diagnostics.reason}`);
+  const blockHashes = getBlockHashEntries(capture);
+  const changedBlockCount = capture?.upstream?.cache?.changedBlockCount
+    ?? capture?.upstream?.blockHashComparison?.changedBlockCount
+    ?? blockHashes.filter((entry) => entry.changed).length;
+  if (blockHashes.length) metadata.push(`块哈希 ${blockHashes.length}`);
+  if (changedBlockCount > 0) metadata.push(`变更 ${changedBlockCount}`);
   if (metadata.length) appendText(root, 'span', metadata.join(' · '), 'breakpoint-chip');
 }
 
@@ -1447,8 +1646,28 @@ function renderRequestBodyStream(root, capture, prefixOnly = false) {
       breakpoints,
       cache,
       cacheTtl: capture?.gateway?.cacheTtl,
+      blockHashByPath: blockHashByPath(capture),
     });
   });
+}
+
+function renderUsageStats(root, usage, upstreamMode = 'openai') {
+  const stats = usageStatistics(usage, upstreamMode);
+  const hasAny = [
+    stats.inputTokens,
+    stats.outputTokens,
+    stats.cacheReadTokens,
+    stats.cacheWriteTokens,
+  ].some((value) => value !== null && value !== undefined && value !== '');
+  if (!hasAny) {
+    clearNode(root);
+    root.className = 'usage-stats empty';
+    appendText(root, 'span', '上游没有返回可用的 Usage 数据。', 'usage-empty');
+    return stats;
+  }
+
+  renderUsageLines(root, stats, 'detail usage-stats');
+  return stats;
 }
 
 function renderDetail() {
@@ -1459,11 +1678,13 @@ function renderDetail() {
     item.upstream?.body || item.gateway?.transformedBody,
     item.upstream?.mode || item.gateway?.upstreamMode,
   );
+  const upstreamMode = item.upstream?.mode || item.gateway?.upstreamMode || 'openai';
   const promptEstimate = getPromptTokenEstimate(
     promptSegments,
     usage,
-    item.upstream?.mode || item.gateway?.upstreamMode,
+    upstreamMode,
   );
+  const usageStats = usageStatistics(usage, upstreamMode);
   $('drawerTitle').textContent = item.upstream?.body?.model || item.gateway?.transformedBody?.model || item.id;
   $('drawerEyebrow').textContent = channelName(state.runtime);
   $('detailId').textContent = `ID: ${item.id}`;
@@ -1478,6 +1699,9 @@ function renderDetail() {
     ['候选断点', cachePolicyCandidateCount(getCaptureCachePolicy(item)) ?? '未记录'],
     ['Prefix 动作', item.gateway?.prefixLock?.action || 'disabled'],
     ['Usage', hasUsage(usage) ? '已返回' : '未返回'],
+    ['输入 token', usageStats.inputTokens === null ? '暂不可用' : usageStats.inputTokens],
+    ['输出 token', usageStats.outputTokens === null ? '暂不可用' : usageStats.outputTokens],
+    ['缓存命中率', usageRateLabel(usageStats.cacheHitRatePercent)],
     ['输入提示词', inputPromptTokenLabel(promptEstimate.promptTokens)],
     ['Token 倍率', tokenMultiplierLabel(promptEstimate.tokensPerCharacter)],
     ['当前渠道', channelName(state.runtime)],
@@ -1496,13 +1720,16 @@ function renderDetail() {
   };
 
   const showBody = state.selectedTab === 'body';
+  const showUsage = state.selectedTab === 'usage';
   $('detailBodyTab').hidden = !showBody;
+  $('detailUsageStats').hidden = !showUsage;
   $('detailPre').hidden = showBody;
   if (showBody) {
     renderBreakpointDiagnostics($('detailBreakpointSummary'), item);
     renderRequestBodyStream($('detailBodyStream'), item);
   } else {
-    $('detailPre').textContent = state.selectedTab === 'usage'
+    if (showUsage) renderUsageStats($('detailUsageStats'), usage, upstreamMode);
+    $('detailPre').textContent = showUsage
       ? formatUsage(usage)
       : JSON.stringify(tabPayloads[state.selectedTab] ?? tabPayloads.summary, null, 2);
   }
@@ -1513,6 +1740,8 @@ function renderDetail() {
 async function viewRequest(id) {
   state.selected = await api(`/console/requests/${encodeURIComponent(id)}`);
   state.selectedTab = 'body';
+  const detailScroll = document.querySelector('.detail-scroll');
+  if (detailScroll) detailScroll.scrollTop = 0;
   for (const tab of document.querySelectorAll('.tab')) {
     tab.classList.toggle('active', tab.dataset.tab === 'body');
   }
@@ -1542,21 +1771,40 @@ async function applyCachePolicy() {
   const rawHead = Number($('fixedHeadBreakpointCount').value);
   const rawInterval = Number($('cacheAnchorIntervalBlocks').value);
   const mode = $('cacheAnchorMode').value;
+  const ignoreMode = $('ignoreLastAnchorsMode').value;
+  const rawIgnored = Number($('ignoreLastAnchorCount').value);
+  const autoLastAnchor5m = Boolean($('autoConvertLastAnchorTo5m').checked);
   if (!Number.isInteger(rawHead) || rawHead < 0 || rawHead > CACHE_BREAKPOINT_LIMIT) throw new Error('固定头缓存点必须是 0–4 的整数。');
   if (!['off', 'single', 'rolling'].includes(mode)) throw new Error('缓存锚点模式无效。');
   if (!Number.isInteger(rawInterval) || rawInterval < 1 || rawInterval > 1000) throw new Error('滚动间隔必须是 1–1000 的整数。');
+  if (!['fixed', 'evaluation'].includes(ignoreMode)) throw new Error('末尾锚点忽略模式无效。');
+  if (!Number.isInteger(rawIgnored) || rawIgnored < 0) throw new Error('忽略末尾锚点数量必须是非负整数。');
 
   const button = $('cachePolicyApply');
   const previous = getCachePolicy();
   const changed = rawHead !== previous.fixedHeadBreakpointCount
     || mode !== previous.cacheAnchorMode
-    || rawInterval !== previous.cacheAnchorIntervalBlocks;
+    || rawInterval !== previous.cacheAnchorIntervalBlocks
+    || autoLastAnchor5m !== previous.autoConvertLastAnchorTo5m
+    || ignoreMode !== previous.ignoreLastAnchorsMode
+    || rawIgnored !== previous.ignoreLastAnchorCount;
+  const requiresOutOfRangeConfirmation = ignoreMode === 'fixed'
+    && rawIgnored > 5
+    && rawIgnored !== previous.ignoreLastAnchorCount;
+  if (requiresOutOfRangeConfirmation
+    && !window.confirm(`x=${rawIgnored} 超出建议范围 0–5，确认仍然填入吗？`)) {
+    return;
+  }
   button.disabled = true;
   try {
     await postJson('/console/cache-policy', {
       fixedHeadBreakpointCount: rawHead,
       cacheAnchorMode: mode,
       cacheAnchorIntervalBlocks: rawInterval,
+      autoConvertLastAnchorTo5m: autoLastAnchor5m,
+      ignoreLastAnchorsMode: ignoreMode,
+      ignoreLastAnchorCount: rawIgnored,
+      confirmOutOfRange: requiresOutOfRangeConfirmation,
     });
     await refreshAll();
     const suffix = mode === 'off'
@@ -1564,7 +1812,8 @@ async function applyCachePolicy() {
       : changed
         ? '；Prefix Lock 已关闭，下一次成功请求将学习锚点'
         : '；锚点状态保持不变';
-    setStatus(`断点保留策略已应用：固定头 ${rawHead}，${cacheAnchorModeLabel(mode)}${suffix}`);
+    const ignoreLabel = ignoreMode === 'evaluation' ? '评估模式' : `忽略末尾 ${rawIgnored}`;
+    setStatus(`断点保留策略已应用：固定头 ${rawHead}，${cacheAnchorModeLabel(mode)}，${ignoreLabel}${suffix}`);
   } finally {
     button.disabled = false;
   }
@@ -1661,6 +1910,32 @@ function bindEvents() {
   $('fixedHeadBreakpointCount').onchange = () => renderCachePolicyBudget(true);
   $('cacheAnchorMode').onchange = () => renderCachePolicyBudget(true);
   $('cacheAnchorIntervalBlocks').oninput = () => renderCachePolicyBudget(true);
+  $('ignoreLastAnchorsMode').onchange = () => {
+    const evaluationMode = $('ignoreLastAnchorsMode').value === 'evaluation';
+    $('ignoreLastAnchorCount').disabled = evaluationMode;
+  };
+  $('ignoreLastAnchorCount').oninput = () => renderCachePolicyBudget(true);
+  $('anchorIgnoreEvaluationStart').onclick = async () => {
+    try {
+      const result = await postJson('/console/anchor-ignore-evaluation', { action: 'start' });
+      await refreshAll();
+      setStatus(result.evaluationNotice || `评估模式已开启，x 已设为 0，请连续进行 3 次对话。`);
+    } catch (error) {
+      setStatus(error.message);
+    }
+  };
+  $('anchorIgnoreEvaluationAccept').onclick = async () => {
+    try {
+      await postJson('/console/anchor-ignore-evaluation', {
+        action: 'accept',
+        confirmOutOfRange: true,
+      });
+      await refreshAll();
+      setStatus('评估结果已填入忽略末尾锚点数量。');
+    } catch (error) {
+      setStatus(error.message);
+    }
+  };
   $('cachePolicyApply').onclick = () => applyCachePolicy().catch((error) => { renderCache(); setStatus(error.message); });
   $('cacheAnchorsClear').onclick = () => clearCacheAnchors().catch((error) => setStatus(error.message));
   $('prefixLockSwitch').onchange = async () => { await postJson('/console/prefix-lock', { enabled: $('prefixLockSwitch').checked }); await refreshAll(); setStatus($('prefixLockSwitch').checked ? 'Prefix Lock 已开启，缓存锚点已关闭并清空' : 'Prefix Lock 已关闭并清空'); };
@@ -1700,6 +1975,8 @@ function bindEvents() {
       state.selectedTab = tab.dataset.tab;
       for (const item of document.querySelectorAll('.tab')) item.classList.toggle('active', item === tab);
       renderDetail();
+      const detailScroll = document.querySelector('.detail-scroll');
+      if (detailScroll) detailScroll.scrollTop = 0;
     };
   }
   $('expandAllMessages').onclick = () => document.querySelectorAll('#detailBodyStream .msg-card').forEach((card) => card.classList.remove('collapsed'));

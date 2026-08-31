@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 9,
+  "cacheTranslationEnabled": true,
+  "systemMessageHandlingMode": "default",
+  "autoGenerateCacheBreakpointsMode": "auto",
+  "captureRequests": true,
+  "cacheTtl": "manual",
+  "fixedHeadBreakpointCount": 1,
+  "cacheAnchorMode": "rolling",
+  "cacheAnchorIntervalBlocks": 3,
+  "autoConvertLastAnchorTo5m": false,
+  "ignoreLastAnchorsMode": "evaluation",
+  "ignoreLastAnchorCount": 0,
+  "activeChannelId": "1-4",
+  "channels": [
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "kind": "builtin",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "upstreamMode": "openai",
+      "upstreamExtraJson": {},
+      "upstreamExcludePaths": [],
+      "upstreamHeaders": {},
+      "upstreamExcludeHeaders": []
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "kind": "builtin",
+      "baseUrl": "https://api.anthropic.com",
+      "upstreamMode": "anthropic",
+      "upstreamExtraJson": {},
+      "upstreamExcludePaths": [],
+      "upstreamHeaders": {},
+      "upstreamExcludeHeaders": []
+    },
+    {
+      "id": "vertex",
+      "name": "Google Vertex AI",
+      "kind": "builtin",
+      "baseUrl": "https://us-east5-aiplatform.googleapis.com",
+      "upstreamMode": "anthropic",
+      "upstreamExtraJson": {},
+      "upstreamExcludePaths": [],
+      "upstreamHeaders": {},
+      "upstreamExcludeHeaders": []
+    },
+    {
+      "id": "bedrock",
+      "name": "Amazon Bedrock",
+      "kind": "builtin",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "upstreamMode": "anthropic",
+      "upstreamExtraJson": {},
+      "upstreamExcludePaths": [],
+      "upstreamHeaders": {},
+      "upstreamExcludeHeaders": []
+    },
+    {
+      "id": "pioneer",
+      "name": "Pioneer",
+      "kind": "custom",
+      "baseUrl": "https://api.pioneer.ai",
+      "upstreamMode": "openai",
+      "upstreamExtraJson": {},
+      "upstreamExcludePaths": [],
+      "upstreamHeaders": {},
+      "upstreamExcludeHeaders": []
+    },
+    {
+      "id": "1-4",
+      "name": "DeepSeek",
+      "kind": "custom",
+      "baseUrl": "https://api.deepseek.com/anthropic",
+      "upstreamMode": "anthropic",
+      "upstreamExtraJson": {
+        "output_config": {
+          "effort": "low"
+        },
+        "reasoning": {
+          "effort": "low"
+        },
+        "reasoning_effort": "low"
+      },
+      "upstreamExcludePaths": [],
+      "upstreamHeaders": {},
+      "upstreamExcludeHeaders": []
+    }
+  ],
+  "upstreamMode": "anthropic",
+  "upstreamExtraJson": {
+    "output_config": {
+      "effort": "low"
+    },
+    "reasoning": {
+      "effort": "low"
+    },
+    "reasoning_effort": "low"
+  },
+  "upstreamExcludePaths": [],
+  "upstreamHeaders": {},
+  "upstreamExcludeHeaders": []
+}

@@ -3,10 +3,20 @@ import { createHash } from 'node:crypto';
 export const MARKER = '[[CACHE_BREAK]]';
 export const SHORT_MARKER = '[[CACHE_BREAK_SHORT]]';
 export const MAX_BREAKPOINTS = 4;
+export const MAX_IGNORED_ANCHORS = 5;
+export const INITIAL_EVALUATION_IGNORED_ANCHORS = 0;
+export const ANCHOR_EVALUATION_REQUESTS = 3;
+export const ANCHOR_EVALUATION_SAMPLE_SIZE = 3;
 export const DEFAULT_CACHE_POLICY = Object.freeze({
     fixedHeadBreakpointCount: 0,
     cacheAnchorMode: 'off',
     cacheAnchorIntervalBlocks: 3,
+});
+
+export const DEFAULT_CACHE_ENHANCEMENTS = Object.freeze({
+    autoConvertLastAnchorTo5m: false,
+    ignoreLastAnchorsMode: 'fixed',
+    ignoreLastAnchorCount: 0,
 });
 
 const VALID_PROTOCOLS = new Set(['openai', 'anthropic']);
@@ -308,6 +318,44 @@ function normalizeFingerprintValue(value, definitions = markerDefinitions(), pat
     return output;
 }
 
+function stripCacheControlDeep(value, definitions = markerDefinitions()) {
+    if (typeof value === 'string') {
+        return stripMarkers(value, definitions);
+    }
+
+    if (Array.isArray(value)) {
+        return value.map((item) => stripCacheControlDeep(item, definitions));
+    }
+
+    if (!isObject(value)) {
+        return value;
+    }
+
+    const output = {};
+
+    for (const [key, child] of Object.entries(value)) {
+        if (key === CACHE_CONTROL_KEY || child === undefined) {
+            continue;
+        }
+
+        output[key] = stripCacheControlDeep(child, definitions);
+    }
+
+    return output;
+}
+
+/**
+ * Return a stable content hash for one prompt block.  Cache directives are
+ * intentionally excluded: changing a block from a gateway-owned 1h boundary
+ * to a 5m boundary must not make the block look like prompt content changed.
+ */
+export function hashPromptBlock(value, metadata = null, definitions = markerDefinitions()) {
+    return hashCanonical({
+        metadata: metadata || null,
+        value: stripCacheControlDeep(value, definitions),
+    });
+}
+
 export function normalizeCachePolicy(input = {}) {
     const source = input || {};
     const fixedHeadBreakpointCount = Number(
@@ -342,10 +390,360 @@ export function normalizeCachePolicy(input = {}) {
         );
     }
 
-    return {
+    const result = {
         fixedHeadBreakpointCount,
         cacheAnchorMode,
         cacheAnchorIntervalBlocks,
+    };
+
+    // Keep the original three-field return shape for callers that only use the
+    // historic cache policy.  The optional enhancements are added when one of
+    // their fields is explicitly present, which keeps old integrations and
+    // persisted configurations backwards compatible while allowing the new
+    // planner options to travel through the same policy object.
+    const enhancementKeys = [
+        'autoConvertLastAnchorTo5m',
+        'autoConvertLastAnchorToShortTtl',
+        'lastAnchorShortTtl',
+        'autoLastAnchor5m',
+        'autoLastAnchorTo5m',
+        'autoConvertLastAnchorToShort',
+        'ignoreLastAnchorsMode',
+        'anchorIgnoreMode',
+        'ignoredAnchorsMode',
+        'ignoreMode',
+        'ignoreLastAnchorCount',
+        'ignoredAnchorCount',
+        'ignoreLastAnchorsCount',
+        'ignoreTailAnchorCount',
+        'ignoreLastAnchors',
+        'ignoredAnchors',
+    ];
+
+    if (enhancementKeys.some((key) => hasOwn(source, key))) {
+        Object.assign(result, normalizeCacheEnhancements(source, { allowEvaluationOverflow: true }));
+    } else {
+        // Expose safe defaults without changing the enumerable shape expected
+        // by older callers that deep-compare the historic three-field policy.
+        Object.defineProperties(result, {
+            autoConvertLastAnchorTo5m: { value: DEFAULT_CACHE_ENHANCEMENTS.autoConvertLastAnchorTo5m },
+            ignoreLastAnchorsMode: { value: DEFAULT_CACHE_ENHANCEMENTS.ignoreLastAnchorsMode },
+            ignoreLastAnchorCount: { value: DEFAULT_CACHE_ENHANCEMENTS.ignoreLastAnchorCount },
+        });
+    }
+
+    return result;
+}
+
+function firstOwnValue(source, keys, fallback) {
+    for (const key of keys) {
+        if (hasOwn(source, key)) {
+            return source[key];
+        }
+    }
+
+    return fallback;
+}
+
+function normalizeBooleanOption(value, fallback = false, strict = false, field = 'option') {
+    if (value === undefined || value === null || value === '') {
+        return fallback;
+    }
+
+    if (typeof value === 'boolean') {
+        return value;
+    }
+
+    if (!strict) {
+        const normalized = String(value).trim().toLowerCase();
+
+        if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) {
+            return true;
+        }
+
+        if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) {
+            return false;
+        }
+
+        return fallback;
+    }
+
+    throw new CachePolicyError(`${field} must be a boolean.`, 'INVALID_CACHE_OPTION', { field, value });
+}
+
+export function normalizeIgnoredAnchorCount(value, { strict = false, allowEvaluationOverflow = false } = {}) {
+    const number = Number(value ?? 0);
+    const aboveMaximum = !allowEvaluationOverflow && number > MAX_IGNORED_ANCHORS;
+
+    if (!Number.isInteger(number) || number < 0 || aboveMaximum) {
+        if (strict) {
+            const range = allowEvaluationOverflow
+                ? 'a non-negative integer'
+                : `an integer from 0 to ${MAX_IGNORED_ANCHORS}`;
+            throw new CachePolicyError(
+                `ignoreLastAnchorCount must be ${range}.`,
+                'INVALID_IGNORED_ANCHOR_COUNT',
+                {
+                    ignoreLastAnchorCount: value,
+                    maximum: allowEvaluationOverflow ? null : MAX_IGNORED_ANCHORS,
+                },
+            );
+        }
+
+        return 0;
+    }
+
+    return number;
+}
+
+export function normalizeIgnoredAnchorMode(value, { strict = false } = {}) {
+    const raw = String(value ?? DEFAULT_CACHE_ENHANCEMENTS.ignoreLastAnchorsMode).trim().toLowerCase();
+    const aliases = new Map([
+        ['fixed', 'fixed'],
+        ['number', 'fixed'],
+        ['numeric', 'fixed'],
+        ['manual', 'fixed'],
+        ['evaluation', 'evaluation'],
+        ['evaluate', 'evaluation'],
+        ['eval', 'evaluation'],
+        ['auto', 'evaluation'],
+    ]);
+    const normalized = aliases.get(raw);
+
+    if (normalized) {
+        return normalized;
+    }
+
+    if (strict) {
+        throw new CachePolicyError(
+            'ignoreLastAnchorsMode must be fixed or evaluation.',
+            'INVALID_IGNORED_ANCHOR_MODE',
+            { ignoreLastAnchorsMode: value },
+        );
+    }
+
+    return DEFAULT_CACHE_ENHANCEMENTS.ignoreLastAnchorsMode;
+}
+
+export function normalizeCacheEnhancements(input = {}, { strict = false, allowEvaluationOverflow = false } = {}) {
+    const source = input || {};
+    const autoRaw = firstOwnValue(source, [
+        'autoConvertLastAnchorTo5m',
+        'autoConvertLastAnchorToShortTtl',
+        'lastAnchorShortTtl',
+        'autoLastAnchor5m',
+        'autoLastAnchorTo5m',
+        'autoConvertLastAnchorToShort',
+    ], DEFAULT_CACHE_ENHANCEMENTS.autoConvertLastAnchorTo5m);
+    const modeRaw = firstOwnValue(source, [
+        'ignoreLastAnchorsMode',
+        'anchorIgnoreMode',
+        'ignoredAnchorsMode',
+        'ignoreMode',
+    ], DEFAULT_CACHE_ENHANCEMENTS.ignoreLastAnchorsMode);
+    const countRaw = firstOwnValue(source, [
+        'ignoreLastAnchorCount',
+        'ignoredAnchorCount',
+        'ignoreLastAnchorsCount',
+        'ignoreTailAnchorCount',
+        'ignoreLastAnchors',
+        'ignoredAnchors',
+    ], undefined);
+    const mode = normalizeIgnoredAnchorMode(modeRaw, { strict });
+    const count = countRaw === undefined
+        ? (mode === 'evaluation' ? INITIAL_EVALUATION_IGNORED_ANCHORS : DEFAULT_CACHE_ENHANCEMENTS.ignoreLastAnchorCount)
+        : normalizeIgnoredAnchorCount(countRaw, { strict, allowEvaluationOverflow });
+
+    return {
+        autoConvertLastAnchorTo5m: normalizeBooleanOption(
+            autoRaw,
+            DEFAULT_CACHE_ENHANCEMENTS.autoConvertLastAnchorTo5m,
+            strict,
+            'autoConvertLastAnchorTo5m',
+        ),
+        ignoreLastAnchorsMode: mode,
+        ignoreLastAnchorCount: count,
+    };
+}
+
+function normalizeEvaluationSample(snapshot = {}) {
+    const blocks = Array.isArray(snapshot.blocks)
+        ? snapshot.blocks.map((entry, index) => ({
+            path: String(entry?.path ?? entry?.key ?? index),
+            identity: String(entry?.identity ?? entry?.path ?? entry?.key ?? index),
+            hash: entry?.hash === undefined || entry?.hash === null ? null : String(entry.hash),
+        }))
+        : [];
+    const anchors = Array.isArray(snapshot.anchors)
+        ? snapshot.anchors.map((entry, index) => {
+            const blockIndex = Number(entry?.blockIndex);
+            return {
+                path: String(entry?.path ?? index),
+                logicalIndex: Number.isInteger(Number(entry?.logicalIndex))
+                    ? Number(entry.logicalIndex)
+                    : null,
+                blockIndex: Number.isInteger(blockIndex) && blockIndex >= 0 ? blockIndex : null,
+            };
+        })
+        : [];
+
+    return { blocks, anchors };
+}
+
+function evaluateAnchorSamples(samples) {
+    if (samples.length !== ANCHOR_EVALUATION_SAMPLE_SIZE
+        || samples.some((sample) => sample.blocks.length === 0)) {
+        return { available: false, reason: 'hash-data-unavailable' };
+    }
+
+    const shortestLength = Math.min(...samples.map((sample) => sample.blocks.length));
+    let stablePrefixLength = 0;
+
+    while (stablePrefixLength < shortestLength) {
+        const first = samples[0].blocks[stablePrefixLength];
+        const stable = first.hash !== null && samples.every((sample) => {
+            const block = sample.blocks[stablePrefixLength];
+            return block.path === first.path
+                && block.identity === first.identity
+                && block.hash === first.hash;
+        });
+
+        if (!stable) {
+            break;
+        }
+
+        stablePrefixLength += 1;
+    }
+
+    const allBlocksStable = samples.every((sample) => (
+        sample.blocks.length === samples[0].blocks.length
+        && stablePrefixLength === sample.blocks.length
+    ));
+    if (allBlocksStable) {
+        return {
+            available: true,
+            reason: 'all-blocks-stable',
+            stablePrefixLength,
+            changedBlockIndex: null,
+            ignoredAnchorCount: 0,
+        };
+    }
+
+    const latestAnchors = samples.at(-1).anchors;
+    if (latestAnchors.some((anchor) => anchor.blockIndex === null)) {
+        return { available: false, reason: 'anchor-boundary-unavailable' };
+    }
+
+    const firstIgnoredAnchorIndex = latestAnchors.findIndex(
+        (anchor) => anchor.blockIndex >= stablePrefixLength,
+    );
+    const ignoredAnchorCount = firstIgnoredAnchorIndex < 0
+        ? 0
+        : latestAnchors.length - firstIgnoredAnchorIndex;
+
+    return {
+        available: true,
+        reason: 'block-prefix-changed',
+        stablePrefixLength,
+        changedBlockIndex: stablePrefixLength,
+        firstIgnoredAnchorIndex: firstIgnoredAnchorIndex < 0 ? null : firstIgnoredAnchorIndex,
+        ignoredAnchorCount,
+    };
+}
+
+/**
+ * Create the in-memory state used by the optional three-request anchor
+ * evaluation mode.  The evaluator deliberately lives in the cache-policy
+ * module so the request server and unit tests share exactly the same rules.
+ */
+export function createAnchorEvaluationState(initialCount = INITIAL_EVALUATION_IGNORED_ANCHORS) {
+    const count = normalizeIgnoredAnchorCount(initialCount, { allowEvaluationOverflow: true });
+
+    return {
+        active: true,
+        pendingReview: false,
+        x: count,
+        initialX: count,
+        requestsCompleted: 0,
+        cyclesCompleted: 0,
+        requiredRequests: ANCHOR_EVALUATION_REQUESTS,
+        sampleSize: ANCHOR_EVALUATION_SAMPLE_SIZE,
+        samples: [],
+        result: null,
+        warning: null,
+        notice: null,
+    };
+}
+
+/**
+ * Add one successful conversation to an evaluation.  The third sample is
+ * compared with the first two as an ordered sequence of prompt-block hashes.
+ * The first unstable block invalidates its own cache boundary and every later
+ * candidate anchor because each later cache entry includes the changed prefix.
+ */
+export function recordAnchorEvaluation(state, snapshot = {}) {
+    const current = state && typeof state === 'object'
+        ? state
+        : createAnchorEvaluationState();
+
+    if (!current.active || current.pendingReview) {
+        return {
+            state: { ...current, samples: [...(current.samples || [])] },
+            evaluated: false,
+            completed: Number.isInteger(current.result) || Boolean(current.warning),
+            reason: 'inactive',
+        };
+    }
+
+    const samples = [
+        ...(Array.isArray(current.samples) ? current.samples : []),
+        normalizeEvaluationSample(snapshot),
+    ];
+    const next = {
+        ...current,
+        requestsCompleted: Number(current.requestsCompleted || 0) + 1,
+        samples,
+        notice: null,
+    };
+
+    if (samples.length < ANCHOR_EVALUATION_SAMPLE_SIZE) {
+        return { state: next, evaluated: false, completed: false, reason: 'sampling' };
+    }
+
+    const evaluation = evaluateAnchorSamples(samples);
+    const nextX = evaluation.available ? evaluation.ignoredAnchorCount : 0;
+    next.x = nextX;
+    next.cyclesCompleted = Number(current.cyclesCompleted || 0) + 1;
+    next.samples = [];
+    next.active = false;
+
+    if (!evaluation.available) {
+        next.pendingReview = true;
+        next.result = null;
+        next.warning = 'evaluation-data-unavailable';
+        next.notice = '三次对话缺少可比较的块哈希或锚点边界，未自动填入结果，请检查预设后重新评估。';
+    } else {
+        next.pendingReview = nextX > MAX_IGNORED_ANCHORS;
+        next.result = nextX;
+        next.notice = nextX <= MAX_IGNORED_ANCHORS
+            ? `已完成 ${ANCHOR_EVALUATION_REQUESTS} 次连续对话，建议忽略末尾 ${nextX} 个锚点。`
+            : `已完成 ${ANCHOR_EVALUATION_REQUESTS} 次连续对话，评估结果为 ${nextX}，超出 0-${MAX_IGNORED_ANCHORS} 的合理范围，请检查预设。`;
+        next.warning = nextX > MAX_IGNORED_ANCHORS ? 'evaluation-result-out-of-range' : null;
+    }
+
+    return {
+        state: next,
+        evaluated: true,
+        completed: true,
+        reason: evaluation.reason,
+        previousX: Number(current.x || 0),
+        x: nextX,
+        result: next.result,
+        stablePrefixLength: evaluation.stablePrefixLength ?? null,
+        changedBlockIndex: evaluation.changedBlockIndex ?? null,
+        firstIgnoredAnchorIndex: evaluation.firstIgnoredAnchorIndex ?? null,
+        ignoredAnchorCount: evaluation.ignoredAnchorCount ?? null,
+        warning: next.warning,
     };
 }
 
@@ -1002,12 +1400,20 @@ function finalizeCandidates(normalization, protocol) {
             prefix,
             boundaryMarkerHistory,
         });
+        const contentPrefixHash = hashCanonical({ meta, prefix });
+        const markerHistoryHash = hashCanonical(boundaryMarkerHistory.map((item) => item.markerKinds));
         candidates.push({
             ...raw,
             order: candidates.length,
             path: unit.path,
             logicalIndex,
             prefixHash,
+            contentPrefixHash,
+            markerHistoryHash,
+            blockHash: hashPromptBlock(raw.target, {
+                group: unit.group,
+                messageMeta: unit.messageMeta,
+            }, normalization.markerDefinitions),
         });
     }
 
@@ -1216,6 +1622,10 @@ function cloneAnchor(anchor) {
     return {
         prefixHash: anchor.prefixHash,
         logicalIndex: anchor.logicalIndex,
+        ...(anchor.contentPrefixHash ? { contentPrefixHash: anchor.contentPrefixHash } : {}),
+        ...(anchor.markerHistoryHash ? { markerHistoryHash: anchor.markerHistoryHash } : {}),
+        ...(anchor.markerKinds ? { markerKinds: [...anchor.markerKinds] } : {}),
+        ...(anchor.blockHash ? { blockHash: anchor.blockHash } : {}),
     };
 }
 
@@ -1255,10 +1665,15 @@ export class AnchorStore {
             activeAnchorCount += context.anchors.length;
         }
 
+        const protectedLastAnchorCount = [...this.contexts.values()]
+            .filter((context) => context.initialLastAnchor?.prefixHash)
+            .length;
+
         return {
             generation: this.generation,
             contextCount: this.contexts.size,
             activeAnchorCount,
+            protectedLastAnchorCount,
             pendingEvictionAnchorCount: 0,
             retiringAnchorCount: 0,
             maxContexts: this.maxContexts,
@@ -1276,6 +1691,12 @@ export class AnchorStore {
 
     _findMatch(scopeKey, anchorMode, candidates) {
         const candidateByHash = new Map(candidates.map((candidate) => [candidate.prefixHash, candidate]));
+        const candidateByContentPrefix = new Map(candidates
+            .filter((candidate) => candidate.contentPrefixHash && candidate.markerHistoryHash)
+            .map((candidate) => [
+                `${candidate.contentPrefixHash}:${candidate.markerHistoryHash}`,
+                candidate,
+            ]));
         let best = null;
 
         for (const context of this.contexts.values()) {
@@ -1286,7 +1707,27 @@ export class AnchorStore {
             const matched = [];
 
             for (const anchor of context.anchors) {
-                const candidate = candidateByHash.get(anchor.prefixHash);
+                let candidate = candidateByHash.get(anchor.prefixHash);
+
+                // Rolling mode gets a narrow compatibility fallback for a
+                // structurally equivalent boundary whose full prefix hash
+                // changed only because message/container paths were rebuilt.
+                // Marker history and the semantic content prefix must still
+                // be identical, so ordinary prompt/schema changes remain
+                // invalidating.
+                if (!candidate
+                    && anchorMode === 'rolling'
+                    && anchor.contentPrefixHash
+                    && anchor.markerHistoryHash) {
+                    candidate = candidateByContentPrefix.get(
+                        `${anchor.contentPrefixHash}:${anchor.markerHistoryHash}`,
+                    );
+                    if (candidate
+                        && Array.isArray(anchor.markerKinds)
+                        && JSON.stringify(anchor.markerKinds) !== JSON.stringify(candidate.markerKinds)) {
+                        candidate = null;
+                    }
+                }
 
                 if (!candidate) {
                     break;
@@ -1369,6 +1810,11 @@ export class AnchorStore {
             scopeHash: statePlan.scopeHash,
             anchorMode: statePlan.anchorMode,
             anchors: statePlan.nextContext.anchors.map(cloneAnchor),
+            initialLastAnchor: statePlan.nextContext.initialLastAnchor
+                ? cloneAnchor(statePlan.nextContext.initialLastAnchor)
+                : context?.initialLastAnchor
+                    ? cloneAnchor(context.initialLastAnchor)
+                    : null,
             frontierDepth: statePlan.nextContext.frontierDepth,
             version: (context?.version || 0) + 1,
             lastPlanSequence: Math.max(context?.lastPlanSequence || 0, statePlan.planSequence),
@@ -1399,6 +1845,7 @@ function buildAnchorDecision({
     store,
     scopeInfo,
     candidates,
+    eligibleCandidates = candidates,
     policy,
     maxAnchorCount,
     callerOwnedTargets,
@@ -1415,6 +1862,7 @@ function buildAnchorDecision({
             matchedContext: null,
             resetReason: null,
             canPersist: false,
+            protectedLastAnchor: null,
         };
     }
 
@@ -1435,6 +1883,7 @@ function buildAnchorDecision({
             matchedContext: null,
             resetReason: null,
             canPersist: false,
+            protectedLastAnchor: null,
         };
     }
 
@@ -1451,6 +1900,7 @@ function buildAnchorDecision({
             resetReason: null,
             canPersist: false,
             needsSeed: true,
+            protectedLastAnchor: null,
         };
     }
 
@@ -1459,6 +1909,9 @@ function buildAnchorDecision({
         candidate,
     }));
     const resetReason = matchedAnchors.length < match.context.anchors.length ? 'deeper-anchor-mismatch' : null;
+    const protectedLastAnchor = match.context.initialLastAnchor
+        ? cloneAnchor(match.context.initialLastAnchor)
+        : matchedAnchors.at(-1)?.anchor || null;
 
     if (mode === 'single') {
         const current = matchedAnchors[matchedAnchors.length - 1];
@@ -1471,6 +1924,7 @@ function buildAnchorDecision({
             matchedContext: match.context,
             resetReason,
             canPersist: true,
+            protectedLastAnchor,
         };
     }
 
@@ -1499,11 +1953,12 @@ function buildAnchorDecision({
             resetReason: rollingResetReason,
             canPersist: false,
             needsSeed: true,
+            protectedLastAnchor,
         };
     }
 
     const current = activeAnchors[activeAnchors.length - 1];
-    const promotion = candidates.find((candidate) => (
+    const promotion = eligibleCandidates.find((candidate) => (
         !callerOwnedTargets.has(candidate.target)
         && candidate.logicalIndex > current.candidate.logicalIndex
         && candidate.logicalIndex - current.candidate.logicalIndex >= policy.cacheAnchorIntervalBlocks
@@ -1519,13 +1974,21 @@ function buildAnchorDecision({
             matchedContext: match.context,
             resetReason: rollingResetReason,
             canPersist: true,
+            protectedLastAnchor,
         };
     }
 
     const combined = [
         ...activeAnchors.map((item) => ({ ...item, reason: 'active-anchor' })),
         {
-            anchor: { prefixHash: promotion.prefixHash, logicalIndex: promotion.logicalIndex },
+            anchor: {
+                prefixHash: promotion.prefixHash,
+                logicalIndex: promotion.logicalIndex,
+                contentPrefixHash: promotion.contentPrefixHash,
+                markerHistoryHash: promotion.markerHistoryHash,
+                markerKinds: promotion.markerKinds,
+                blockHash: promotion.blockHash,
+            },
             candidate: promotion,
             reason: 'promoted-anchor',
         },
@@ -1548,6 +2011,7 @@ function buildAnchorDecision({
         matchedContext: match.context,
         resetReason: rollingResetReason,
         canPersist: true,
+        protectedLastAnchor,
     };
 }
 
@@ -1601,6 +2065,14 @@ function makeStatePlan({ store, scopeInfo, candidates, decision, selectedTargets
     }
 
     const frontierDepth = nextAnchors.length > 0 ? nextAnchors[nextAnchors.length - 1].logicalIndex : 0;
+    const protectedStillActive = decision.protectedLastAnchor
+        && nextAnchors.some((anchor) => (
+            anchor.prefixHash === decision.protectedLastAnchor.prefixHash
+            || (anchor.blockHash && anchor.blockHash === decision.protectedLastAnchor.blockHash)
+        ));
+    const nextProtectedLastAnchor = protectedStillActive
+        ? cloneAnchor(decision.protectedLastAnchor)
+        : (nextAnchors.length > 0 ? cloneAnchor(nextAnchors[nextAnchors.length - 1]) : null);
 
     return {
         store,
@@ -1616,6 +2088,7 @@ function makeStatePlan({ store, scopeInfo, candidates, decision, selectedTargets
         observedCandidateHashes: candidates.map((candidate) => candidate.prefixHash),
         nextContext: {
             anchors: nextAnchors.map(cloneAnchor),
+            initialLastAnchor: nextProtectedLastAnchor,
             frontierDepth,
         },
         action,
@@ -1637,6 +2110,12 @@ function publicStatePlan(statePlan, mode) {
             prefixHash: anchor.prefixHash,
             logicalIndex: anchor.logicalIndex,
         })) || [],
+        initialLastAnchor: statePlan.nextContext?.initialLastAnchor
+            ? {
+                prefixHash: statePlan.nextContext.initialLastAnchor.prefixHash,
+                logicalIndex: statePlan.nextContext.initialLastAnchor.logicalIndex,
+            }
+            : null,
         action: statePlan.action,
         pauseReason: statePlan.pauseReason || null,
     };
@@ -1693,6 +2172,90 @@ function resolveCandidateCacheControl(candidate, options) {
     }
 
     return resolved[0]?.value ?? resolveCacheControl(options.cacheControl);
+}
+
+const ANCHOR_SELECTION_REASONS = new Set([
+    'learned-anchor',
+    'active-anchor',
+    'promoted-anchor',
+]);
+
+function isAnchorSelectionReason(reason) {
+    return ANCHOR_SELECTION_REASONS.has(reason);
+}
+
+function applyLastAnchorShortTtl({
+    enabled,
+    body,
+    candidates,
+    selectedTargets,
+    selectionReasons,
+    callerOwnedTargets,
+    candidateCacheControls,
+}) {
+    const diagnostics = {
+        enabled: Boolean(enabled),
+        applied: false,
+        path: null,
+        from: null,
+        to: null,
+        reason: enabled ? 'no-anchor' : 'disabled',
+    };
+
+    if (!enabled) {
+        return diagnostics;
+    }
+
+    const anchors = candidates
+        .filter((candidate) => {
+            if (!selectedTargets.has(candidate.target) || callerOwnedTargets.has(candidate.target)) {
+                return false;
+            }
+
+            const reasons = selectionReasons.get(candidate.target) || [];
+            return reasons.some(isAnchorSelectionReason);
+        })
+        .sort((left, right) => left.order - right.order);
+    const lastAnchor = anchors.at(-1);
+
+    if (!lastAnchor) {
+        return diagnostics;
+    }
+
+    const currentControl = candidateCacheControls.get(lastAnchor.target)
+        || lastAnchor.target?.cache_control;
+    const currentTtl = getEffectiveClaudeCacheTtl(currentControl || {});
+
+    if (currentTtl !== '1h') {
+        diagnostics.reason = currentTtl === '5m' ? 'already-5m' : 'not-1h';
+        diagnostics.path = `${lastAnchor.path}.cache_control`;
+        return diagnostics;
+    }
+
+    const controls = collectCacheControls(body || {}).controls;
+    const selectedControlIndex = controls.findIndex((control) => control.target === lastAnchor.target);
+    const laterOneHour = selectedControlIndex >= 0 && controls
+        .slice(selectedControlIndex + 1)
+        .some((control) => getEffectiveClaudeCacheTtl(control.value) === '1h');
+
+    if (laterOneHour) {
+        diagnostics.reason = 'ttl-order';
+        diagnostics.path = `${lastAnchor.path}.cache_control`;
+        return diagnostics;
+    }
+
+    const nextControl = {
+        ...cloneJson(currentControl),
+        ttl: '5m',
+    };
+    lastAnchor.target.cache_control = nextControl;
+    candidateCacheControls.set(lastAnchor.target, nextControl);
+    diagnostics.applied = true;
+    diagnostics.path = `${lastAnchor.path}.cache_control`;
+    diagnostics.from = '1h';
+    diagnostics.to = '5m';
+    diagnostics.reason = 'last-anchor-converted';
+    return diagnostics;
 }
 
 function semanticCachePathRank(path) {
@@ -1775,6 +2338,10 @@ export function planCacheBreaks(body, options = {}) {
 
     const protocol = normalizeProtocol(options.protocol);
     const policy = normalizeCachePolicy(options.policy);
+    const enhancements = normalizeCacheEnhancements({
+        ...(options.policy || {}),
+        ...options,
+    }, { allowEvaluationOverflow: true });
     const marker = options.marker ?? MARKER;
     const shortMarker = options.shortMarker ?? SHORT_MARKER;
     const definitions = markerDefinitions(marker, shortMarker);
@@ -1798,6 +2365,16 @@ export function planCacheBreaks(body, options = {}) {
     const candidates = finalizeCandidates(normalization, protocol);
     const existing = collectCacheControls(normalization.body);
     const candidateCacheControls = new Map();
+
+    // Ignored tail anchors are excluded from gateway selection, but caller
+    // controls remain authoritative and are never silently removed.  The
+    // numeric option is literal: x=4 on twenty candidates makes only the first
+    // sixteen candidates eligible, even when the ignored suffix reaches a
+    // configured fixed-head position.
+    const requestedIgnoredAnchorCount = enhancements.ignoreLastAnchorCount;
+    const ignoredStart = Math.max(0, candidates.length - requestedIgnoredAnchorCount);
+    const ignoredTargets = new Set(candidates.slice(ignoredStart).map((candidate) => candidate.target));
+    const eligibleCandidates = candidates.slice(0, ignoredStart);
 
     if (existing.controls.length > maxBreakpoints) {
         assertCachePlan(normalization.body, {
@@ -1854,6 +2431,10 @@ export function planCacheBreaks(body, options = {}) {
     }
 
     function selectCandidate(candidate, reason) {
+        if (ignoredTargets.has(candidate.target) && !existing.byTarget.has(candidate.target)) {
+            return false;
+        }
+
         if (!selectedTargets.has(candidate.target) && selectedTargets.size >= maxBreakpoints) {
             return false;
         }
@@ -1879,7 +2460,7 @@ export function planCacheBreaks(body, options = {}) {
     }
 
     if (legacyMode) {
-        for (const candidate of candidates) {
+        for (const candidate of eligibleCandidates) {
             selectCandidate(candidate, existing.byTarget.has(candidate.target) ? 'existing-control' : 'legacy-head');
         }
     }
@@ -1893,10 +2474,11 @@ export function planCacheBreaks(body, options = {}) {
         matchedContext: null,
         resetReason: null,
         canPersist: false,
+        protectedLastAnchor: null,
     };
 
     if (!legacyMode) {
-        const fixedCandidates = candidates.slice(0, policy.fixedHeadBreakpointCount);
+        const fixedCandidates = eligibleCandidates.slice(0, policy.fixedHeadBreakpointCount);
         const neededFixed = uniqueNewTargets(fixedCandidates, selectedTargets);
 
         if (selectedTargets.size + neededFixed > maxBreakpoints) {
@@ -1924,6 +2506,7 @@ export function planCacheBreaks(body, options = {}) {
             store: options.store,
             scopeInfo,
             candidates,
+            eligibleCandidates,
             policy,
             maxAnchorCount: Math.max(0, maxBreakpoints - reservedBreakpointCount),
             callerOwnedTargets,
@@ -1953,8 +2536,8 @@ export function planCacheBreaks(body, options = {}) {
         // Tail selection initializes a rolling queue once. After that, only an
         // interval promotion may introduce a new cache boundary.
         if (policy.cacheAnchorMode !== 'rolling' || anchorDecision.needsSeed) {
-            for (let index = candidates.length - 1; index >= 0 && selectedTargets.size < maxBreakpoints; index--) {
-                selectCandidate(candidates[index], 'tail');
+            for (let index = eligibleCandidates.length - 1; index >= 0 && selectedTargets.size < maxBreakpoints; index--) {
+                selectCandidate(eligibleCandidates[index], 'tail');
             }
         }
 
@@ -1981,7 +2564,21 @@ export function planCacheBreaks(body, options = {}) {
                     nextAnchors: learned.map((candidate) => ({
                         prefixHash: candidate.prefixHash,
                         logicalIndex: candidate.logicalIndex,
+                        contentPrefixHash: candidate.contentPrefixHash,
+                        markerHistoryHash: candidate.markerHistoryHash,
+                        markerKinds: candidate.markerKinds,
+                        blockHash: candidate.blockHash,
                     })),
+                    protectedLastAnchor: learned.at(-1)
+                        ? {
+                            prefixHash: learned.at(-1).prefixHash,
+                            logicalIndex: learned.at(-1).logicalIndex,
+                            contentPrefixHash: learned.at(-1).contentPrefixHash,
+                            markerHistoryHash: learned.at(-1).markerHistoryHash,
+                            markerKinds: learned.at(-1).markerKinds,
+                            blockHash: learned.at(-1).blockHash,
+                        }
+                        : null,
                     canPersist: true,
                     needsSeed: false,
                 };
@@ -1990,6 +2587,43 @@ export function planCacheBreaks(body, options = {}) {
             }
         }
     }
+
+    let protectedLastAnchorHeld = false;
+    let protectedLastAnchorReleased = false;
+    if (policy.cacheAnchorMode === 'rolling' && anchorDecision.protectedLastAnchor) {
+        const protectedAnchor = anchorDecision.protectedLastAnchor;
+        const protectedCandidate = candidates.find((candidate) => (
+            candidate.prefixHash === protectedAnchor.prefixHash
+            || (protectedAnchor.blockHash && candidate.blockHash === protectedAnchor.blockHash)
+        ));
+        const isPendingEviction = Boolean(
+            anchorDecision.pendingEviction
+            && (anchorDecision.pendingEviction.anchor?.prefixHash === protectedAnchor.prefixHash
+                || (anchorDecision.pendingEviction.anchor?.blockHash
+                    && anchorDecision.pendingEviction.anchor.blockHash === protectedAnchor.blockHash)),
+        );
+
+        if (protectedCandidate && !isPendingEviction && !selectedTargets.has(protectedCandidate.target)) {
+            protectedLastAnchorHeld = selectCandidate(protectedCandidate, 'active-anchor');
+            if (!protectedLastAnchorHeld) {
+                pauseReason ||= 'protected-last-anchor-budget';
+            }
+        } else if (isPendingEviction) {
+            protectedLastAnchorReleased = true;
+        } else if (protectedCandidate && selectedTargets.has(protectedCandidate.target)) {
+            protectedLastAnchorHeld = true;
+        }
+    }
+
+    const lastAnchorTtlConversion = applyLastAnchorShortTtl({
+        enabled: enhancements.autoConvertLastAnchorTo5m,
+        body: normalization.body,
+        candidates,
+        selectedTargets,
+        selectionReasons,
+        callerOwnedTargets: new Set(existing.controls.map((record) => record.target)),
+        candidateCacheControls,
+    });
 
     const statePlan = makeStatePlan({
         store: options.store,
@@ -2028,10 +2662,20 @@ export function planCacheBreaks(body, options = {}) {
             markerCount: candidate.markerCount,
             markerKinds: [...candidate.markerKinds],
             markerKindCounts: { ...candidate.markerKindCounts },
+            blockHash: candidate.blockHash,
+            contentPrefixHash: candidate.contentPrefixHash,
+            markerHistoryHash: candidate.markerHistoryHash,
+            markerKinds: [...candidate.markerKinds],
+            ignored: ignoredTargets.has(candidate.target),
             sources: [...candidate.sources],
             selected,
-            reason: reasons[0] || 'overflow',
-            reasons: reasons.length > 0 ? reasons : ['overflow'],
+            reason: reasons[0] || (ignoredTargets.has(candidate.target) ? 'ignored-tail' : 'overflow'),
+            reasons: reasons.length > 0
+                ? reasons
+                : [ignoredTargets.has(candidate.target) ? 'ignored-tail' : 'overflow'],
+            ttlOverride: lastAnchorTtlConversion.path === `${candidate.path}.cache_control`
+                ? lastAnchorTtlConversion.to
+                : null,
         };
     });
     const selectedMarkerCount = candidateDiagnostics
@@ -2061,6 +2705,11 @@ export function planCacheBreaks(body, options = {}) {
                 contextHash: candidate.contextHash,
                 logicalIndex: candidate.logicalIndex,
                 markerKinds: [...candidate.markerKinds],
+                blockHash: candidate.blockHash,
+                contentPrefixHash: candidate.contentPrefixHash,
+                markerHistoryHash: candidate.markerHistoryHash,
+                ignored: false,
+                ttlOverride: candidateDiagnostics.find((item) => item.path === path)?.ttlOverride || null,
             };
         }
 
@@ -2079,6 +2728,16 @@ export function planCacheBreaks(body, options = {}) {
     });
     sortBreakpointDiagnostics(selectedBreakpoints);
 
+    const pendingEvictionAnchor = anchorDecision.pendingEviction?.anchor || null;
+    const protectedLastAnchor = statePlan.nextContext?.initialLastAnchor || null;
+    const decisionProtectedLastAnchor = anchorDecision.protectedLastAnchor || protectedLastAnchor;
+    const protectedLastAnchorPendingEviction = Boolean(
+        pendingEvictionAnchor
+        && decisionProtectedLastAnchor
+        && (pendingEvictionAnchor.prefixHash === decisionProtectedLastAnchor.prefixHash
+            || (pendingEvictionAnchor.blockHash
+                && pendingEvictionAnchor.blockHash === decisionProtectedLastAnchor.blockHash)),
+    );
     const diagnostics = {
         disabled: false,
         protocol,
@@ -2107,6 +2766,32 @@ export function planCacheBreaks(body, options = {}) {
         matchedContextId: anchorDecision.matchedContext?.id || null,
         activeAnchorCount: plannedActiveAnchorCount,
         pendingEvictionAnchorCount: anchorTransitionApplied && anchorDecision.pendingEviction ? 1 : 0,
+        pendingEvictionAnchor: pendingEvictionAnchor
+            ? {
+                prefixHash: pendingEvictionAnchor.prefixHash,
+                logicalIndex: pendingEvictionAnchor.logicalIndex,
+                ...(pendingEvictionAnchor.blockHash ? { blockHash: pendingEvictionAnchor.blockHash } : {}),
+            }
+            : null,
+        protectedLastAnchorPendingEviction,
+        protectedLastAnchor: statePlan.nextContext?.initialLastAnchor
+            ? {
+                prefixHash: statePlan.nextContext.initialLastAnchor.prefixHash,
+                logicalIndex: statePlan.nextContext.initialLastAnchor.logicalIndex,
+                ...(statePlan.nextContext.initialLastAnchor.blockHash
+                    ? { blockHash: statePlan.nextContext.initialLastAnchor.blockHash }
+                    : {}),
+            }
+            : null,
+        ignoredAnchorMode: enhancements.ignoreLastAnchorsMode,
+        ignoredAnchorCount: requestedIgnoredAnchorCount,
+        ignoredCandidateCount: [...ignoredTargets].length,
+        ignoredCandidateLogicalIndexes: candidates
+            .filter((candidate) => ignoredTargets.has(candidate.target))
+            .map((candidate) => candidate.logicalIndex),
+        lastAnchorTtlConversion,
+        protectedLastAnchorHeld,
+        protectedLastAnchorReleased,
     };
     const plan = {
         body: normalization.body,

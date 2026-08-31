@@ -274,6 +274,13 @@ label { display: grid; gap: 7px; color: var(--text-muted); font-weight: 700; fon
 .set-title { font-size: 14.5px; font-weight: 800; margin-bottom: 3px; }
 .set-desc { font-size: 12.5px; color: var(--text-muted); line-height: 1.5; }
 .set-control { flex-shrink: 0; display: flex; align-items: center; gap: 10px; }
+.anchor-ignore-control { flex-wrap: wrap; justify-content: flex-end; }
+.anchor-ignore-control .compact-field { min-width: 108px; }
+.anchor-ignore-control #ignoreLastAnchorCount { width: 74px; min-width: 74px; }
+.anchor-ignore-control button { white-space: nowrap; }
+.anchor-ignore-status { margin-top: 10px; min-height: 0; color: var(--text-muted); font-size: 12px; line-height: 1.55; }
+.anchor-ignore-status.warning { color: var(--warning); font-weight: 700; }
+.anchor-ignore-status.success { color: var(--success); font-weight: 700; }
 .switch { position: relative; width: 46px; height: 26px; flex-shrink: 0; cursor: pointer; }
 .switch input { display: none; }
 .switch .track { position: absolute; inset: 0; background-color: var(--border-strong); border-radius: 999px; transition: background-color 0.18s ease; }
@@ -362,7 +369,10 @@ tr:hover td { background-color: var(--bg-app); }
 .msg-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; background-color: var(--bg-app); border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; }
 .msg-card-head:hover { background-color: var(--bg-hover); }
 .msg-left, .msg-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.msg-right { flex-shrink: 0; }
+.msg-right { flex: 1 1 auto; justify-content: flex-end; flex-wrap: wrap; }
+.msg-head-hashes { display: inline-flex; justify-content: flex-end; flex-wrap: wrap; gap: 5px 9px; min-width: 0; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-muted-light); }
+.msg-head-hash { white-space: nowrap; }
+.msg-head-hash.changed { color: var(--primary-coral); font-weight: 900; }
 .msg-caret { font-size: 11px; color: var(--text-muted); transition: transform 0.18s ease; }
 .msg-card.collapsed:not(.has-cache-breakpoints) .msg-body { display: none; }
 .msg-card.collapsed.has-cache-breakpoints .msg-content-block { display: none; }
@@ -404,6 +414,18 @@ tr:hover td { background-color: var(--bg-app); }
 .breakpoint-chip strong { color: var(--text-main); white-space: nowrap; }
 .breakpoint-chip code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; padding: 0; background: transparent; color: inherit; }
 .breakpoint-chip.empty { border-style: dashed; border-radius: 9px; }
+.usage-lines { color: var(--text-main); }
+.usage-lines.detail { margin: 0 0 14px; padding: 13px 15px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-app); }
+.usage-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; line-height: 1.65; }
+.usage-pair { display: inline-flex; align-items: baseline; gap: 3px; white-space: nowrap; }
+.usage-label { color: var(--text-muted); }
+.usage-value { color: var(--text-main); font-family: var(--font-mono); font-weight: 800; }
+.usage-separator { color: var(--text-muted-light); }
+.usage-lines.compact { min-width: 190px; font-size: 11.5px; }
+.usage-lines.compact .usage-line { flex-wrap: nowrap; white-space: nowrap; }
+.usage-lines.detail .usage-line { font-size: 14px; }
+.usage-lines.detail .usage-value { font-size: 15px; }
+.usage-stats.empty { display: block; padding: 12px 14px; border: 1px dashed var(--border-strong); border-radius: 10px; color: var(--text-muted); font-size: 12px; }
 .empty-hint { border: 1px dashed var(--border-strong); border-radius: 10px; padding: 18px; color: var(--text-muted); background: var(--bg-app); }
 
 .guide-toc { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 16px; margin-bottom: 8px; border-bottom: 1px solid var(--border); }
@@ -491,6 +513,7 @@ tr:hover td { background-color: var(--bg-app); }
   .policy-actions { display: grid; grid-template-columns: 1fr; }
   .log-controls { justify-content: space-between; }
   .stat-grid, .stat-grid.three, .two-col, .channel-grid, .advanced-grid, .meta-grid, .meta-grid.three, .prompt-map, .channel-form .form-row { grid-template-columns: 1fr; }
+  .anchor-ignore-control { justify-content: flex-start; }
   .quick-panel { order: -1; }
   .table-wrap { overflow: visible; border: 0; border-radius: 0; }
   table { min-width: 0; border-collapse: separate; border-spacing: 0 12px; }
