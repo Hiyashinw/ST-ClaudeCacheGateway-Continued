@@ -1,8 +1,8 @@
 # ST-ClaudeCacheGateway-Continued 使用指南
 
-**ST-ClaudeCacheGateway-Continued** 是基于原项目 [ST-ClaudeCacheGateway](https://github.com/shanye5593/ST-ClaudeCacheGateway) 的继续开发版。它是一个面向 SillyTavern / 酒馆的本地 Claude 缓存网关，接收 OpenAI-compatible 或 Anthropic native 请求，并在发送给上游前处理缓存 marker、Claude prompt cache、Prefix 锁定、渠道 Profile 和高级参数。
+**ST-ClaudeCacheGateway-Continued** 是基于原项目 [ST-ClaudeCacheGateway](https://github.com/shanye5593/ST-ClaudeCacheGateway) 的继续开发版。它是一个主要面向 SillyTavern / 酒馆的本地 Claude 缓存网关（当然也可接入Cherrystudio、Rikkahub等其他应用），接收 OpenAI-compatible 或 Anthropic native 请求，并在发送给上游前处理缓存 marker、Claude prompt cache、Prefix 锁定、渠道 Profile 和高级参数。
 
-本项目新增的断点保留和轮换策略，目标是在长上下文持续增长时减少稳定缓存边界的无谓移动，从而更容易提高缓存命中率；实际命中情况仍取决于模型、供应商以及缓存点之前的内容是否完全稳定。
+本项目主要新增断点保留和轮换策略，目标是在长上下文持续增长时减少稳定缓存边界的无谓移动，从而更容易提高缓存命中率；实际命中情况仍取决于模型、供应商以及缓存点之前的内容是否完全稳定。
 
 默认监听：
 
@@ -10,7 +10,7 @@
 http://127.0.0.1:8788
 ```
 
-酒馆 / 客户端推荐填写：
+酒馆 / 客户端需要填写：
 
 ```text
 Base URL: http://127.0.0.1:8788/v1
@@ -21,24 +21,18 @@ API Key: 你的上游供应商 API Key
 
 ## 功能概览
 
-- 接收 OpenAI-compatible `POST /v1/chat/completions` 请求。
-- 默认使用 Pioneer 的 OpenAI-compatible 上游格式，也可切换为 Anthropic native `/v1/messages`。
+- 可接收 OpenAI-compatible `v1/chat/completions` 请求；同时也兼容Anthropic native `v1/messages` 请求，并对两者间的转换进行特殊优化。
+- 支持自动生成缓存断点，傻瓜式操作。
 - 系统身份消息处理提供“默认”“关闭Anthropic优化”或“统一将系统身份消息放至最顶部”三种方式；默认对 OpenAI-compatible 上游原样传输，并在转为 Anthropic native 时自动完成保序角色转换与同角色消息合并。
 - 支持 `[[CACHE_BREAK]]` 与 `[[CACHE_BREAK_SHORT]]` 两种手动标记；在手动 TTL 下可分别指定 1h 长缓存与 5m 短缓存。
 - 支持 Claude `cache_control` 注入，最多 4 个缓存断点。
 - 支持固定头缓存点，以及单锚点 / 滚动锚点保留策略。
 - 支持 Claude 原生 5 分钟 / 1 小时缓存 TTL、不发送 `ttl` 的自动模式，以及由两种 marker 分别指定长短窗口的手动模式。
-- 支持首页“缓存转译”总开关。
 - 支持 Prefix 锁定，降低前缀漂移导致的缓存不命中。
-- 支持多渠道 Profile：Pioneer、OpenRouter、Anthropic、Vertex、Bedrock、自定义渠道。
-- 支持 OpenRouter 供应商锁定和自定义供应商名。
 - 支持高级配置：包含 / 排除主体参数，包含 / 排除请求头。
 - 支持请求诊断；诊断开关会持久化，捕获的请求正文只保存在内存中。
-- 每个最终提示词块都会生成 SHA-256 哈希并与上一条同范围请求对比；短哈希显示在消息标题栏，变化或新增块的哈希会加粗。
-- 请求列表与 Usage 详情会按三行显示输入、输出、缓存创建、缓存命中和命中率，同时保留原始 Usage JSON。
+- 每个最终提示词块都会生成 SHA-256 哈希并与上一条同范围请求对比；短哈希显示在消息标题栏，变化或新增块的哈希会加红。
 - 支持将最末网关锚点自动从 1h 转为 5m，以及忽略末尾 x 个锚点的固定数字 / 评估模式。
-- `default-gateway-settings.json` 提供全局缺省配置；不会覆盖或导入渠道 Profile。
-- OpenAI-compatible 入站转 Anthropic 上游时，会把非流式 `thinking` 和流式 `thinking_delta` 转成酒馆可读取的 `reasoning_content`；Anthropic 原生链路仍保持原始块不变。
 - 默认只绑定 `127.0.0.1`，适合本机使用。
 
 ## 相对原项目优势
@@ -107,13 +101,13 @@ Base URL: http://127.0.0.1:8788/v1
 启动后打开：
 
 ```text
-http://127.0.0.1:8788/console
+http://127.0.0.1:8788/
 ```
 
 控制台包含：
 
 - 网关概览：当前渠道、缓存转译、上游格式、TTL、Prefix 状态。
-- 渠道配置：切换 / 保存渠道 Profile。
+- 渠道配置：切换 / 保存渠道配置。
 - 缓存策略：查看缓存标记、切换 TTL、配置系统身份消息处理方式、固定头与缓存锚点、管理 Prefix 锁定。
 - 请求日志：开启或关闭请求诊断、查看最终请求体和缓存结果；开关状态会保留到下次启动，日志正文仍只存于内存。
 - 高级配置：处理主体参数和请求头。
@@ -128,7 +122,7 @@ API Key: 你的上游供应商 API Key
 Model: 你的上游模型名
 ```
 
-也可以使用 Claude / Anthropic-compatible 原生入站：
+也可以在其他应用里使用 Claude / Anthropic-compatible 原生入站：
 
 ```text
 POST http://127.0.0.1:8788/v1/messages
@@ -141,9 +135,9 @@ POST http://127.0.0.1:8788/v1/messages/count_tokens
 酒馆 OpenAI-compatible 请求 -> 本地网关 -> OpenAI-compatible 或 Anthropic native 上游
 ```
 
-如果使用 Claude 原生入站，请把当前渠道的上游格式保持为 Anthropic native。
+如果使用 Claude 原生入站，请把当前渠道的上游格式保持为 Anthropic native，暂时不支持Anthropic native 上游 -> OpenAI-compatible 请求
 
-## 系统身份消息处理
+## 系统身份消息处理（专为Anthropic  native 上游优化）
 
 控制台“缓存策略 → 缓存标记与 TTL”提供“系统身份消息处理”选项。它按所选模式处理 **OpenAI-compatible 入站**中的 `system` 消息；Anthropic native 入站本身已经使用顶层 `system`，不参与这一步角色转换。
 
@@ -211,8 +205,6 @@ POST http://127.0.0.1:8788/v1/messages/count_tokens
 切换自动生成模式会清空已学习的锚点和 Prefix Lock 内容，下一次成功请求会按新的候选边界重新学习。
 
 Claude 每个请求最多支持 4 个缓存断点。两种 marker、自动生成的候选和调用方已有的 `cache_control` 共用这 4 个位置；所有未选中的 marker 仍会被移除，不会原样发给上游。
-
-默认的固定头数量为 `0`，锚点模式为“关闭”。在这个兼容模式下，网关仍按旧版行为保留最前面的 4 个候选断点。
 
 ## 固定头缓存点与渐进轮换锚点
 
