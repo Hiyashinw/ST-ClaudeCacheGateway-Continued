@@ -1702,7 +1702,7 @@ function renderDetail() {
     ['输入 token', usageStats.inputTokens === null ? '暂不可用' : usageStats.inputTokens],
     ['输出 token', usageStats.outputTokens === null ? '暂不可用' : usageStats.outputTokens],
     ['缓存命中率', usageRateLabel(usageStats.cacheHitRatePercent)],
-    ['输入提示词', inputPromptTokenLabel(promptEstimate.promptTokens)],
+    ['缓存创建 / 缓存命中', `${usageNumberLabel(usageStats.cacheWriteTokens)} / ${usageNumberLabel(usageStats.cacheReadTokens)}`],
     ['Token 倍率', tokenMultiplierLabel(promptEstimate.tokensPerCharacter)],
     ['当前渠道', channelName(state.runtime)],
   ]);
