@@ -145,15 +145,7 @@
       "kind": "custom",
       "baseUrl": "https://api.deepseek.com/anthropic",
       "upstreamMode": "anthropic",
-      "upstreamExtraJson": {
-        "output_config": {
-          "effort": "low"
-        },
-        "reasoning": {
-          "effort": "low"
-        },
-        "reasoning_effort": "low"
-      },
+      "upstreamExtraJson": {},
       "upstreamExcludePaths": [],
       "upstreamHeaders": {},
       "upstreamExcludeHeaders": []
