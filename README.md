@@ -1,6 +1,6 @@
 # ST-ClaudeCacheGateway-Continued 使用指南
 
-**ST-ClaudeCacheGateway-Continued** 是基于原项目 [ST-ClaudeCacheGateway](https://github.com/shanye5593/ST-ClaudeCacheGateway) 的继续开发版。它是一个主要面向 SillyTavern / 酒馆的本地 Claude 缓存网关（当然也可接入Cherrystudio、Rikkahub等其他应用），接收 OpenAI-compatible 或 Anthropic native 请求，并在发送给上游前处理缓存 marker、Claude prompt cache、Prefix 锁定、渠道 Profile 和高级参数。
+**ST-ClaudeCacheGateway-Continued** 是基于原项目 [ST-ClaudeCacheGateway](https://github.com/shanye5593/ST-ClaudeCacheGateway) 的继续开发版。它是一个主要面向 SillyTavern / 酒馆的本地 Claude 缓存网关（当然也可接入Cherrystudio、Rikkahub等其他应用），接收 OpenAI-compatible 或 Anthropic native 请求，并在发送给上游前处理缓存断点、Claude prompt cache、Prefix 锁定、渠道 Profile 和高级参数。
 
 本项目主要新增断点保留和轮换策略，目标是在长上下文持续增长时减少稳定缓存边界的无谓移动，从而更容易提高缓存命中率；实际命中情况仍取决于模型、供应商以及缓存点之前的内容是否完全稳定。
 
@@ -52,6 +52,8 @@ API Key: 你的上游供应商 API Key
 - **自动生成、选择与清理断点**：支持自动判断、始终开启和完全关闭三种生成模式；需要生成时，会在最终 SYSTEM 末尾和每个 ASSISTANT 消息后预生成 marker。随后统一规范化 inline、独立 marker、content array 和 Anthropic system 候选，自动去重、删除未选 marker 与空消息，并在固定头、单锚点尾点、冻结滚动点及调用方已有控制之间分配最多四点预算。
 - **三条实际请求链路**：统一处理并验证 OpenAI 入站 → OpenAI 上游、OpenAI 入站 → Anthropic 上游、Anthropic 入站 → Anthropic 上游的最终请求体。
 - **更完整的诊断**：可查看候选路径、入选原因、上下文短哈希、锚点动作或暂停原因、最终上游请求体以及上游返回的缓存 token 用量；每条 message 显示为一张角色卡，内部保留各 content block、原始路径和缓存断点，每个提示词模块还会显示字符数、基于实际 usage 的 token 估计和块哈希变化状态。
+- **更美观、实用的请求日志界面**：可通过哈希值快速检查两次对话间的不同。概览界面能直接显示输入输出、缓存命中或创建、缓存命中率、上下文 ID等数据。同时也能在高级设置处自定义部分数据的标记颜色。
+- **快速导入、导出配置**：可以在网页中快速导入、导出json配置文件。
 
 ## 效果实测
 
