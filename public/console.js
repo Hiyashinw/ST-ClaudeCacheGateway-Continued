@@ -9,7 +9,49 @@ const state = {
     cache: '',
   },
   channelDrafts: [],
+  processingOrderDraft: null,
+  usagePreviewEditing: false,
 };
+
+const DEFAULT_CACHE_POLICY_PROCESSING_ORDER = [
+  'fixed-head',
+  'ignore-tail',
+  'cache-anchor',
+  'tail-fill',
+  'protected-tail-anchor',
+  'last-gateway-cache-point-5m',
+];
+
+const CACHE_POLICY_STAGE_INFO = {
+  'fixed-head': { label: '固定头缓存点', description: '从完整候选头部锁定配置数量；默认放在忽略末尾之前。' },
+  'ignore-tail': { label: '忽略末尾锚点', description: '阻止最新 x 个尚未被前置阶段锁定的候选。' },
+  'cache-anchor': { label: '缓存锚点', description: '执行单锚点或滚动锚点的学习、复用与轮换。' },
+  'tail-fill': { label: '普通尾点填充', description: '使用剩余预算选择普通候选；滚动队列冻结后默认跳过。' },
+  'protected-tail-anchor': { label: '保护尾锚点', description: '尝试保留滚动模式首次冻结的最后锚点，直至其待淘汰。' },
+  'last-gateway-cache-point-5m': { label: '末锚点自动使用 5 分钟', description: '把执行到此阶段时最后一个网关缓存点转为 5 分钟。' },
+};
+
+const DEFAULT_USAGE_PREVIEW_SAMPLE = {
+  inputTokens: 148792,
+  outputTokens: 546,
+  cacheReadTokens: 141558,
+  cacheWriteTokens: 6924,
+  cacheHitRatePercent: 95.14,
+};
+
+const DEFAULT_REQUEST_CACHE_APPEARANCE = {
+  prefixLock: { textColor: '#191919', backgroundColor: null },
+  cacheAnchor: { textColor: '#191919', backgroundColor: null },
+  cacheBudgetInsufficient: { textColor: '#B25E00', backgroundColor: '#FBF1E6' },
+  blockHashChange: { textColor: '#B25E00', backgroundColor: '#FBF1E6' },
+};
+
+const REQUEST_CACHE_APPEARANCE_FIELDS = [
+  { key: 'prefixLock', cssKey: 'prefix-lock', label: 'Prefix 锁定' },
+  { key: 'cacheAnchor', cssKey: 'cache-anchor', label: '缓存锚点' },
+  { key: 'cacheBudgetInsufficient', cssKey: 'cache-budget-insufficient', label: '缓存点额度不足' },
+  { key: 'blockHashChange', cssKey: 'block-hash-change', label: '块哈希变更数字' },
+];
 
 const USAGE_APPEARANCE_FIELDS = [
   { path: ['input'], cssKey: 'input', label: '输入' },
@@ -31,6 +73,8 @@ const pages = {
 };
 
 let customChannelSeq = 0;
+let cachePolicyAutoApplyTimer = null;
+let cachePolicyAutoApplySequence = 0;
 
 function $(id) {
   return document.getElementById(id);
@@ -195,6 +239,18 @@ function booleanValue(value, fallback = false) {
   return fallback;
 }
 
+function normalizeProcessingOrder(value) {
+  if (!Array.isArray(value)) return [...DEFAULT_CACHE_POLICY_PROCESSING_ORDER];
+  const normalized = value.map((stage) => String(stage || '').trim().toLowerCase());
+  const required = new Set(DEFAULT_CACHE_POLICY_PROCESSING_ORDER);
+  if (normalized.length !== required.size
+    || new Set(normalized).size !== required.size
+    || normalized.some((stage) => !required.has(stage))) {
+    return [...DEFAULT_CACHE_POLICY_PROCESSING_ORDER];
+  }
+  return normalized;
+}
+
 function cacheAnchorModeLabel(value) {
   if (value === 'single') return '单锚点';
   if (value === 'rolling') return '滚动锚点';
@@ -217,6 +273,9 @@ function getCachePolicy(runtime = state.runtime) {
     1,
     1000,
     3,
+  );
+  const cachePolicyProcessingOrder = normalizeProcessingOrder(
+    runtime?.cachePolicyProcessingOrder ?? nested.cachePolicyProcessingOrder,
   );
   const autoConvertLastAnchorTo5m = booleanValue(
     runtime?.autoConvertLastAnchorTo5m
@@ -241,6 +300,7 @@ function getCachePolicy(runtime = state.runtime) {
     fixedHeadBreakpointCount,
     cacheAnchorMode,
     cacheAnchorIntervalBlocks,
+    cachePolicyProcessingOrder,
     autoConvertLastAnchorTo5m,
     ignoreLastAnchorsMode,
     ignoreLastAnchorCount,
@@ -302,7 +362,7 @@ function prefixLockStatusLabel(item) {
   if (enabled === false || action === 'disabled' || reason === 'cache-anchor-enabled') return '关闭';
   if (action === 'created') return '开启 · 已学习';
   if (action === 'replaced') return '开启 · 已应用';
-  if (action === 'cleared') return '关闭 · 已清空';
+  if (action === 'cleared') return enabled === true ? '开启 · 已清空待学习' : '关闭 · 已清空';
   if (action === 'learning') return '开启 · 待学习';
   if (action === 'skipped') {
     if (reason === 'cache-translation-disabled') return '开启 · 已暂停';
@@ -361,12 +421,12 @@ function anchorReasonClass(value) {
   return normalizedDiagnosticCode(value) === 'deeper-anchor-mismatch' ? 'danger' : '';
 }
 
-function appendRequestCacheSummaryRow(root, label) {
+function appendRequestCacheSummaryRow(root, label, appearanceKind = '') {
   const row = document.createElement('div');
-  row.className = 'request-cache-summary-row';
+  row.className = `request-cache-summary-row ${appearanceKind ? `request-cache-${appearanceKind}-row` : ''}`.trim();
   appendText(row, 'dt', label, 'request-cache-summary-label');
   const value = document.createElement('dd');
-  value.className = 'request-cache-summary-value';
+  value.className = `request-cache-summary-value ${appearanceKind ? `request-cache-${appearanceKind}-value` : ''}`.trim();
   row.appendChild(value);
   root.appendChild(row);
   return value;
@@ -377,38 +437,50 @@ function renderRequestCacheSummary(root, item) {
   const summary = document.createElement('dl');
   summary.className = 'request-cache-summary';
   const diagnostics = getCaptureCachePolicy(item);
-
-  let value = appendRequestCacheSummaryRow(summary, '强制 Prefix 锁定');
-  appendText(value, 'span', prefixLockStatusLabel(item), 'request-cache-summary-text');
-
-  value = appendRequestCacheSummaryRow(summary, '缓存锚点');
-  appendText(value, 'span', cacheAnchorRequestLabel(item, diagnostics), 'request-cache-summary-text');
-
   const anchorMode = requestCacheAnchorMode(item, diagnostics);
-  const anchorAction = normalizedDiagnosticCode(diagnostics.action);
-  if (['single', 'rolling'].includes(anchorMode) && anchorAction && !['off', 'disabled'].includes(anchorAction)) {
-    value = appendRequestCacheSummaryRow(summary, '锚点状态');
-    appendText(value, 'span', anchorActionLabel(anchorAction), 'request-cache-summary-text');
-    if (diagnostics.reason) {
-      const reasonClass = anchorReasonClass(diagnostics.reason);
-      appendText(
-        value,
-        'span',
-        anchorReasonLabel(diagnostics.reason),
-        `request-cache-status-chip ${reasonClass}`.trim(),
-      );
+  const showPrefix = item?.prefixLockEnabled === true;
+  const showAnchor = ['single', 'rolling'].includes(anchorMode);
+
+  let value;
+  if (showPrefix) {
+    value = appendRequestCacheSummaryRow(summary, '强制 Prefix 锁定', 'prefix-lock');
+    appendText(value, 'span', prefixLockStatusLabel(item), 'request-cache-summary-text request-cache-appearance-value');
+  }
+
+  if (showAnchor) {
+    value = appendRequestCacheSummaryRow(summary, '缓存锚点', 'cache-anchor');
+    appendText(value, 'span', cacheAnchorRequestLabel(item, diagnostics), 'request-cache-summary-text request-cache-appearance-value');
+
+    const anchorAction = normalizedDiagnosticCode(diagnostics.action);
+    if (anchorAction && !['off', 'disabled'].includes(anchorAction)) {
+      value = appendRequestCacheSummaryRow(summary, '锚点状态', 'cache-anchor');
+      appendText(value, 'span', anchorActionLabel(anchorAction), 'request-cache-summary-text request-cache-appearance-value');
+      if (diagnostics.reason) {
+        const reasonClass = anchorReasonClass(diagnostics.reason);
+        const budgetClass = normalizedDiagnosticCode(diagnostics.reason).includes('budget')
+          ? 'request-cache-budget-insufficient-chip'
+          : '';
+        appendText(
+          value,
+          'span',
+          anchorReasonLabel(diagnostics.reason),
+          `request-cache-status-chip ${reasonClass} ${budgetClass}`.trim(),
+        );
+      }
+    }
+
+    if (diagnostics.contextHash) {
+      value = appendRequestCacheSummaryRow(summary, '锚点上下文 ID', 'cache-anchor');
+      appendText(value, 'span', compactHash(diagnostics.contextHash), 'request-cache-summary-id request-cache-appearance-value');
     }
   }
 
-  if (['single', 'rolling'].includes(anchorMode) && diagnostics.contextHash) {
-    value = appendRequestCacheSummaryRow(summary, '锚点上下文 ID');
-    appendText(value, 'span', compactHash(diagnostics.contextHash), 'request-cache-summary-id');
-  }
-
-  const changedBlockCount = Number(item?.changedBlockCount || 0);
-  if (Number.isFinite(changedBlockCount) && changedBlockCount > 0) {
-    value = appendRequestCacheSummaryRow(summary, '块哈希变更');
-    appendText(value, 'span', changedBlockCount, 'request-cache-status-chip warning request-cache-summary-id');
+  if (showPrefix || showAnchor) {
+    const changedBlockCount = Number(item?.changedBlockCount || 0);
+    if (Number.isFinite(changedBlockCount) && changedBlockCount > 0) {
+      value = appendRequestCacheSummaryRow(summary, '块哈希变更');
+      appendText(value, 'span', changedBlockCount, 'request-cache-status-chip warning request-cache-summary-id request-cache-block-hash-change-chip');
+    }
   }
 
   root.appendChild(summary);
@@ -430,8 +502,49 @@ function downloadJson(data, filename) {
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(url);
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function localDateStamp(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function exportGatewayConfiguration() {
+  const a = document.createElement('a');
+  a.href = '/console/config/export?download=1';
+  a.download = `st-claude-cache-gateway-config-${localDateStamp()}.json`;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setStatus('配置下载已开始；文件中的 upstreamMode / upstreamBaseUrl 仅供参考，导入时不会覆盖当前连接。');
+}
+
+async function importGatewayConfiguration(file) {
+  if (!file) return;
+  const raw = await file.text();
+  const configuration = JSON.parse(raw.replace(/^\uFEFF/, ''));
+  await postJson('/console/config/import', configuration);
+  state.usagePreviewEditing = false;
+  await refreshAll();
+  setStatus('配置已导入；当前 upstreamMode、upstreamBaseUrl、渠道 Profile 和 anchorState 均未被覆盖。');
+}
+
+async function restoreDefaultGatewayConfiguration() {
+  if (!window.confirm('确认读取 default-gateway-settings.json 并恢复默认配置吗？当前上游模式、Base URL 与渠道 Profile 会保留，学习数据会清空。')) {
+    return;
+  }
+  await postJson('/console/config/reset', {});
+  state.usagePreviewEditing = false;
+  await refreshAll();
+  setStatus('已从 default-gateway-settings.json 恢复默认配置；当前上游连接保持不变。');
 }
 
 function setStatus(message) {
@@ -488,17 +601,91 @@ function collectUsageAppearanceDraft() {
   return appearance;
 }
 
+function collectUsagePreviewSample() {
+  const token = (id, fallback) => {
+    const value = Number($(id)?.value);
+    return Number.isInteger(value) && value >= 0 ? value : fallback;
+  };
+  const rate = Number($('usageSampleHitRate')?.value);
+  return {
+    inputTokens: token('usageSampleInputTokens', DEFAULT_USAGE_PREVIEW_SAMPLE.inputTokens),
+    outputTokens: token('usageSampleOutputTokens', DEFAULT_USAGE_PREVIEW_SAMPLE.outputTokens),
+    cacheReadTokens: token('usageSampleCacheReadTokens', DEFAULT_USAGE_PREVIEW_SAMPLE.cacheReadTokens),
+    cacheWriteTokens: token('usageSampleCacheWriteTokens', DEFAULT_USAGE_PREVIEW_SAMPLE.cacheWriteTokens),
+    cacheHitRatePercent: Number.isFinite(rate) && rate >= 0 && rate <= 100
+      ? rate
+      : DEFAULT_USAGE_PREVIEW_SAMPLE.cacheHitRatePercent,
+  };
+}
+
+function renderUsagePreviewMode() {
+  const editor = $('usagePreviewEditor');
+  const preview = $('usageAppearancePreview');
+  const done = $('usagePreviewDone');
+  if (editor) editor.hidden = !state.usagePreviewEditing;
+  if (preview) preview.hidden = state.usagePreviewEditing;
+  if (done) done.hidden = !state.usagePreviewEditing;
+}
+
+function setUsagePreviewEditing(editing, focusId = null) {
+  state.usagePreviewEditing = Boolean(editing);
+  renderUsagePreviewMode();
+  if (state.usagePreviewEditing && focusId) {
+    queueMicrotask(() => $(focusId)?.focus());
+  }
+}
+
+function calculateUsagePreviewSample(sample, changedField) {
+  const next = {
+    inputTokens: Math.max(0, Math.round(Number(sample?.inputTokens) || 0)),
+    outputTokens: Math.max(0, Math.round(Number(sample?.outputTokens) || 0)),
+    cacheReadTokens: Math.max(0, Math.round(Number(sample?.cacheReadTokens) || 0)),
+    cacheWriteTokens: Math.max(0, Math.round(Number(sample?.cacheWriteTokens) || 0)),
+    cacheHitRatePercent: Math.min(100, Math.max(0, Number(sample?.cacheHitRatePercent) || 0)),
+  };
+
+  if (changedField === 'cacheReadTokens') {
+    next.cacheReadTokens = Math.min(next.inputTokens, next.cacheReadTokens);
+    next.cacheHitRatePercent = next.inputTokens > 0
+      ? Number(((next.cacheReadTokens / next.inputTokens) * 100).toFixed(2))
+      : 0;
+  } else if (changedField === 'inputTokens' || changedField === 'cacheHitRatePercent') {
+    next.cacheHitRatePercent = Number(next.cacheHitRatePercent.toFixed(2));
+    next.cacheReadTokens = Math.round(next.inputTokens * next.cacheHitRatePercent / 100);
+  }
+
+  return next;
+}
+
+function updateUsagePreviewDerived(changedField) {
+  const next = calculateUsagePreviewSample(collectUsagePreviewSample(), changedField);
+  renderUsagePreviewSampleControls(next);
+  renderUsageAppearancePreview();
+}
+
+function usagePreviewFocusTarget(eventTarget) {
+  const className = String(eventTarget?.className || '');
+  if (className.includes('usage-value-input')) return 'usageSampleInputTokens';
+  if (className.includes('usage-value-output')) return 'usageSampleOutputTokens';
+  if (className.includes('usage-value-cache-read')) return 'usageSampleCacheReadTokens';
+  if (className.includes('usage-value-cache-write')) return 'usageSampleCacheWriteTokens';
+  if (className.includes('usage-rate-value') || className.includes('usage-rate-row')) return 'usageSampleHitRate';
+  return 'usageSampleInputTokens';
+}
+
+function renderUsagePreviewSampleControls(sample = DEFAULT_USAGE_PREVIEW_SAMPLE) {
+  if ($('usageSampleInputTokens')) $('usageSampleInputTokens').value = String(sample.inputTokens);
+  if ($('usageSampleOutputTokens')) $('usageSampleOutputTokens').value = String(sample.outputTokens);
+  if ($('usageSampleCacheReadTokens')) $('usageSampleCacheReadTokens').value = String(sample.cacheReadTokens);
+  if ($('usageSampleCacheWriteTokens')) $('usageSampleCacheWriteTokens').value = String(sample.cacheWriteTokens);
+  if ($('usageSampleHitRate')) $('usageSampleHitRate').value = String(sample.cacheHitRatePercent);
+}
+
 function renderUsageAppearancePreview(appearance = collectUsageAppearanceDraft()) {
   const preview = $('usageAppearancePreview');
   if (!preview) return;
   setUsageAppearanceVariables(appearance, preview);
-  renderUsageLines(preview, {
-    inputTokens: 148792,
-    outputTokens: 546,
-    cacheReadTokens: 141558,
-    cacheWriteTokens: 6924,
-    cacheHitRatePercent: 95.14,
-  }, 'detail usage-preview');
+  renderUsageLines(preview, collectUsagePreviewSample(), 'detail usage-preview');
 }
 
 function renderUsageAppearanceControls(appearance) {
@@ -516,6 +703,87 @@ function renderUsageAppearanceControls(appearance) {
     backgroundInput.disabled = transparentInput.checked;
   }
   renderUsageAppearancePreview(appearance);
+}
+
+function setRequestCacheAppearanceVariables(appearance, root = document.documentElement) {
+  if (!appearance || !root?.style?.setProperty) return;
+  for (const field of REQUEST_CACHE_APPEARANCE_FIELDS) {
+    const style = appearance?.[field.key];
+    if (!style) continue;
+    root.style.setProperty(`--request-cache-${field.cssKey}-text`, style.textColor);
+    root.style.setProperty(`--request-cache-${field.cssKey}-background`, style.backgroundColor || 'transparent');
+  }
+}
+
+function requestCacheAppearanceControl(field) {
+  return document.querySelector(`[data-request-cache-style="${field.key}"]`);
+}
+
+function collectRequestCacheAppearanceDraft() {
+  const appearance = {};
+  for (const field of REQUEST_CACHE_APPEARANCE_FIELDS) {
+    const row = requestCacheAppearanceControl(field);
+    if (!row) continue;
+    appearance[field.key] = {
+      textColor: row.querySelector('[data-request-cache-text-color]').value.toUpperCase(),
+      backgroundColor: row.querySelector('[data-request-cache-background-transparent]').checked
+        ? null
+        : row.querySelector('[data-request-cache-background-color]').value.toUpperCase(),
+    };
+  }
+  return appearance;
+}
+
+function renderRequestCacheAppearancePreview(appearance = collectRequestCacheAppearanceDraft()) {
+  const preview = $('requestCacheAppearancePreview');
+  if (!preview) return;
+  setRequestCacheAppearanceVariables(appearance, preview);
+  const sample = {
+    prefixLockEnabled: true,
+    prefixLockAction: 'replaced',
+    cacheAnchorMode: 'rolling',
+    cacheTranslationEnabled: true,
+    cachePolicyAction: 'rotation-paused',
+    cachePolicyReason: 'anchor-budget-unavailable',
+    cacheContextHash: '6124045f59ab',
+    changedBlockCount: 2,
+  };
+  renderRequestCacheSummary(preview, sample);
+  if (!preview.querySelector?.('.request-cache-summary')) {
+    clearNode(preview);
+    const fallback = document.createElement('div');
+    fallback.className = 'request-cache-summary';
+    for (const [label, value, kind] of [
+      ['强制 Prefix 锁定', '开启 · 已应用', 'prefix-lock'],
+      ['缓存锚点', '滚动锚点', 'cache-anchor'],
+      ['锚点状态', '轮换暂停', 'cache-anchor'],
+    ]) {
+      const row = appendRequestCacheSummaryRow(fallback, label, kind);
+      appendText(row, 'span', value, 'request-cache-summary-text request-cache-appearance-value');
+    }
+    let row = appendRequestCacheSummaryRow(fallback, '缓存点额度不足');
+    appendText(row, 'span', '缓存点额度不足', 'request-cache-status-chip request-cache-budget-insufficient-chip');
+    row = appendRequestCacheSummaryRow(fallback, '块哈希变更');
+    appendText(row, 'span', '2', 'request-cache-status-chip request-cache-summary-id request-cache-block-hash-change-chip');
+    preview.appendChild(fallback);
+  }
+}
+
+function renderRequestCacheAppearanceControls(appearance) {
+  if (!appearance) return;
+  for (const field of REQUEST_CACHE_APPEARANCE_FIELDS) {
+    const row = requestCacheAppearanceControl(field);
+    const style = appearance[field.key];
+    if (!row || !style) continue;
+    const textInput = row.querySelector('[data-request-cache-text-color]');
+    const backgroundInput = row.querySelector('[data-request-cache-background-color]');
+    const transparentInput = row.querySelector('[data-request-cache-background-transparent]');
+    textInput.value = style.textColor;
+    backgroundInput.value = style.backgroundColor || '#FFFFFF';
+    transparentInput.checked = style.backgroundColor === null;
+    backgroundInput.disabled = transparentInput.checked;
+  }
+  renderRequestCacheAppearancePreview(appearance);
 }
 
 function renderKv(root, entries) {
@@ -664,6 +932,17 @@ function renderCaptureControls() {
   $('logsCaptureState').textContent = runtime.captureRequests ? '已开启' : '已关闭';
   $('logsCaptureState').style.color = runtime.captureRequests ? 'var(--text-main)' : 'var(--text-muted)';
   $('logsCaptureSwitch').checked = Boolean(runtime.captureRequests);
+  if ($('maxRequestCaptures')) $('maxRequestCaptures').value = String(runtime.maxRequestCaptures || 20);
+  const logPersistence = runtime.persistence?.requestLogs || {};
+  const persistenceMessage = logPersistence.lastError
+    ? `本地日志写入失败：${logPersistence.lastError}`
+    : logPersistence.lastSavedAt
+      ? `完整诊断日志已保存到本地；最近保存：${new Date(logPersistence.lastSavedAt).toLocaleString()}。日志可能包含私密提示词。`
+      : `${logPersistence.notice || '完整诊断日志将在首次捕获后保存到本地。'} 日志可能包含私密提示词。`;
+  if ($('requestLogPersistenceStatus')) {
+    $('requestLogPersistenceStatus').textContent = persistenceMessage;
+    $('requestLogPersistenceStatus').className = `note log-persistence-note ${logPersistence.lastError ? 'danger' : ''}`.trim();
+  }
 }
 
 function renderDashboard() {
@@ -924,11 +1203,119 @@ function renderChannels() {
   $('channelStateBadge').textContent = `${channelName(runtime)} · ${upstreamModeLabel(runtime.upstreamMode)}`;
 }
 
+function processingOrderRiskMessages(order) {
+  const normalized = normalizeProcessingOrder(order);
+  const indexOf = (stage) => normalized.indexOf(stage);
+  const warnings = [];
+
+  if (indexOf('ignore-tail') < indexOf('fixed-head')) {
+    warnings.push('忽略末尾早于固定头：固定头候选可能先被阻止。');
+  }
+  if (indexOf('tail-fill') < indexOf('cache-anchor')) {
+    warnings.push('普通尾点早于缓存锚点：尾点可能先占满四点预算。');
+  }
+  if (indexOf('protected-tail-anchor') < indexOf('cache-anchor')) {
+    warnings.push('保护尾锚点早于缓存锚点：执行时可能还没有可保护的锚点。');
+  }
+  if (indexOf('ignore-tail') > indexOf('tail-fill')) {
+    warnings.push('忽略末尾晚于普通尾点：已被尾点阶段锁定的候选不会再被忽略。');
+  }
+  if (indexOf('last-gateway-cache-point-5m') !== normalized.length - 1) {
+    warnings.push('末缓存点 5m 不在最后：可能无点可处理，或之后新增的末点仍保持原 TTL。');
+  }
+
+  return warnings;
+}
+
+function moveProcessingStage(stage, offset) {
+  const order = normalizeProcessingOrder(state.processingOrderDraft);
+  const index = order.indexOf(stage);
+  const target = index + offset;
+  if (index < 0 || target < 0 || target >= order.length) return;
+  [order[index], order[target]] = [order[target], order[index]];
+  state.processingOrderDraft = order;
+  renderCacheProcessingOrder();
+  scheduleCachePolicyAutoApply();
+}
+
+function renderCacheProcessingOrder(order = state.processingOrderDraft) {
+  const root = $('cacheProcessingOrderList');
+  if (!root) return;
+  const normalized = normalizeProcessingOrder(order);
+  state.processingOrderDraft = normalized;
+  clearNode(root);
+
+  for (const [index, stage] of normalized.entries()) {
+    const info = CACHE_POLICY_STAGE_INFO[stage];
+    const fixedNumber = DEFAULT_CACHE_POLICY_PROCESSING_ORDER.indexOf(stage) + 1;
+    const isInactive = stage === 'last-gateway-cache-point-5m'
+      && !$('autoConvertLastAnchorTo5m')?.checked;
+    const row = document.createElement('div');
+    row.className = `processing-order-item ${isInactive ? 'inactive' : ''}`.trim();
+    row.draggable = true;
+    row.dataset.stage = stage;
+    row.tabIndex = 0;
+    appendText(row, 'span', fixedNumber, 'processing-order-index');
+    appendText(row, 'span', '⋮⋮', 'processing-order-drag');
+    const content = document.createElement('div');
+    content.className = 'processing-order-content';
+    appendText(content, 'strong', `${info.label}${isInactive ? '（未启用）' : ''}`);
+    appendText(content, 'span', info.description);
+    row.appendChild(content);
+    const actions = document.createElement('div');
+    actions.className = 'processing-order-actions';
+    const up = appendText(actions, 'button', '上移', 'ghost small');
+    const down = appendText(actions, 'button', '下移', 'ghost small');
+    up.type = 'button';
+    down.type = 'button';
+    up.disabled = index === 0;
+    down.disabled = index === normalized.length - 1;
+    up.onclick = () => moveProcessingStage(stage, -1);
+    down.onclick = () => moveProcessingStage(stage, 1);
+    row.appendChild(actions);
+    row.ondragstart = (event) => {
+      event.dataTransfer?.setData('text/plain', stage);
+      if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+      row.classList.add('dragging');
+    };
+    row.ondragend = () => row.classList.remove('dragging');
+    row.ondragover = (event) => {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    };
+    row.ondrop = (event) => {
+      event.preventDefault();
+      const sourceStage = event.dataTransfer?.getData('text/plain');
+      if (!sourceStage || sourceStage === stage) return;
+      const next = normalizeProcessingOrder(state.processingOrderDraft);
+      const sourceIndex = next.indexOf(sourceStage);
+      const targetIndex = next.indexOf(stage);
+      if (sourceIndex < 0 || targetIndex < 0) return;
+      next.splice(sourceIndex, 1);
+      next.splice(targetIndex, 0, sourceStage);
+      state.processingOrderDraft = next;
+      renderCacheProcessingOrder();
+      scheduleCachePolicyAutoApply();
+    };
+    root.appendChild(row);
+  }
+
+  const warnings = processingOrderRiskMessages(normalized);
+  const warningRoot = $('cacheProcessingOrderWarning');
+  if (warningRoot) {
+    warningRoot.textContent = warnings.length
+      ? warnings.join(' ')
+      : '当前为推荐顺序：固定头先保护，末缓存点 5m 最后处理。';
+    warningRoot.className = `processing-order-warning ${warnings.length ? 'warning' : 'success'}`;
+  }
+}
+
 function readCachePolicyForm() {
   return {
     fixedHeadBreakpointCount: integerInRange($('fixedHeadBreakpointCount')?.value, 0, CACHE_BREAKPOINT_LIMIT, 0),
     cacheAnchorMode: ['off', 'single', 'rolling'].includes($('cacheAnchorMode')?.value) ? $('cacheAnchorMode').value : 'off',
     cacheAnchorIntervalBlocks: integerInRange($('cacheAnchorIntervalBlocks')?.value, 1, 1000, 3),
+    cachePolicyProcessingOrder: normalizeProcessingOrder(state.processingOrderDraft),
     autoConvertLastAnchorTo5m: Boolean($('autoConvertLastAnchorTo5m')?.checked),
     ignoreLastAnchorsMode: ['fixed', 'evaluation'].includes($('ignoreLastAnchorsMode')?.value) ? $('ignoreLastAnchorsMode').value : 'fixed',
     ignoreLastAnchorCount: nonNegativeInteger($('ignoreLastAnchorCount')?.value, 0),
@@ -999,6 +1386,12 @@ function renderCache() {
   $('autoConvertLastAnchorTo5m').checked = policy.autoConvertLastAnchorTo5m;
   $('ignoreLastAnchorsMode').value = policy.ignoreLastAnchorsMode;
   $('ignoreLastAnchorCount').value = String(policy.ignoreLastAnchorCount);
+  state.processingOrderDraft = [...policy.cachePolicyProcessingOrder];
+  renderCacheProcessingOrder();
+  if ($('cachePolicyAutoSaveState') && !cachePolicyAutoApplyTimer) {
+    $('cachePolicyAutoSaveState').textContent = '修改后自动应用';
+    $('cachePolicyAutoSaveState').className = 'badge success';
+  }
   const evaluation = runtime.anchorIgnoreEvaluation || {};
   const evaluationActive = policy.ignoreLastAnchorsMode === 'evaluation' && Boolean(evaluation.active);
   const evaluationResult = Number.isInteger(evaluation.result) ? evaluation.result : null;
@@ -1029,14 +1422,20 @@ function renderCache() {
   $('cachePolicyBadge').classList.toggle('off', policy.fixedHeadBreakpointCount === 0 && policy.cacheAnchorMode === 'off');
   $('cachePolicyBadge').classList.toggle('warning', noAnchorCapacity);
   renderCachePolicyBudget();
+  const runtimePersistence = runtime.persistence?.runtimeState || {};
   renderKv($('cacheAnchorKv'), [
-    ['内存上下文', `${anchorState.contextCount ?? 0} / ${anchorState.maxContexts ?? 32}`],
+    ['本地上下文', `${anchorState.contextCount ?? 0} / ${anchorState.maxContexts ?? 32}`],
     ['活动锚点', anchorState.activeAnchorCount ?? 0],
     ['待淘汰锚点', anchorState.retiringAnchorCount ?? anchorState.pendingEvictionAnchorCount ?? 0],
     ['最近动作', anchorState.lastAction],
     ['最近原因', anchorState.lastReason],
     ['暂停原因', anchorState.lastPauseReason ?? anchorState.pauseReason],
     ['最近更新', anchorState.lastUpdatedAt ? new Date(anchorState.lastUpdatedAt).toLocaleString() : '-'],
+    ['本地保存', runtimePersistence.lastError
+      ? `失败：${runtimePersistence.lastError}`
+      : runtimePersistence.lastSavedAt
+        ? new Date(runtimePersistence.lastSavedAt).toLocaleString()
+        : runtimePersistence.notice || '等待首次保存'],
   ]);
   $('prefixLockSwitch').checked = runtime.prefixLockEnabled;
   $('prefixLockBadge').textContent = runtime.prefixLockActive ? '开启' : runtime.prefixLockEnabled ? '学习' : '关闭';
@@ -1067,7 +1466,12 @@ function renderAdvanced() {
   $('headerOverrideBadge').className = `badge ${runtime.upstreamHeadersEnabled || runtime.upstreamExcludeHeadersEnabled ? 'success' : ''}`;
   $('usageAppearanceBadge').textContent = '全局配置';
   $('usageAppearanceBadge').className = 'badge success';
+  renderUsagePreviewSampleControls(runtime.usagePreviewSample || DEFAULT_USAGE_PREVIEW_SAMPLE);
   renderUsageAppearanceControls(runtime.usageAppearance);
+  renderUsagePreviewMode();
+  $('requestCacheAppearanceBadge').textContent = '全局配置';
+  $('requestCacheAppearanceBadge').className = 'badge success';
+  renderRequestCacheAppearanceControls(runtime.requestCacheAppearance || DEFAULT_REQUEST_CACHE_APPEARANCE);
   $('cacheControl').textContent = JSON.stringify({
     cacheTranslationEnabled: runtime.cacheTranslationEnabled,
     systemMessageHandlingMode: systemMessageHandlingMode(runtime),
@@ -1079,6 +1483,7 @@ function renderAdvanced() {
       fixedHeadBreakpointCount: getCachePolicy(runtime).fixedHeadBreakpointCount,
       cacheAnchorMode: getCachePolicy(runtime).cacheAnchorMode,
       cacheAnchorIntervalBlocks: getCachePolicy(runtime).cacheAnchorIntervalBlocks,
+      cachePolicyProcessingOrder: getCachePolicy(runtime).cachePolicyProcessingOrder,
       autoConvertLastAnchorTo5m: getCachePolicy(runtime).autoConvertLastAnchorTo5m,
       ignoreLastAnchorsMode: getCachePolicy(runtime).ignoreLastAnchorsMode,
       ignoreLastAnchorCount: getCachePolicy(runtime).ignoreLastAnchorCount,
@@ -1097,6 +1502,10 @@ function renderAdvanced() {
     upstreamHeaders: runtime.upstreamHeaders,
     upstreamExcludeHeaders: runtime.upstreamExcludeHeaders,
     usageAppearance: runtime.usageAppearance,
+    usagePreviewSample: runtime.usagePreviewSample,
+    requestCacheAppearance: runtime.requestCacheAppearance,
+    maxRequestCaptures: runtime.maxRequestCaptures,
+    persistence: runtime.persistence,
   }, null, 2);
 }
 
@@ -1174,7 +1583,7 @@ function renderRequests() {
     }, 'compact');
 
     const channel = tableCell(tr, '', '', '渠道');
-    channel.append(document.createTextNode(channelName(state.runtime)));
+    channel.append(document.createTextNode(item.channelName || channelName(state.runtime)));
     if (item.upstreamMode) {
       channel.appendChild(document.createElement('br'));
       appendText(channel, 'small', upstreamModeLabel(item.upstreamMode));
@@ -1190,6 +1599,7 @@ function renderRequests() {
 
 function renderAll() {
   setUsageAppearanceVariables(state.runtime?.usageAppearance);
+  setRequestCacheAppearanceVariables(state.runtime?.requestCacheAppearance);
   renderTopbar();
   renderDashboard();
   renderCaptureControls();
@@ -1940,9 +2350,16 @@ function renderDetail() {
   );
   const usageStats = usageStatistics(usage, upstreamMode);
   $('drawerTitle').textContent = item.upstream?.body?.model || item.gateway?.transformedBody?.model || item.id;
-  $('drawerEyebrow').textContent = channelName(state.runtime);
+  $('drawerEyebrow').textContent = item.gateway?.channelName || channelName(state.runtime);
   $('detailId').textContent = `ID: ${item.id}`;
-  renderMetaGrid($('detailMetaGrid'), [
+  const detailPolicy = getCaptureCachePolicy(item);
+  const detailAnchorMode = requestCacheAnchorMode(item, detailPolicy);
+  const detailPrefixSummary = {
+    prefixLockEnabled: item.gateway?.prefixLock?.enabled ?? false,
+    prefixLockAction: item.gateway?.prefixLock?.action,
+    prefixLockReason: item.gateway?.prefixLock?.reason,
+  };
+  const detailMeta = [
     ['响应状态', item.response?.status],
     ['缓存转译', item.gateway?.cacheTranslationEnabled ? '开启' : '关闭'],
     ['系统身份消息处理', systemMessageHandlingLabel(item.gateway)],
@@ -1950,16 +2367,30 @@ function renderDetail() {
     ['注入断点', item.gateway?.conversion?.injected ?? 0, (item.gateway?.conversion?.injected ?? 0) > 0 ? 'success' : ''],
     ['转换标记', item.gateway?.conversion?.removed ?? 0],
     ['缓存点数量', item.upstream?.cache?.cacheControlCount ?? 0],
-    ['候选断点', cachePolicyCandidateCount(getCaptureCachePolicy(item)) ?? '未记录'],
-    ['Prefix 动作', item.gateway?.prefixLock?.action || 'disabled'],
+    ['候选断点', cachePolicyCandidateCount(detailPolicy) ?? '未记录'],
+  ];
+  if (detailPrefixSummary.prefixLockEnabled === true) {
+    detailMeta.push(['Prefix 锁定', prefixLockStatusLabel(detailPrefixSummary), 'request-cache-prefix-detail']);
+  }
+  if (['single', 'rolling'].includes(detailAnchorMode)) {
+    detailMeta.push(
+      ['缓存锚点', cacheAnchorRequestLabel({
+        cacheAnchorMode: detailAnchorMode,
+        cacheTranslationEnabled: item.gateway?.cacheTranslationEnabled,
+      }, detailPolicy), 'request-cache-anchor-detail'],
+      ['锚点状态', anchorActionLabel(detailPolicy.action), 'request-cache-anchor-detail'],
+    );
+  }
+  detailMeta.push(
     ['Usage', hasUsage(usage) ? '已返回' : '未返回'],
     ['输入 token', usageStats.inputTokens === null ? '暂不可用' : usageStats.inputTokens],
     ['输出 token', usageStats.outputTokens === null ? '暂不可用' : usageStats.outputTokens],
     ['缓存命中率', usageRateLabel(usageStats.cacheHitRatePercent)],
     ['缓存创建 / 缓存命中', `${usageNumberLabel(usageStats.cacheWriteTokens)} / ${usageNumberLabel(usageStats.cacheReadTokens)}`],
     ['Token 倍率', tokenMultiplierLabel(promptEstimate.tokensPerCharacter)],
-    ['当前渠道', channelName(state.runtime)],
-  ]);
+    ['请求渠道', item.gateway?.channelName || channelName(state.runtime)],
+  );
+  renderMetaGrid($('detailMetaGrid'), detailMeta);
 
   const tabPayloads = {
     usage: hasUsage(usage) ? usage : { message: '暂无 usage。' },
@@ -2021,6 +2452,39 @@ async function applyTtl(value) {
   setStatus(`TTL 已切换为 ${ttlLabel(value)}`);
 }
 
+function scheduleCachePolicyAutoApply(delay = 650) {
+  if (cachePolicyAutoApplyTimer) clearTimeout(cachePolicyAutoApplyTimer);
+  const sequence = ++cachePolicyAutoApplySequence;
+  const badge = $('cachePolicyAutoSaveState');
+  if (badge) {
+    badge.textContent = '等待自动应用';
+    badge.className = 'badge warning';
+  }
+  cachePolicyAutoApplyTimer = setTimeout(async () => {
+    cachePolicyAutoApplyTimer = null;
+    if (badge) {
+      badge.textContent = '正在自动应用';
+      badge.className = 'badge warning';
+    }
+    try {
+      const applied = await applyCachePolicy();
+      if (sequence !== cachePolicyAutoApplySequence) return;
+      if (badge) {
+        badge.textContent = applied === false ? '已取消，保持原策略' : '已自动应用';
+        badge.className = `badge ${applied === false ? '' : 'success'}`.trim();
+      }
+    } catch (error) {
+      if (sequence !== cachePolicyAutoApplySequence) return;
+      await refreshAll().catch(() => {});
+      if (badge) {
+        badge.textContent = '自动应用失败';
+        badge.className = 'badge danger';
+      }
+      setStatus(error.message);
+    }
+  }, delay);
+}
+
 async function applyCachePolicy() {
   const rawHead = Number($('fixedHeadBreakpointCount').value);
   const rawInterval = Number($('cacheAnchorIntervalBlocks').value);
@@ -2028,6 +2492,7 @@ async function applyCachePolicy() {
   const ignoreMode = $('ignoreLastAnchorsMode').value;
   const rawIgnored = Number($('ignoreLastAnchorCount').value);
   const autoLastAnchor5m = Boolean($('autoConvertLastAnchorTo5m').checked);
+  const nextProcessingOrder = normalizeProcessingOrder(state.processingOrderDraft);
   if (!Number.isInteger(rawHead) || rawHead < 0 || rawHead > CACHE_BREAKPOINT_LIMIT) throw new Error('固定头缓存点必须是 0–4 的整数。');
   if (!['off', 'single', 'rolling'].includes(mode)) throw new Error('缓存锚点模式无效。');
   if (!Number.isInteger(rawInterval) || rawInterval < 1 || rawInterval > 1000) throw new Error('滚动间隔必须是 1–1000 的整数。');
@@ -2036,9 +2501,11 @@ async function applyCachePolicy() {
 
   const button = $('cachePolicyApply');
   const previous = getCachePolicy();
+  const orderChanged = JSON.stringify(nextProcessingOrder) !== JSON.stringify(previous.cachePolicyProcessingOrder);
   const changed = rawHead !== previous.fixedHeadBreakpointCount
     || mode !== previous.cacheAnchorMode
     || rawInterval !== previous.cacheAnchorIntervalBlocks
+    || orderChanged
     || autoLastAnchor5m !== previous.autoConvertLastAnchorTo5m
     || ignoreMode !== previous.ignoreLastAnchorsMode
     || rawIgnored !== previous.ignoreLastAnchorCount;
@@ -2047,14 +2514,21 @@ async function applyCachePolicy() {
     && rawIgnored !== previous.ignoreLastAnchorCount;
   if (requiresOutOfRangeConfirmation
     && !window.confirm(`x=${rawIgnored} 超出建议范围 0–5，确认仍然填入吗？`)) {
-    return;
+    await refreshAll();
+    return false;
   }
-  button.disabled = true;
+  if (orderChanged
+    && !window.confirm('处理顺序变化会立即清空缓存锚点与 Prefix 锁定学习数据，并可能产生高风险组合。确认应用吗？')) {
+    await refreshAll();
+    return false;
+  }
+  if (button) button.disabled = true;
   try {
     await postJson('/console/cache-policy', {
       fixedHeadBreakpointCount: rawHead,
       cacheAnchorMode: mode,
       cacheAnchorIntervalBlocks: rawInterval,
+      cachePolicyProcessingOrder: nextProcessingOrder,
       autoConvertLastAnchorTo5m: autoLastAnchor5m,
       ignoreLastAnchorsMode: ignoreMode,
       ignoreLastAnchorCount: rawIgnored,
@@ -2067,9 +2541,10 @@ async function applyCachePolicy() {
         ? '；Prefix Lock 已关闭，下一次成功请求将学习锚点'
         : '；锚点状态保持不变';
     const ignoreLabel = ignoreMode === 'evaluation' ? '评估模式' : `忽略末尾 ${rawIgnored}`;
-    setStatus(`断点保留策略已应用：固定头 ${rawHead}，${cacheAnchorModeLabel(mode)}，${ignoreLabel}${suffix}`);
+    setStatus(`断点保留策略已自动应用：固定头 ${rawHead}，${cacheAnchorModeLabel(mode)}，${ignoreLabel}${orderChanged ? '；处理顺序已更新并清空学习数据' : suffix}`);
+    return true;
   } finally {
-    button.disabled = false;
+    if (button) button.disabled = false;
   }
 }
 
@@ -2161,14 +2636,22 @@ function bindEvents() {
   $('quickPrefixRefresh').onclick = async () => { await api('/console/prefix-lock/clear', { method: 'POST' }); await postJson('/console/prefix-lock', { enabled: true }); await refreshAll(); setStatus('Prefix Lock 已清空并重新开启，缓存锚点已关闭'); };
 
   for (const button of document.querySelectorAll('#quickTtlSeg button, #cacheTtlSeg button')) button.onclick = () => applyTtl(button.dataset.ttl);
-  $('fixedHeadBreakpointCount').onchange = () => renderCachePolicyBudget(true);
-  $('cacheAnchorMode').onchange = () => renderCachePolicyBudget(true);
-  $('cacheAnchorIntervalBlocks').oninput = () => renderCachePolicyBudget(true);
+  $('fixedHeadBreakpointCount').onchange = () => { renderCachePolicyBudget(true); scheduleCachePolicyAutoApply(200); };
+  $('cacheAnchorMode').onchange = () => { renderCachePolicyBudget(true); scheduleCachePolicyAutoApply(200); };
+  $('cacheAnchorIntervalBlocks').oninput = () => { renderCachePolicyBudget(true); scheduleCachePolicyAutoApply(); };
+  $('autoConvertLastAnchorTo5m').onchange = () => { renderCacheProcessingOrder(); scheduleCachePolicyAutoApply(200); };
   $('ignoreLastAnchorsMode').onchange = () => {
     const evaluationMode = $('ignoreLastAnchorsMode').value === 'evaluation';
     $('ignoreLastAnchorCount').disabled = evaluationMode;
+    scheduleCachePolicyAutoApply(200);
   };
-  $('ignoreLastAnchorCount').oninput = () => renderCachePolicyBudget(true);
+  $('ignoreLastAnchorCount').oninput = () => { renderCachePolicyBudget(true); scheduleCachePolicyAutoApply(); };
+  $('cacheProcessingOrderReset').onclick = () => {
+    state.processingOrderDraft = [...DEFAULT_CACHE_POLICY_PROCESSING_ORDER];
+    renderCacheProcessingOrder();
+    scheduleCachePolicyAutoApply(200);
+    setStatus('处理顺序已恢复为默认并等待自动应用。');
+  };
   $('anchorIgnoreEvaluationStart').onclick = async () => {
     try {
       const result = await postJson('/console/anchor-ignore-evaluation', { action: 'start' });
@@ -2190,7 +2673,6 @@ function bindEvents() {
       setStatus(error.message);
     }
   };
-  $('cachePolicyApply').onclick = () => applyCachePolicy().catch((error) => { renderCache(); setStatus(error.message); });
   $('cacheAnchorsClear').onclick = () => clearCacheAnchors().catch((error) => setStatus(error.message));
   $('prefixLockSwitch').onchange = async () => { await postJson('/console/prefix-lock', { enabled: $('prefixLockSwitch').checked }); await refreshAll(); setStatus($('prefixLockSwitch').checked ? 'Prefix Lock 已开启，缓存锚点已关闭并清空' : 'Prefix Lock 已关闭并清空'); };
   $('prefixLockRefresh').onclick = async () => { await refreshAll(); setStatus('Prefix Lock 状态已刷新'); };
@@ -2202,6 +2684,17 @@ function bindEvents() {
   $('refreshCaptures').onclick = async () => { await loadRequests(); renderRequests(); setStatus('日志已刷新'); };
   $('filterCache').onchange = () => { state.filters.cache = $('filterCache').value; state.page = 1; renderRequests(); };
   $('pageSize').onchange = () => { state.pageSize = Number($('pageSize').value); state.page = 1; renderRequests(); };
+  $('maxRequestCaptures').onchange = async () => {
+    const value = Number($('maxRequestCaptures').value);
+    if (!Number.isInteger(value) || value < 1 || value > 1000) {
+      renderCaptureControls();
+      setStatus('最大保留日志数量必须是 1–1000 的整数。');
+      return;
+    }
+    await postJson('/console/request-log-settings', { maxRequestCaptures: value });
+    await refreshAll();
+    setStatus(`请求日志最大保留数量已设为 ${value}，超出部分已删除。`);
+  };
   $('prevPage').onclick = () => { state.page -= 1; renderRequests(); };
   $('nextPage').onclick = () => { state.page += 1; renderRequests(); };
 
@@ -2217,16 +2710,90 @@ function bindEvents() {
     backgroundInput.oninput = updatePreview;
     transparentInput.onchange = updatePreview;
   }
+  $('usageAppearancePreview').onclick = (event) => {
+    setUsagePreviewEditing(true, usagePreviewFocusTarget(event.target));
+  };
+  $('usagePreviewDone').onclick = () => {
+    setUsagePreviewEditing(false);
+    renderUsageAppearancePreview();
+  };
+  $('usageSampleInputTokens').oninput = () => updateUsagePreviewDerived('inputTokens');
+  $('usageSampleOutputTokens').oninput = () => renderUsageAppearancePreview();
+  $('usageSampleCacheReadTokens').oninput = () => updateUsagePreviewDerived('cacheReadTokens');
+  $('usageSampleCacheWriteTokens').oninput = () => renderUsageAppearancePreview();
+  $('usageSampleHitRate').oninput = () => updateUsagePreviewDerived('cacheHitRatePercent');
   $('usageAppearanceApply').onclick = async () => {
-    await postJson('/console/usage-appearance', { value: collectUsageAppearanceDraft() });
+    await postJson('/console/usage-appearance', {
+      value: collectUsageAppearanceDraft(),
+      previewSample: collectUsagePreviewSample(),
+    });
+    state.usagePreviewEditing = false;
     await refreshAll();
-    setStatus('Usage 配色已应用');
+    setStatus('Usage 外观与示例数据已应用');
   };
   $('usageAppearanceReset').onclick = async () => {
     await postJson('/console/usage-appearance', { reset: true });
     await refreshAll();
-    setStatus('Usage 配色已恢复默认');
+    setStatus('Usage 配色已恢复默认，示例数据保持不变');
   };
+  $('usagePreviewSampleReset').onclick = async () => {
+    state.usagePreviewEditing = false;
+    renderUsagePreviewSampleControls(DEFAULT_USAGE_PREVIEW_SAMPLE);
+    renderUsagePreviewMode();
+    renderUsageAppearancePreview();
+    setStatus('Usage 示例数据已即时恢复默认，正在保存。');
+    try {
+      await postJson('/console/usage-appearance', { resetSample: true });
+      if (state.runtime) state.runtime.usagePreviewSample = { ...DEFAULT_USAGE_PREVIEW_SAMPLE };
+      setStatus('Usage 示例数据已恢复默认并保存');
+    } catch (error) {
+      await refreshAll().catch(() => {});
+      setStatus(`Usage 示例数据保存失败：${error.message}`);
+    }
+  };
+
+  for (const row of document.querySelectorAll('[data-request-cache-style]')) {
+    const textInput = row.querySelector('[data-request-cache-text-color]');
+    const backgroundInput = row.querySelector('[data-request-cache-background-color]');
+    const transparentInput = row.querySelector('[data-request-cache-background-transparent]');
+    const updatePreview = () => {
+      backgroundInput.disabled = transparentInput.checked;
+      renderRequestCacheAppearancePreview();
+    };
+    textInput.oninput = updatePreview;
+    backgroundInput.oninput = updatePreview;
+    transparentInput.onchange = updatePreview;
+  }
+  $('requestCacheAppearanceApply').onclick = async () => {
+    await postJson('/console/request-cache-appearance', { value: collectRequestCacheAppearanceDraft() });
+    await refreshAll();
+    setStatus('Prefix 锁定 / 缓存锚点配色已应用');
+  };
+  $('requestCacheAppearanceReset').onclick = async () => {
+    await postJson('/console/request-cache-appearance', { reset: true });
+    await refreshAll();
+    setStatus('Prefix 锁定 / 缓存锚点配色已恢复默认');
+  };
+
+  $('configExport').onclick = () => {
+    try {
+      exportGatewayConfiguration();
+    } catch (error) {
+      setStatus(`配置导出失败：${error.message}`);
+    }
+  };
+  $('configImport').onclick = () => $('configImportFile').click();
+  $('configImportFile').onchange = async () => {
+    const [file] = $('configImportFile').files || [];
+    try {
+      await importGatewayConfiguration(file);
+    } catch (error) {
+      setStatus(`配置导入失败：${error.message}`);
+    } finally {
+      $('configImportFile').value = '';
+    }
+  };
+  $('configRestoreDefault').onclick = () => restoreDefaultGatewayConfiguration().catch((error) => setStatus(error.message));
 
   $('extraJsonOff').onclick = async () => { await postJson('/console/upstream-extra-json', { value: {} }); await refreshAll(); setStatus('包含主体参数已清空'); };
   $('extraJsonFormat').onclick = () => { $('upstreamExtraJson').value = JSON.stringify(JSON.parse($('upstreamExtraJson').value || '{}'), null, 2); setStatus('包含主体参数已格式化'); };

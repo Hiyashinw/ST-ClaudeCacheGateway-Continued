@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
     AnchorStore,
     ANCHOR_EVALUATION_REQUESTS,
+    DEFAULT_CACHE_POLICY_PROCESSING_ORDER,
     DEFAULT_CACHE_ENHANCEMENTS,
     INITIAL_EVALUATION_IGNORED_ANCHORS,
     MAX_IGNORED_ANCHORS,
@@ -15,13 +17,16 @@ import {
     normalizeCacheEnhancements,
     normalizeIgnoredAnchorCount,
     normalizeIgnoredAnchorMode,
+    normalizeCachePolicyProcessingOrder,
     planCacheBreaks,
     preprocessAutomaticCacheBreaks,
 } from './cache-policy.js';
 
 const MARKER = '[[CACHE_BREAK]]';
 const MAX_BREAKPOINTS = 4;
-const SETTINGS_SCHEMA_VERSION = 10;
+const SETTINGS_SCHEMA_VERSION = 11;
+const RUNTIME_STATE_SCHEMA_VERSION = 1;
+const REQUEST_LOG_SCHEMA_VERSION = 1;
 const DEFAULT_UPSTREAM_BASE_URL = 'https://api.pioneer.ai';
 const DEFAULT_USAGE_APPEARANCE = Object.freeze({
     input: Object.freeze({ textColor: '#127852', backgroundColor: null }),
@@ -35,8 +40,25 @@ const DEFAULT_USAGE_APPEARANCE = Object.freeze({
         le100: Object.freeze({ textColor: '#127852', backgroundColor: null }),
     }),
 });
+const DEFAULT_USAGE_PREVIEW_SAMPLE = Object.freeze({
+    inputTokens: 148792,
+    outputTokens: 546,
+    cacheReadTokens: 141558,
+    cacheWriteTokens: 6924,
+    cacheHitRatePercent: 95.14,
+});
+const DEFAULT_REQUEST_CACHE_APPEARANCE = Object.freeze({
+    prefixLock: Object.freeze({ textColor: '#191919', backgroundColor: null }),
+    cacheAnchor: Object.freeze({ textColor: '#191919', backgroundColor: null }),
+    cacheBudgetInsufficient: Object.freeze({ textColor: '#B25E00', backgroundColor: '#FBF1E6' }),
+    blockHashChange: Object.freeze({ textColor: '#B25E00', backgroundColor: '#FBF1E6' }),
+});
+const DEFAULT_MAX_REQUEST_CAPTURES = 20;
+const MAX_REQUEST_CAPTURE_LIMIT = 1000;
 const SETTINGS_FILE = new URL('./gateway-settings.json', import.meta.url);
 const DEFAULT_SETTINGS_FILE = new URL('./default-gateway-settings.json', import.meta.url);
+const RUNTIME_STATE_FILE = new URL('./gateway-runtime-state.json', import.meta.url);
+const REQUEST_LOG_FILE = new URL('./gateway-request-logs.json', import.meta.url);
 const CHANNEL_SETTING_KEYS = new Set([
     'channels',
     'channelProfiles',
@@ -63,6 +85,9 @@ let autoGenerateCacheBreakpointsMode = normalizeAutoGenerateCacheBreakpointsMode
 let fixedHeadBreakpointCount = normalizeFixedHeadBreakpointCount(runtimeSettings.fixedHeadBreakpointCount);
 let cacheAnchorMode = normalizeCacheAnchorMode(runtimeSettings.cacheAnchorMode);
 let cacheAnchorIntervalBlocks = normalizeCacheAnchorIntervalBlocks(runtimeSettings.cacheAnchorIntervalBlocks);
+let cachePolicyProcessingOrder = normalizeCachePolicyProcessingOrder(
+    runtimeSettings.cachePolicyProcessingOrder,
+);
 let autoConvertLastAnchorTo5m = normalizeBoolean(
     runtimeSettings.autoConvertLastAnchorTo5m,
     DEFAULT_CACHE_ENHANCEMENTS.autoConvertLastAnchorTo5m,
@@ -83,8 +108,11 @@ let upstreamHeaders = normalizeUpstreamHeaders(getRuntimeConfigValue('UPSTREAM_H
 let upstreamExcludeHeaders = normalizeUpstreamExcludeHeaders(getRuntimeConfigValue('UPSTREAM_EXCLUDE_HEADERS', runtimeSettings.upstreamExcludeHeaders || getActiveChannel()?.upstreamExcludeHeaders, []));
 syncActiveChannelFromRuntime();
 let captureRequests = normalizeBoolean(runtimeSettings.captureRequests, false);
+let maxRequestCaptures = normalizeMaxRequestCaptures(runtimeSettings.maxRequestCaptures);
 let usageAppearance = normalizeUsageAppearance(runtimeSettings.usageAppearance);
-let prefixLockEnabled = false;
+let usagePreviewSample = normalizeUsagePreviewSample(runtimeSettings.usagePreviewSample);
+let requestCacheAppearance = normalizeRequestCacheAppearance(runtimeSettings.requestCacheAppearance);
+let prefixLockEnabled = normalizeBoolean(runtimeSettings.prefixLockEnabled, false);
 let prefixLock = null;
 const prefixLockStats = {
     replacements: 0,
@@ -94,16 +122,26 @@ const prefixLockStats = {
 };
 const cacheAnchorStore = new AnchorStore({ maxContexts: 32 });
 const requestCaptures = [];
-const MAX_REQUEST_CAPTURES = 20;
 const MAX_BLOCK_HASH_SNAPSHOTS = 64;
 const blockHashSnapshots = new Map();
 let lastBlockHashComparison = null;
+const persistenceStatus = {
+    runtimeState: { loaded: false, lastSavedAt: null, lastError: null, notice: null },
+    requestLogs: { loaded: false, lastSavedAt: null, lastError: null, notice: null },
+};
+let runtimeStatePersistTimer = null;
+let requestLogsPersistTimer = null;
 let anchorIgnoreEvaluation = ignoreLastAnchorsMode === 'evaluation'
     ? createAnchorEvaluationState(INITIAL_EVALUATION_IGNORED_ANCHORS)
     : null;
 if (anchorIgnoreEvaluation) {
     anchorIgnoreEvaluation.notice = `评估模式已开启：请连续进行 ${ANCHOR_EVALUATION_REQUESTS} 次对话。`;
 }
+if (cacheAnchorMode !== 'off') {
+    prefixLockEnabled = false;
+}
+restorePersistedRuntimeState();
+restorePersistedRequestLogs();
 
 function loadRuntimeSettings() {
     const defaults = loadJsonSettings(DEFAULT_SETTINGS_FILE);
@@ -119,6 +157,311 @@ function loadJsonSettings(file) {
     } catch {
         return {};
     }
+}
+
+function readPersistedJson(file, statusKey) {
+    try {
+        const parsed = JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+        persistenceStatus[statusKey].lastError = null;
+        return parsed;
+    } catch (error) {
+        if (error?.code === 'ENOENT') {
+            persistenceStatus[statusKey].notice = '尚未创建本地数据文件。';
+            return null;
+        }
+
+        persistenceStatus[statusKey].lastError = error?.message || String(error);
+        persistenceStatus[statusKey].notice = '本地数据文件无法读取，已使用空状态启动。';
+        return null;
+    }
+}
+
+function writePersistedJson(file, value, statusKey) {
+    const targetPath = fileURLToPath(file);
+    const temporaryPath = `${targetPath}.${process.pid}.tmp`;
+    const payload = `${JSON.stringify(value, null, 2)}\n`;
+
+    try {
+        writeFileSync(temporaryPath, payload);
+        try {
+            renameSync(temporaryPath, targetPath);
+        } catch {
+            // Some Windows filesystems do not replace an existing destination
+            // atomically. Fall back to a direct write while retaining the
+            // temporary-file path for the common case.
+            writeFileSync(targetPath, payload);
+            rmSync(temporaryPath, { force: true });
+        }
+        persistenceStatus[statusKey].lastSavedAt = new Date().toISOString();
+        persistenceStatus[statusKey].lastError = null;
+        persistenceStatus[statusKey].notice = null;
+        return true;
+    } catch (error) {
+        try { rmSync(temporaryPath, { force: true }); } catch {}
+        persistenceStatus[statusKey].lastError = error?.message || String(error);
+        persistenceStatus[statusKey].notice = '本地数据写入失败；网关请求仍会继续转发。';
+        return false;
+    }
+}
+
+function getLearningConfigFingerprint() {
+    return hashCanonical({
+        cacheTranslationEnabled,
+        systemMessageHandlingMode,
+        autoGenerateCacheBreakpointsMode,
+        cacheTtl: getCacheTtlLabel(),
+        fixedHeadBreakpointCount,
+        cacheAnchorMode,
+        cacheAnchorIntervalBlocks,
+        cachePolicyProcessingOrder,
+        autoConvertLastAnchorTo5m,
+        ignoreLastAnchorsMode,
+        ignoreLastAnchorCount,
+    });
+}
+
+function normalizePersistedAnchorEvaluation(value) {
+    if (!isPlainObject(value)) {
+        return null;
+    }
+
+    const base = createAnchorEvaluationState(
+        Number.isInteger(value.x) && value.x >= 0 ? value.x : INITIAL_EVALUATION_IGNORED_ANCHORS,
+    );
+    const samples = Array.isArray(value.samples)
+        ? value.samples.filter(isPlainObject).slice(-ANCHOR_EVALUATION_REQUESTS).map(safeJsonClone)
+        : [];
+
+    return {
+        ...base,
+        ...safeJsonClone(value),
+        samples,
+        requestsCompleted: Math.max(0, Math.min(
+            ANCHOR_EVALUATION_REQUESTS,
+            Number.isInteger(value.requestsCompleted) ? value.requestsCompleted : samples.length,
+        )),
+    };
+}
+
+function normalizePersistedPrefixLock(value) {
+    if (!isPlainObject(value)
+        || !['openai', 'anthropic'].includes(value.mode)
+        || !Array.isArray(value.prefixSegments)
+        || typeof value.prefixHash !== 'string') {
+        return null;
+    }
+
+    return {
+        mode: value.mode,
+        prefixSegments: safeJsonClone(value.prefixSegments),
+        prefixHash: value.prefixHash,
+        prefixLength: Math.max(0, Number(value.prefixLength) || 0),
+        prefixBlockCount: Math.max(0, Number(value.prefixBlockCount) || 0),
+        firstCacheControlPath: typeof value.firstCacheControlPath === 'string'
+            ? value.firstCacheControlPath
+            : null,
+        createdAt: typeof value.createdAt === 'string' ? value.createdAt : null,
+    };
+}
+
+function serializePersistedRuntimeState() {
+    return {
+        schemaVersion: RUNTIME_STATE_SCHEMA_VERSION,
+        savedAt: new Date().toISOString(),
+        learningConfigFingerprint: getLearningConfigFingerprint(),
+        anchorStore: cacheAnchorStore.exportState(),
+        anchorIgnoreEvaluation: safeJsonClone(anchorIgnoreEvaluation),
+        prefixLock: safeJsonClone(prefixLock),
+        prefixLockStats: safeJsonClone(prefixLockStats),
+        blockHashSnapshots: [...blockHashSnapshots.entries()].map(([key, value]) => [key, safeJsonClone(value)]),
+        lastBlockHashComparison: safeJsonClone(lastBlockHashComparison),
+    };
+}
+
+function serializePersistedRequestLogs() {
+    return {
+        schemaVersion: REQUEST_LOG_SCHEMA_VERSION,
+        savedAt: new Date().toISOString(),
+        captures: safeJsonClone(requestCaptures),
+    };
+}
+
+function persistRuntimeStateNow() {
+    if (runtimeStatePersistTimer) {
+        clearTimeout(runtimeStatePersistTimer);
+        runtimeStatePersistTimer = null;
+    }
+    return writePersistedJson(RUNTIME_STATE_FILE, serializePersistedRuntimeState(), 'runtimeState');
+}
+
+function persistRequestLogsNow() {
+    if (requestLogsPersistTimer) {
+        clearTimeout(requestLogsPersistTimer);
+        requestLogsPersistTimer = null;
+    }
+    return writePersistedJson(REQUEST_LOG_FILE, serializePersistedRequestLogs(), 'requestLogs');
+}
+
+function scheduleRuntimeStatePersist({ immediate = false } = {}) {
+    if (immediate) {
+        return persistRuntimeStateNow();
+    }
+    if (runtimeStatePersistTimer) {
+        clearTimeout(runtimeStatePersistTimer);
+    }
+    runtimeStatePersistTimer = setTimeout(() => {
+        runtimeStatePersistTimer = null;
+        persistRuntimeStateNow();
+    }, 40);
+    runtimeStatePersistTimer.unref?.();
+    return true;
+}
+
+function scheduleRequestLogsPersist({ immediate = false } = {}) {
+    if (immediate) {
+        return persistRequestLogsNow();
+    }
+    if (requestLogsPersistTimer) {
+        clearTimeout(requestLogsPersistTimer);
+    }
+    requestLogsPersistTimer = setTimeout(() => {
+        requestLogsPersistTimer = null;
+        persistRequestLogsNow();
+    }, 40);
+    requestLogsPersistTimer.unref?.();
+    return true;
+}
+
+function trimRequestCaptures() {
+    if (requestCaptures.length > maxRequestCaptures) {
+        requestCaptures.length = maxRequestCaptures;
+        return true;
+    }
+    return false;
+}
+
+function restorePersistedRuntimeState() {
+    const snapshot = readPersistedJson(RUNTIME_STATE_FILE, 'runtimeState');
+    if (!snapshot) {
+        if (prefixLockEnabled) {
+            prefixLockStats.lastAction = 'learning';
+        }
+        return false;
+    }
+
+    if (!isPlainObject(snapshot) || Number(snapshot.schemaVersion) !== RUNTIME_STATE_SCHEMA_VERSION) {
+        persistenceStatus.runtimeState.notice = '运行状态文件版本不兼容，已忽略旧数据。';
+        return false;
+    }
+
+    if (snapshot.learningConfigFingerprint !== getLearningConfigFingerprint()) {
+        persistenceStatus.runtimeState.notice = '缓存策略已变化，旧学习数据已忽略并等待重新学习。';
+        return false;
+    }
+
+    try {
+        if (snapshot.anchorStore) {
+            cacheAnchorStore.restoreState(snapshot.anchorStore);
+        }
+        anchorIgnoreEvaluation = normalizePersistedAnchorEvaluation(snapshot.anchorIgnoreEvaluation);
+        if (ignoreLastAnchorsMode !== 'evaluation') {
+            anchorIgnoreEvaluation = null;
+        }
+
+        if (prefixLockEnabled && cacheAnchorMode === 'off') {
+            prefixLock = normalizePersistedPrefixLock(snapshot.prefixLock);
+        }
+
+        const savedStats = isPlainObject(snapshot.prefixLockStats) ? snapshot.prefixLockStats : {};
+        prefixLockStats.replacements = Math.max(0, Number(savedStats.replacements) || 0);
+        prefixLockStats.lastAction = typeof savedStats.lastAction === 'string'
+            ? savedStats.lastAction
+            : (prefixLock ? 'enabled' : (prefixLockEnabled ? 'learning' : 'disabled'));
+        prefixLockStats.lastSkipReason = typeof savedStats.lastSkipReason === 'string'
+            ? savedStats.lastSkipReason
+            : null;
+        prefixLockStats.lastAppliedAt = typeof savedStats.lastAppliedAt === 'string'
+            ? savedStats.lastAppliedAt
+            : null;
+
+        if (!prefixLockEnabled) {
+            prefixLock = null;
+            prefixLockStats.lastAction = 'disabled';
+        } else if (!prefixLock) {
+            prefixLockStats.lastAction = 'learning';
+        }
+
+        blockHashSnapshots.clear();
+        if (Array.isArray(snapshot.blockHashSnapshots)) {
+            for (const entry of snapshot.blockHashSnapshots.slice(-MAX_BLOCK_HASH_SNAPSHOTS)) {
+                if (Array.isArray(entry) && typeof entry[0] === 'string' && isPlainObject(entry[1])) {
+                    blockHashSnapshots.set(entry[0], safeJsonClone(entry[1]));
+                }
+            }
+        }
+        lastBlockHashComparison = isPlainObject(snapshot.lastBlockHashComparison)
+            ? safeJsonClone(snapshot.lastBlockHashComparison)
+            : null;
+        persistenceStatus.runtimeState.loaded = true;
+        persistenceStatus.runtimeState.notice = null;
+        return true;
+    } catch (error) {
+        cacheAnchorStore.clear('persisted-state-invalid');
+        prefixLock = null;
+        blockHashSnapshots.clear();
+        lastBlockHashComparison = null;
+        persistenceStatus.runtimeState.lastError = error?.message || String(error);
+        persistenceStatus.runtimeState.notice = '运行状态文件内容无效，已使用空学习状态。';
+        return false;
+    }
+}
+
+function restorePersistedRequestLogs() {
+    const snapshot = readPersistedJson(REQUEST_LOG_FILE, 'requestLogs');
+    if (!snapshot) {
+        return false;
+    }
+
+    if (!isPlainObject(snapshot)
+        || Number(snapshot.schemaVersion) !== REQUEST_LOG_SCHEMA_VERSION
+        || !Array.isArray(snapshot.captures)) {
+        persistenceStatus.requestLogs.notice = '请求日志文件版本或格式不兼容，已忽略旧数据。';
+        return false;
+    }
+
+    const seen = new Set();
+    for (const capture of snapshot.captures) {
+        if (!isPlainObject(capture) || typeof capture.id !== 'string' || seen.has(capture.id)) {
+            continue;
+        }
+        seen.add(capture.id);
+        requestCaptures.push(safeJsonClone(capture));
+    }
+    const trimmed = trimRequestCaptures();
+    persistenceStatus.requestLogs.loaded = true;
+    persistenceStatus.requestLogs.notice = null;
+    if (trimmed) {
+        scheduleRequestLogsPersist();
+    }
+    return true;
+}
+
+function flushPersistedData() {
+    if (runtimeStatePersistTimer) {
+        persistRuntimeStateNow();
+    }
+    if (requestLogsPersistTimer) {
+        persistRequestLogsNow();
+    }
+}
+
+function clearCacheAnchorState(reason) {
+    cacheAnchorStore.clear(reason);
+    scheduleRuntimeStatePersist({ immediate: true });
+}
+
+function getPersistenceStatus() {
+    return safeJsonClone(persistenceStatus);
 }
 
 function mergeDefaultRuntimeSettings(saved = {}, defaults = {}) {
@@ -466,10 +809,15 @@ function migrateRuntimeSettings(rawSettings = {}) {
                 : (normalizeBoolean(rawSettings.autoGenerateCacheBreakpoints, false) ? 'on' : 'off'),
         ),
         captureRequests: normalizeBoolean(rawSettings.captureRequests, false),
+        maxRequestCaptures: normalizeMaxRequestCaptures(rawSettings.maxRequestCaptures),
         usageAppearance: normalizeUsageAppearance(rawSettings.usageAppearance),
+        usagePreviewSample: normalizeUsagePreviewSample(rawSettings.usagePreviewSample),
+        requestCacheAppearance: normalizeRequestCacheAppearance(rawSettings.requestCacheAppearance),
+        prefixLockEnabled: normalizeBoolean(rawSettings.prefixLockEnabled, false),
         fixedHeadBreakpointCount: normalizeFixedHeadBreakpointCount(rawSettings.fixedHeadBreakpointCount),
         cacheAnchorMode: normalizeCacheAnchorMode(rawSettings.cacheAnchorMode),
         cacheAnchorIntervalBlocks: normalizeCacheAnchorIntervalBlocks(rawSettings.cacheAnchorIntervalBlocks),
+        cachePolicyProcessingOrder: normalizeCachePolicyProcessingOrder(rawSettings.cachePolicyProcessingOrder),
         autoConvertLastAnchorTo5m: cacheEnhancements.autoConvertLastAnchorTo5m,
         ignoreLastAnchorsMode: cacheEnhancements.ignoreLastAnchorsMode,
         ignoreLastAnchorCount: cacheEnhancements.ignoreLastAnchorCount,
@@ -549,11 +897,16 @@ function saveRuntimeSettings() {
         systemMessageHandlingMode,
         autoGenerateCacheBreakpointsMode,
         captureRequests,
+        maxRequestCaptures,
         usageAppearance,
+        usagePreviewSample,
+        requestCacheAppearance,
+        prefixLockEnabled,
         cacheTtl: getCacheTtlLabel(),
         fixedHeadBreakpointCount,
         cacheAnchorMode,
         cacheAnchorIntervalBlocks,
+        cachePolicyProcessingOrder,
         autoConvertLastAnchorTo5m,
         ignoreLastAnchorsMode,
         ignoreLastAnchorCount,
@@ -565,6 +918,165 @@ function saveRuntimeSettings() {
         upstreamHeaders,
         upstreamExcludeHeaders,
     }, null, 2)}\n`);
+    scheduleRuntimeStatePersist();
+}
+
+function getExportedConfiguration() {
+    return {
+        schemaVersion: SETTINGS_SCHEMA_VERSION,
+        exportedAt: new Date().toISOString(),
+        upstreamMode,
+        upstreamBaseUrl,
+        cacheTranslationEnabled,
+        systemMessageHandlingMode,
+        autoGenerateCacheBreakpointsMode,
+        captureRequests,
+        maxRequestCaptures,
+        usageAppearance: safeJsonClone(usageAppearance),
+        usagePreviewSample: safeJsonClone(usagePreviewSample),
+        requestCacheAppearance: safeJsonClone(requestCacheAppearance),
+        prefixLockEnabled,
+        cacheTtl: getCacheTtlLabel(),
+        fixedHeadBreakpointCount,
+        cacheAnchorMode,
+        cacheAnchorIntervalBlocks,
+        cachePolicyProcessingOrder: [...cachePolicyProcessingOrder],
+        autoConvertLastAnchorTo5m,
+        ignoreLastAnchorsMode,
+        ignoreLastAnchorCount,
+        upstreamExtraJson: safeJsonClone(upstreamExtraJson),
+        upstreamExcludePaths: [...upstreamExcludePaths],
+        upstreamHeaders: safeJsonClone(upstreamHeaders),
+        upstreamExcludeHeaders: [...upstreamExcludeHeaders],
+    };
+}
+
+function normalizeImportedBoolean(source, key, fallback) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) {
+        return fallback;
+    }
+    if (typeof source[key] !== 'boolean') {
+        throw new Error(`${key} must be a boolean.`);
+    }
+    return source[key];
+}
+
+function normalizeImportedConfiguration(value) {
+    const source = isPlainObject(value?.config) ? value.config : value;
+    if (!isPlainObject(source)) {
+        throw new Error('Imported configuration must be a JSON object.');
+    }
+
+    const importedExtraJson = Object.prototype.hasOwnProperty.call(source, 'upstreamExtraJson')
+        ? normalizeUpstreamExtraJson(source.upstreamExtraJson)
+        : safeJsonClone(upstreamExtraJson);
+    assertSafeProfileJson(importedExtraJson);
+
+    return {
+        cacheTranslationEnabled: normalizeImportedBoolean(source, 'cacheTranslationEnabled', cacheTranslationEnabled),
+        systemMessageHandlingMode: Object.prototype.hasOwnProperty.call(source, 'systemMessageHandlingMode')
+            ? normalizeSystemMessageHandlingMode(source.systemMessageHandlingMode, { strict: true })
+            : systemMessageHandlingMode,
+        autoGenerateCacheBreakpointsMode: Object.prototype.hasOwnProperty.call(source, 'autoGenerateCacheBreakpointsMode')
+            ? normalizeAutoGenerateCacheBreakpointsMode(source.autoGenerateCacheBreakpointsMode, { strict: true })
+            : autoGenerateCacheBreakpointsMode,
+        captureRequests: normalizeImportedBoolean(source, 'captureRequests', captureRequests),
+        maxRequestCaptures: Object.prototype.hasOwnProperty.call(source, 'maxRequestCaptures')
+            ? normalizeMaxRequestCaptures(source.maxRequestCaptures, { strict: true })
+            : maxRequestCaptures,
+        usageAppearance: Object.prototype.hasOwnProperty.call(source, 'usageAppearance')
+            ? normalizeUsageAppearance(source.usageAppearance, { strict: true })
+            : safeJsonClone(usageAppearance),
+        usagePreviewSample: Object.prototype.hasOwnProperty.call(source, 'usagePreviewSample')
+            ? normalizeUsagePreviewSample(source.usagePreviewSample, { strict: true })
+            : safeJsonClone(usagePreviewSample),
+        requestCacheAppearance: Object.prototype.hasOwnProperty.call(source, 'requestCacheAppearance')
+            ? normalizeRequestCacheAppearance(source.requestCacheAppearance, { strict: true })
+            : safeJsonClone(requestCacheAppearance),
+        prefixLockEnabled: normalizeImportedBoolean(source, 'prefixLockEnabled', prefixLockEnabled),
+        cacheTtl: Object.prototype.hasOwnProperty.call(source, 'cacheTtl')
+            ? normalizeCacheTtl(source.cacheTtl, { strict: true })
+            : cacheTtl,
+        fixedHeadBreakpointCount: Object.prototype.hasOwnProperty.call(source, 'fixedHeadBreakpointCount')
+            ? normalizeFixedHeadBreakpointCount(source.fixedHeadBreakpointCount, { strict: true })
+            : fixedHeadBreakpointCount,
+        cacheAnchorMode: Object.prototype.hasOwnProperty.call(source, 'cacheAnchorMode')
+            ? normalizeCacheAnchorMode(source.cacheAnchorMode, { strict: true })
+            : cacheAnchorMode,
+        cacheAnchorIntervalBlocks: Object.prototype.hasOwnProperty.call(source, 'cacheAnchorIntervalBlocks')
+            ? normalizeCacheAnchorIntervalBlocks(source.cacheAnchorIntervalBlocks, { strict: true })
+            : cacheAnchorIntervalBlocks,
+        cachePolicyProcessingOrder: Object.prototype.hasOwnProperty.call(source, 'cachePolicyProcessingOrder')
+            ? normalizeCachePolicyProcessingOrder(source.cachePolicyProcessingOrder, { strict: true })
+            : [...cachePolicyProcessingOrder],
+        autoConvertLastAnchorTo5m: normalizeImportedBoolean(
+            source,
+            'autoConvertLastAnchorTo5m',
+            autoConvertLastAnchorTo5m,
+        ),
+        ignoreLastAnchorsMode: Object.prototype.hasOwnProperty.call(source, 'ignoreLastAnchorsMode')
+            ? normalizeIgnoredAnchorMode(source.ignoreLastAnchorsMode, { strict: true })
+            : ignoreLastAnchorsMode,
+        ignoreLastAnchorCount: Object.prototype.hasOwnProperty.call(source, 'ignoreLastAnchorCount')
+            ? normalizeIgnoredAnchorCount(source.ignoreLastAnchorCount, {
+                strict: true,
+                allowEvaluationOverflow: true,
+            })
+            : ignoreLastAnchorCount,
+        upstreamExtraJson: importedExtraJson,
+        upstreamExcludePaths: Object.prototype.hasOwnProperty.call(source, 'upstreamExcludePaths')
+            ? normalizeUpstreamExcludePaths(source.upstreamExcludePaths)
+            : [...upstreamExcludePaths],
+        upstreamHeaders: Object.prototype.hasOwnProperty.call(source, 'upstreamHeaders')
+            ? normalizeUpstreamHeaders(source.upstreamHeaders)
+            : safeJsonClone(upstreamHeaders),
+        upstreamExcludeHeaders: Object.prototype.hasOwnProperty.call(source, 'upstreamExcludeHeaders')
+            ? normalizeUpstreamExcludeHeaders(source.upstreamExcludeHeaders)
+            : [...upstreamExcludeHeaders],
+    };
+}
+
+function applyImportedConfiguration(value, reason = 'config-imported') {
+    const next = normalizeImportedConfiguration(value);
+    cacheTranslationEnabled = next.cacheTranslationEnabled;
+    systemMessageHandlingMode = next.systemMessageHandlingMode;
+    autoGenerateCacheBreakpointsMode = next.autoGenerateCacheBreakpointsMode;
+    captureRequests = next.captureRequests;
+    maxRequestCaptures = next.maxRequestCaptures;
+    usageAppearance = next.usageAppearance;
+    usagePreviewSample = next.usagePreviewSample;
+    requestCacheAppearance = next.requestCacheAppearance;
+    cacheTtl = next.cacheTtl;
+    fixedHeadBreakpointCount = next.fixedHeadBreakpointCount;
+    cacheAnchorMode = next.cacheAnchorMode;
+    cacheAnchorIntervalBlocks = next.cacheAnchorIntervalBlocks;
+    cachePolicyProcessingOrder = [...next.cachePolicyProcessingOrder];
+    autoConvertLastAnchorTo5m = next.autoConvertLastAnchorTo5m;
+    ignoreLastAnchorsMode = next.ignoreLastAnchorsMode;
+    ignoreLastAnchorCount = next.ignoreLastAnchorsMode === 'evaluation'
+        ? INITIAL_EVALUATION_IGNORED_ANCHORS
+        : next.ignoreLastAnchorCount;
+    anchorIgnoreEvaluation = next.ignoreLastAnchorsMode === 'evaluation'
+        ? createAnchorEvaluationState(INITIAL_EVALUATION_IGNORED_ANCHORS)
+        : null;
+    if (anchorIgnoreEvaluation) {
+        anchorIgnoreEvaluation.reason = reason;
+        anchorIgnoreEvaluation.notice = `评估模式已开启：x 已设为 0，请连续进行 ${ANCHOR_EVALUATION_REQUESTS} 次对话。`;
+    }
+
+    upstreamExtraJson = next.upstreamExtraJson;
+    upstreamExcludePaths = next.upstreamExcludePaths;
+    upstreamHeaders = next.upstreamHeaders;
+    upstreamExcludeHeaders = next.upstreamExcludeHeaders;
+    prefixLockEnabled = next.cacheAnchorMode === 'off' ? next.prefixLockEnabled : false;
+    clearPrefixLock();
+    clearCacheAnchorState(reason);
+    trimRequestCaptures();
+    syncActiveChannelFromRuntime();
+    saveRuntimeSettings();
+    scheduleRequestLogsPersist({ immediate: true });
+    scheduleRuntimeStatePersist({ immediate: true });
+    return getRuntimeState();
 }
 
 function getRuntimeConfigValue(name, savedValue, defaultValue) {
@@ -692,6 +1204,85 @@ function normalizeUsageAppearance(value, { strict = false } = {}) {
             le90: normalizeUsageColorStyle(hitRate.le90, DEFAULT_USAGE_APPEARANCE.hitRate.le90, { strict, path: 'usageAppearance.hitRate.le90' }),
             le100: normalizeUsageColorStyle(hitRate.le100, DEFAULT_USAGE_APPEARANCE.hitRate.le100, { strict, path: 'usageAppearance.hitRate.le100' }),
         },
+    };
+}
+
+function normalizeMaxRequestCaptures(value, { strict = false } = {}) {
+    const number = Number(value ?? DEFAULT_MAX_REQUEST_CAPTURES);
+
+    if (Number.isInteger(number) && number >= 1 && number <= MAX_REQUEST_CAPTURE_LIMIT) {
+        return number;
+    }
+
+    if (strict) {
+        throw new Error(`maxRequestCaptures must be an integer from 1 to ${MAX_REQUEST_CAPTURE_LIMIT}.`);
+    }
+
+    return DEFAULT_MAX_REQUEST_CAPTURES;
+}
+
+function normalizeUsagePreviewSample(value, { strict = false } = {}) {
+    const source = isPlainObject(value) ? value : {};
+    const fields = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'cacheHitRatePercent'];
+
+    if (strict && (!isPlainObject(value) || fields.some((field) => !Object.prototype.hasOwnProperty.call(source, field)))) {
+        throw new Error(`usagePreviewSample must include ${fields.join(', ')}.`);
+    }
+
+    function token(field) {
+        const number = Number(source[field] ?? DEFAULT_USAGE_PREVIEW_SAMPLE[field]);
+        if (Number.isInteger(number) && number >= 0) {
+            return number;
+        }
+        if (strict) {
+            throw new Error(`usagePreviewSample.${field} must be a non-negative integer.`);
+        }
+        return DEFAULT_USAGE_PREVIEW_SAMPLE[field];
+    }
+
+    const rate = Number(source.cacheHitRatePercent ?? DEFAULT_USAGE_PREVIEW_SAMPLE.cacheHitRatePercent);
+    if ((!Number.isFinite(rate) || rate < 0 || rate > 100) && strict) {
+        throw new Error('usagePreviewSample.cacheHitRatePercent must be a number from 0 to 100.');
+    }
+
+    return {
+        inputTokens: token('inputTokens'),
+        outputTokens: token('outputTokens'),
+        cacheReadTokens: token('cacheReadTokens'),
+        cacheWriteTokens: token('cacheWriteTokens'),
+        cacheHitRatePercent: Number.isFinite(rate) && rate >= 0 && rate <= 100
+            ? rate
+            : DEFAULT_USAGE_PREVIEW_SAMPLE.cacheHitRatePercent,
+    };
+}
+
+function normalizeRequestCacheAppearance(value, { strict = false } = {}) {
+    const source = isPlainObject(value) ? value : {};
+    const requiredKeys = ['prefixLock', 'cacheAnchor', 'cacheBudgetInsufficient', 'blockHashChange'];
+
+    if (strict && (!isPlainObject(value) || requiredKeys.some((key) => !Object.prototype.hasOwnProperty.call(source, key)))) {
+        throw new Error('requestCacheAppearance must include prefixLock, cacheAnchor, cacheBudgetInsufficient, and blockHashChange.');
+    }
+
+    return {
+        prefixLock: normalizeUsageColorStyle(source.prefixLock, DEFAULT_REQUEST_CACHE_APPEARANCE.prefixLock, {
+            strict,
+            path: 'requestCacheAppearance.prefixLock',
+        }),
+        cacheAnchor: normalizeUsageColorStyle(source.cacheAnchor, DEFAULT_REQUEST_CACHE_APPEARANCE.cacheAnchor, {
+            strict,
+            path: 'requestCacheAppearance.cacheAnchor',
+        }),
+        cacheBudgetInsufficient: normalizeUsageColorStyle(
+            source.cacheBudgetInsufficient,
+            DEFAULT_REQUEST_CACHE_APPEARANCE.cacheBudgetInsufficient,
+            { strict, path: 'requestCacheAppearance.cacheBudgetInsufficient' },
+        ),
+        blockHashChange: normalizeUsageColorStyle(
+            source.blockHashChange,
+            DEFAULT_REQUEST_CACHE_APPEARANCE.blockHashChange,
+            { strict, path: 'requestCacheAppearance.blockHashChange' },
+        ),
     };
 }
 
@@ -1116,6 +1707,7 @@ function startAnchorIgnoreEvaluation(reason = 'manual-start') {
     anchorIgnoreEvaluation.notice = `评估模式已开启：x 已设为 0，请连续进行 ${ANCHOR_EVALUATION_REQUESTS} 次对话。`;
     ignoreLastAnchorsMode = 'evaluation';
     ignoreLastAnchorCount = INITIAL_EVALUATION_IGNORED_ANCHORS;
+    scheduleRuntimeStatePersist();
     return getAnchorIgnoreEvaluationState();
 }
 
@@ -1230,8 +1822,10 @@ function recordSuccessfulAnchorEvaluation(plan) {
 
     if (plan._capture) {
         plan._capture.gateway.anchorIgnoreEvaluation = getAnchorIgnoreEvaluationState();
+        scheduleRequestLogsPersist();
     }
 
+    scheduleRuntimeStatePersist({ immediate: true });
     return outcome;
 }
 
@@ -1240,6 +1834,7 @@ function getCachePolicy() {
         fixedHeadBreakpointCount,
         cacheAnchorMode,
         cacheAnchorIntervalBlocks,
+        cachePolicyProcessingOrder: [...cachePolicyProcessingOrder],
         autoConvertLastAnchorTo5m,
         autoConvertLastAnchorToShortTtl: autoConvertLastAnchorTo5m,
         ignoreLastAnchorsMode,
@@ -1315,6 +1910,7 @@ function commitRequestCache(plan, upstreamResponse) {
     }
 
     recordSuccessfulAnchorEvaluation(plan);
+    scheduleRuntimeStatePersist({ immediate: true });
     return committed;
 }
 
@@ -1360,6 +1956,7 @@ function getRuntimeState() {
         fixedHeadBreakpointCount,
         cacheAnchorMode,
         cacheAnchorIntervalBlocks,
+        cachePolicyProcessingOrder: [...cachePolicyProcessingOrder],
         autoConvertLastAnchorTo5m,
         autoConvertLastAnchorToShortTtl: autoConvertLastAnchorTo5m,
         ignoreLastAnchorsMode,
@@ -1385,8 +1982,12 @@ function getRuntimeState() {
         upstreamExcludeHeadersText: getUpstreamExcludeHeadersText(),
         upstreamExcludeHeadersEnabled: upstreamExcludeHeaders.length > 0,
         captureRequests,
+        maxRequestCaptures,
         usageAppearance: safeJsonClone(usageAppearance),
+        usagePreviewSample: safeJsonClone(usagePreviewSample),
+        requestCacheAppearance: safeJsonClone(requestCacheAppearance),
         capturedRequests: requestCaptures.length,
+        persistence: getPersistenceStatus(),
         anthropicInboundEnabled: true,
         prefixLockEnabled,
         prefixLockActive: Boolean(prefixLock),
@@ -1990,6 +2591,7 @@ function compareAndRememberPromptBlockHashes(body, mode) {
         blockHashSnapshots.delete(blockHashSnapshots.keys().next().value);
     }
     lastBlockHashComparison = snapshot;
+    scheduleRuntimeStatePersist();
     return snapshot;
 }
 
@@ -2258,6 +2860,8 @@ function updatePrefixLockStats(action, reason = null) {
     if (action === 'replaced') {
         prefixLockStats.replacements++;
     }
+
+    scheduleRuntimeStatePersist({ immediate: true });
 }
 
 function clearPrefixLock() {
@@ -2562,6 +3166,8 @@ function addRequestCapture({ request, originalBody, convertedBody, result, inbou
             bodyHash: getBodyHash(originalBody),
         },
         gateway: {
+            channelId: activeChannelId,
+            channelName: getActiveChannel()?.name ?? null,
             upstreamMode,
             cacheTranslationEnabled,
             systemMessageHandlingMode,
@@ -2593,11 +3199,8 @@ function addRequestCapture({ request, originalBody, convertedBody, result, inbou
     };
 
     requestCaptures.unshift(capture);
-
-    if (requestCaptures.length > MAX_REQUEST_CAPTURES) {
-        requestCaptures.length = MAX_REQUEST_CAPTURES;
-    }
-
+    trimRequestCaptures();
+    scheduleRequestLogsPersist();
     return capture;
 }
 
@@ -2639,6 +3242,7 @@ function setCaptureUpstream(capture, { url, method, headers, body, mode, plan = 
         blockHashComparison: safeJsonClone(blockHashComparison),
         cache: cacheDiagnostics,
     };
+    scheduleRequestLogsPersist();
     return blockHashComparison;
 }
 
@@ -2660,6 +3264,7 @@ function setCaptureResponse(capture, upstreamResponse, text = null, json = null)
         cacheResult: usage ? getCacheResultFromUsage(usage) : 'unknown',
         upstreamProvider,
     };
+    scheduleRequestLogsPersist({ immediate: true });
 }
 
 function mergeCaptureUsage(capture, usage) {
@@ -2682,6 +3287,7 @@ function mergeCaptureUsage(capture, usage) {
 
     capture.response.usage = next;
     capture.response.cacheResult = getCacheResultFromUsage(next);
+    scheduleRequestLogsPersist({ immediate: true });
 }
 
 function mergeCaptureUsageFromSseJson(capture, json, mode) {
@@ -3824,6 +4430,8 @@ function getCaptureSummary(capture) {
         cacheTtl: capture.gateway?.cacheTtl ?? null,
         inboundMode: capture.inbound?.mode ?? null,
         upstreamMode: capture.gateway?.upstreamMode ?? null,
+        channelId: capture.gateway?.channelId ?? null,
+        channelName: capture.gateway?.channelName ?? null,
         upstreamUrl: capture.upstream?.url ?? null,
         injected: capture.gateway?.conversion?.injected ?? 0,
         removed: capture.gateway?.conversion?.removed ?? 0,
@@ -3983,6 +4591,52 @@ async function handleConsoleApi(request, url) {
         return jsonResponse(getRuntimeState());
     }
 
+    if (request.method === 'GET' && url.pathname === '/console/config/export') {
+        const exported = getExportedConfiguration();
+        if (url.searchParams.get('download') === '1') {
+            return new Response(`${JSON.stringify(exported, null, 2)}\n`, {
+                status: 200,
+                headers: addCorsHeaders(new Headers({
+                    'content-type': 'application/json; charset=utf-8',
+                    'content-disposition': 'attachment; filename="st-claude-cache-gateway-config.json"',
+                    'cache-control': 'no-store',
+                })),
+            });
+        }
+        return jsonResponse(exported);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/console/config/import') {
+        try {
+            const body = await readJsonRequest(request);
+            const state = applyImportedConfiguration(body, 'config-imported');
+            log('Imported console configuration while preserving upstream mode and base URL.', {
+                upstreamMode,
+                upstreamBaseUrl,
+            });
+            return jsonResponse(state);
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/console/config/reset') {
+        try {
+            const defaults = loadJsonSettings(DEFAULT_SETTINGS_FILE);
+            if (!isPlainObject(defaults) || Object.keys(defaults).length === 0) {
+                throw new Error('default-gateway-settings.json is missing or does not contain a JSON object.');
+            }
+            const state = applyImportedConfiguration(defaults, 'default-config-restored');
+            log('Restored console configuration from default-gateway-settings.json.', {
+                upstreamMode,
+                upstreamBaseUrl,
+            });
+            return jsonResponse(state);
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
+    }
+
     if (request.method === 'POST' && url.pathname === '/console/cache-ttl') {
         try {
             const body = await readJsonRequest(request);
@@ -4026,7 +4680,7 @@ async function handleConsoleApi(request, url) {
 
             if (nextMode !== systemMessageHandlingMode) {
                 systemMessageHandlingMode = nextMode;
-                cacheAnchorStore.clear('system-message-handling-changed');
+                clearCacheAnchorState('system-message-handling-changed');
                 clearPrefixLock();
             }
 
@@ -4050,7 +4704,7 @@ async function handleConsoleApi(request, url) {
 
             if (nextMode !== systemMessageHandlingMode) {
                 systemMessageHandlingMode = nextMode;
-                cacheAnchorStore.clear('system-message-handling-changed');
+                clearCacheAnchorState('system-message-handling-changed');
                 clearPrefixLock();
             }
 
@@ -4086,7 +4740,7 @@ async function handleConsoleApi(request, url) {
 
             if (nextMode !== autoGenerateCacheBreakpointsMode) {
                 autoGenerateCacheBreakpointsMode = nextMode;
-                cacheAnchorStore.clear('auto-breakpoints-changed');
+                clearCacheAnchorState('auto-breakpoints-changed');
                 clearPrefixLock();
                 saveRuntimeSettings();
             }
@@ -4108,7 +4762,7 @@ async function handleConsoleApi(request, url) {
                 throw new Error('enabled is required and must be a boolean.');
             }
             autoConvertLastAnchorTo5m = body.enabled;
-            cacheAnchorStore.clear('last-anchor-ttl-changed');
+            clearCacheAnchorState('last-anchor-ttl-changed');
             saveRuntimeSettings();
             return jsonResponse(getRuntimeState());
         } catch (error) {
@@ -4144,7 +4798,7 @@ async function handleConsoleApi(request, url) {
                 ignoreLastAnchorCount = count;
                 anchorIgnoreEvaluation = null;
             }
-            cacheAnchorStore.clear('ignore-last-anchors-changed');
+            clearCacheAnchorState('ignore-last-anchors-changed');
             saveRuntimeSettings();
             return jsonResponse(getRuntimeState());
         } catch (error) {
@@ -4165,6 +4819,9 @@ async function handleConsoleApi(request, url) {
             const nextFixedHeadBreakpointCount = normalizeFixedHeadBreakpointCount(body?.fixedHeadBreakpointCount, { strict: true });
             const nextCacheAnchorMode = normalizeCacheAnchorMode(body?.cacheAnchorMode, { strict: true });
             const nextCacheAnchorIntervalBlocks = normalizeCacheAnchorIntervalBlocks(body?.cacheAnchorIntervalBlocks, { strict: true });
+            const nextCachePolicyProcessingOrder = Object.prototype.hasOwnProperty.call(body || {}, 'cachePolicyProcessingOrder')
+                ? normalizeCachePolicyProcessingOrder(body.cachePolicyProcessingOrder, { strict: true })
+                : [...cachePolicyProcessingOrder];
             const enhancementInput = { ...(body || {}) };
             if (!Object.keys(enhancementInput).some((key) => [
                 'autoConvertLastAnchorTo5m',
@@ -4206,9 +4863,11 @@ async function handleConsoleApi(request, url) {
                     body,
                 )
                 : INITIAL_EVALUATION_IGNORED_ANCHORS;
+            const orderChanged = JSON.stringify(nextCachePolicyProcessingOrder) !== JSON.stringify(cachePolicyProcessingOrder);
             const coreChanged = nextFixedHeadBreakpointCount !== fixedHeadBreakpointCount
                 || nextCacheAnchorMode !== cacheAnchorMode
-                || nextCacheAnchorIntervalBlocks !== cacheAnchorIntervalBlocks;
+                || nextCacheAnchorIntervalBlocks !== cacheAnchorIntervalBlocks
+                || orderChanged;
             const enhancementChanged = nextAutoConvertLastAnchorTo5m !== autoConvertLastAnchorTo5m
                 || nextIgnoreLastAnchorsMode !== ignoreLastAnchorsMode
                 || nextIgnoreLastAnchorCount !== ignoreLastAnchorCount;
@@ -4216,6 +4875,7 @@ async function handleConsoleApi(request, url) {
             fixedHeadBreakpointCount = nextFixedHeadBreakpointCount;
             cacheAnchorMode = nextCacheAnchorMode;
             cacheAnchorIntervalBlocks = nextCacheAnchorIntervalBlocks;
+            cachePolicyProcessingOrder = [...nextCachePolicyProcessingOrder];
             autoConvertLastAnchorTo5m = nextAutoConvertLastAnchorTo5m;
 
             if (nextIgnoreLastAnchorsMode === 'evaluation'
@@ -4239,10 +4899,12 @@ async function handleConsoleApi(request, url) {
             if (cacheAnchorMode !== 'off') {
                 prefixLockEnabled = false;
                 clearPrefixLock();
+            } else if (orderChanged) {
+                clearPrefixLock();
             }
 
             if (coreChanged || enhancementChanged) {
-                cacheAnchorStore.clear('policy-changed');
+                clearCacheAnchorState(orderChanged ? 'processing-order-changed' : 'policy-changed');
             }
 
             saveRuntimeSettings();
@@ -4267,7 +4929,7 @@ async function handleConsoleApi(request, url) {
 
             if (['start', 'restart', 'evaluate', 'evaluation'].includes(action)) {
                 startAnchorIgnoreEvaluation(`console-${action}`);
-                cacheAnchorStore.clear('anchor-ignore-evaluation-started');
+                clearCacheAnchorState('anchor-ignore-evaluation-started');
                 saveRuntimeSettings();
                 return jsonResponse({ ...getRuntimeState(), evaluationNotice: anchorIgnoreEvaluation.notice });
             }
@@ -4287,7 +4949,7 @@ async function handleConsoleApi(request, url) {
                 ignoreLastAnchorsMode = 'fixed';
                 ignoreLastAnchorCount = count;
                 anchorIgnoreEvaluation = null;
-                cacheAnchorStore.clear('anchor-ignore-evaluation-accepted');
+                clearCacheAnchorState('anchor-ignore-evaluation-accepted');
                 saveRuntimeSettings();
                 return jsonResponse(getRuntimeState());
             }
@@ -4299,7 +4961,7 @@ async function handleConsoleApi(request, url) {
     }
 
     if (request.method === 'POST' && url.pathname === '/console/cache-anchors/clear') {
-        cacheAnchorStore.clear('manual-clear');
+        clearCacheAnchorState('manual-clear');
         log('Cleared learned cache anchors from console.', getCachePolicy());
         return jsonResponse(getRuntimeState());
     }
@@ -4383,15 +5045,61 @@ async function handleConsoleApi(request, url) {
         const body = await readJsonRequest(request);
 
         try {
-            usageAppearance = body?.reset === true
-                ? normalizeUsageAppearance(DEFAULT_USAGE_APPEARANCE)
-                : normalizeUsageAppearance(body?.value, { strict: true });
+            if (body?.reset === true) {
+                usageAppearance = normalizeUsageAppearance(DEFAULT_USAGE_APPEARANCE);
+            } else if (Object.prototype.hasOwnProperty.call(body || {}, 'value')) {
+                usageAppearance = normalizeUsageAppearance(body.value, { strict: true });
+            }
+
+            if (body?.resetSample === true) {
+                usagePreviewSample = normalizeUsagePreviewSample(DEFAULT_USAGE_PREVIEW_SAMPLE);
+            } else if (Object.prototype.hasOwnProperty.call(body || {}, 'previewSample')) {
+                usagePreviewSample = normalizeUsagePreviewSample(body.previewSample, { strict: true });
+            }
         } catch (error) {
             return jsonResponse({ error: error.message }, 400);
         }
 
         saveRuntimeSettings();
-        log('Updated Usage appearance from console.', { reset: body?.reset === true });
+        log('Updated Usage appearance from console.', {
+            reset: body?.reset === true,
+            resetSample: body?.resetSample === true,
+        });
+        return jsonResponse(getRuntimeState());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/console/request-cache-appearance') {
+        const body = await readJsonRequest(request);
+
+        try {
+            requestCacheAppearance = body?.reset === true
+                ? normalizeRequestCacheAppearance(DEFAULT_REQUEST_CACHE_APPEARANCE)
+                : normalizeRequestCacheAppearance(body?.value, { strict: true });
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
+
+        saveRuntimeSettings();
+        log('Updated Prefix and cache-anchor appearance from console.', { reset: body?.reset === true });
+        return jsonResponse(getRuntimeState());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/console/request-log-settings') {
+        const body = await readJsonRequest(request);
+
+        try {
+            maxRequestCaptures = normalizeMaxRequestCaptures(
+                body?.maxRequestCaptures ?? body?.maxEntries,
+                { strict: true },
+            );
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
+
+        const trimmed = trimRequestCaptures();
+        saveRuntimeSettings();
+        scheduleRequestLogsPersist({ immediate: true });
+        log('Updated request log retention.', { maxRequestCaptures, trimmed });
         return jsonResponse(getRuntimeState());
     }
 
@@ -4409,8 +5117,7 @@ async function handleConsoleApi(request, url) {
 
         if (prefixLockEnabled && cacheAnchorMode !== 'off') {
             cacheAnchorMode = 'off';
-            cacheAnchorStore.clear('prefix-lock-enabled');
-            saveRuntimeSettings();
+            clearCacheAnchorState('prefix-lock-enabled');
         }
 
         if (!prefixLockEnabled) {
@@ -4419,6 +5126,7 @@ async function handleConsoleApi(request, url) {
             updatePrefixLockStats(prefixLock ? 'enabled' : 'learning');
         }
 
+        saveRuntimeSettings();
         log('Updated prefix lock setting from console.', { prefixLockEnabled, prefixLockActive: Boolean(prefixLock) });
         return jsonResponse(getRuntimeState());
     }
@@ -4448,6 +5156,8 @@ async function handleConsoleApi(request, url) {
         requestCaptures.length = 0;
         blockHashSnapshots.clear();
         lastBlockHashComparison = null;
+        scheduleRequestLogsPersist({ immediate: true });
+        scheduleRuntimeStatePersist({ immediate: true });
         return jsonResponse({ ok: true });
     }
 
@@ -4526,6 +5236,14 @@ async function handleRequest(request) {
         log('Request failed.', { message: error.message, name: error.name });
         return jsonResponse({ error: error.message, name: error.name }, 500);
     }
+}
+
+process.once('exit', flushPersistedData);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, () => {
+        flushPersistedData();
+        process.exit(0);
+    });
 }
 
 if (typeof Bun !== 'undefined') {

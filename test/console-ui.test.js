@@ -45,7 +45,8 @@ function loadConsoleHelpers() {
         + 'tableCell, countCharacters, getOrderedBodySegments, groupBodySegmentsForDisplay, displayGroupCharacterCount, '
         + 'promptTokensFromUsage, usageStatistics, usageRateLabel, usageRateBand, renderUsageLines, getPromptTokenEstimate, renderRequestBodyStream, '
         + 'candidateBreakpoints, unusedCandidateBreakpoints, getBlockHashEntries, estimatedTokens, promptEstimateLabel, inputPromptTokenLabel, systemMessageHandlingMode, systemMessageHandlingLabel, '
-        + 'prefixLockStatusLabel, requestCacheAnchorMode, cacheAnchorRequestLabel, anchorActionLabel, anchorReasonLabel, renderRequestCacheSummary\n};', context);
+        + 'prefixLockStatusLabel, requestCacheAnchorMode, cacheAnchorRequestLabel, anchorActionLabel, anchorReasonLabel, renderRequestCacheSummary, '
+        + 'normalizeProcessingOrder, processingOrderRiskMessages, calculateUsagePreviewSample\n};', context);
     return context.__helpers;
 }
 
@@ -80,9 +81,9 @@ test('request-log container cells keep explicit empty strings empty', () => {
 test('request-log Prefix and anchor summary uses Chinese rows and severity chips', () => {
     const root = fakeElement('td');
     helpers.renderRequestCacheSummary(root, {
-        prefixLockEnabled: false,
-        prefixLockAction: 'skipped',
-        prefixLockReason: 'cache-anchor-enabled',
+        prefixLockEnabled: true,
+        prefixLockAction: 'replaced',
+        prefixLockReason: null,
         cacheAnchorMode: 'rolling',
         cacheTranslationEnabled: true,
         cachePolicyAction: 'promote',
@@ -98,7 +99,7 @@ test('request-log Prefix and anchor summary uses Chinese rows and severity chips
     );
     assert.deepEqual(
         elementsByClass(root, 'request-cache-summary-value').map(renderedText),
-        ['关闭', '滚动锚点', '晋升部分缓存锚点失效', '6124045f59', '6'],
+        ['开启 · 已应用', '滚动锚点', '晋升部分缓存锚点失效', '6124045f59', '6'],
     );
 
     const visible = renderedText(root);
@@ -118,8 +119,17 @@ test('request-log Prefix and anchor summary uses Chinese rows and severity chips
     });
     assert.deepEqual(
         elementsByClass(offRoot, 'request-cache-summary-label').map((entry) => entry.textContent),
-        ['强制 Prefix 锁定', '缓存锚点'],
+        ['强制 Prefix 锁定'],
     );
+
+    const fullyOffRoot = fakeElement('td');
+    helpers.renderRequestCacheSummary(fullyOffRoot, {
+        prefixLockEnabled: false,
+        prefixLockAction: 'disabled',
+        cacheAnchorMode: 'off',
+        changedBlockCount: 8,
+    });
+    assert.deepEqual(elementsByClass(fullyOffRoot, 'request-cache-summary-label'), []);
 });
 
 test('request-log Prefix statuses cover every request outcome in Chinese', () => {
@@ -127,6 +137,7 @@ test('request-log Prefix statuses cover every request outcome in Chinese', () =>
         [{ prefixLockEnabled: false, prefixLockAction: 'skipped', prefixLockReason: 'cache-anchor-enabled' }, '关闭'],
         [{ prefixLockEnabled: true, prefixLockAction: 'created' }, '开启 · 已学习'],
         [{ prefixLockEnabled: true, prefixLockAction: 'replaced' }, '开启 · 已应用'],
+        [{ prefixLockEnabled: true, prefixLockAction: 'cleared' }, '开启 · 已清空待学习'],
         [{ prefixLockEnabled: true, prefixLockAction: 'skipped', prefixLockReason: 'no-cache-control' }, '开启 · 本次无缓存点'],
         [{ prefixLockEnabled: true, prefixLockAction: 'skipped', prefixLockReason: 'mode-mismatch' }, '开启 · 上游格式不一致'],
         [{ prefixLockEnabled: true, prefixLockAction: 'skipped', prefixLockReason: 'cache-translation-disabled' }, '开启 · 已暂停'],
@@ -525,6 +536,109 @@ test('Usage appearance controls expose every metric and CSS variable', () => {
     assert.match(consoleCss, /--usage-output-text:\s*#7c3aed/i);
     assert.match(consoleCss, /grid-template-columns:\s*minmax\(0, 1fr\) 1px minmax\(0, 1fr\)/);
     assert.match(consoleCss, /font-variant-numeric:\s*tabular-nums/);
+});
+
+test('Usage preview editing keeps input, cache read, and hit rate synchronized', () => {
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+    assert.deepEqual(plain(helpers.calculateUsagePreviewSample({
+        inputTokens: 200,
+        outputTokens: 10,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 5,
+        cacheHitRatePercent: 25,
+    }, 'inputTokens')), {
+        inputTokens: 200,
+        outputTokens: 10,
+        cacheReadTokens: 50,
+        cacheWriteTokens: 5,
+        cacheHitRatePercent: 25,
+    });
+    assert.deepEqual(plain(helpers.calculateUsagePreviewSample({
+        inputTokens: 200,
+        outputTokens: 10,
+        cacheReadTokens: 60,
+        cacheWriteTokens: 5,
+        cacheHitRatePercent: 1,
+    }, 'cacheReadTokens')), {
+        inputTokens: 200,
+        outputTokens: 10,
+        cacheReadTokens: 60,
+        cacheWriteTokens: 5,
+        cacheHitRatePercent: 30,
+    });
+    assert.deepEqual(plain(helpers.calculateUsagePreviewSample({
+        inputTokens: 80,
+        outputTokens: 10,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 5,
+        cacheHitRatePercent: 12.5,
+    }, 'cacheHitRatePercent')), {
+        inputTokens: 80,
+        outputTokens: 10,
+        cacheReadTokens: 10,
+        cacheWriteTokens: 5,
+        cacheHitRatePercent: 12.5,
+    });
+
+    const html = readFileSync(new URL('../public/console.html', import.meta.url), 'utf8');
+    const script = readFileSync(new URL('../public/console.js', import.meta.url), 'utf8');
+    assert.match(html, /id="usagePreviewEditor"[^>]*hidden/);
+    assert.match(html, /id="usageAppearancePreview"[^>]*usage-preview-clickable/);
+    assert.match(html, /id="usagePreviewDone"/);
+    assert.match(script, /usageAppearancePreview'\)\.onclick/);
+});
+
+test('processing-order UI uses option titles, fixed stage numbers, disabled 5m styling, and automatic apply', () => {
+    const html = readFileSync(new URL('../public/console.html', import.meta.url), 'utf8');
+    const script = readFileSync(new URL('../public/console.js', import.meta.url), 'utf8');
+    assert.match(script, /'fixed-head': \{ label: '固定头缓存点'/);
+    assert.match(script, /'ignore-tail': \{ label: '忽略末尾锚点'/);
+    assert.match(script, /'cache-anchor': \{ label: '缓存锚点'/);
+    assert.match(script, /'last-gateway-cache-point-5m': \{ label: '末锚点自动使用 5 分钟'/);
+    assert.match(script, /DEFAULT_CACHE_POLICY_PROCESSING_ORDER\.indexOf\(stage\) \+ 1/);
+    assert.match(script, /isInactive = stage === 'last-gateway-cache-point-5m'/);
+    assert.match(script, /（未启用）/);
+    assert.match(consoleCss, /\.processing-order-item\.inactive/);
+    assert.doesNotMatch(html, /id="cachePolicyApply"/);
+    assert.match(html, /id="cachePolicyAutoSaveState">修改后自动应用/);
+    assert.match(script, /scheduleCachePolicyAutoApply/);
+
+    assert.deepEqual(
+        Array.from(helpers.normalizeProcessingOrder(['ignore-tail'])),
+        ['fixed-head', 'ignore-tail', 'cache-anchor', 'tail-fill', 'protected-tail-anchor', 'last-gateway-cache-point-5m'],
+    );
+    assert.ok(helpers.processingOrderRiskMessages([
+        'ignore-tail',
+        'fixed-head',
+        'tail-fill',
+        'cache-anchor',
+        'protected-tail-anchor',
+        'last-gateway-cache-point-5m',
+    ]).length >= 2);
+});
+
+test('Prefix and anchor appearance plus configuration management controls are exposed', () => {
+    const html = readFileSync(new URL('../public/console.html', import.meta.url), 'utf8');
+    const script = readFileSync(new URL('../public/console.js', import.meta.url), 'utf8');
+    for (const key of ['prefixLock', 'cacheAnchor', 'cacheBudgetInsufficient', 'blockHashChange']) {
+        assert.match(html, new RegExp(`data-request-cache-style="${key}"`));
+    }
+    assert.match(consoleCss, /--request-cache-prefix-lock-text:\s*#191919/i);
+    assert.match(consoleCss, /--request-cache-cache-anchor-text:\s*#191919/i);
+    assert.match(consoleCss, /--request-cache-cache-budget-insufficient-text:\s*#b25e00/i);
+    assert.match(consoleCss, /--request-cache-block-hash-change-text:\s*#b25e00/i);
+    assert.match(consoleCss, /\.request-cache-budget-insufficient-chip/);
+    assert.match(consoleCss, /\.request-cache-block-hash-change-chip/);
+    assert.match(html, /id="requestCacheAppearancePreview"/);
+    assert.match(html, /id="configImport"/);
+    assert.match(html, /id="configExport"/);
+    assert.match(html, /id="configRestoreDefault"/);
+    assert.match(script, /\/console\/config\/export/);
+    assert.match(script, /\/console\/config\/import/);
+    assert.match(script, /\/console\/config\/reset/);
+    assert.match(script, /document\.body\.appendChild\(a\)/);
+    assert.match(script, /renderUsagePreviewSampleControls\(DEFAULT_USAGE_PREVIEW_SAMPLE\)/);
+    assert.match(script, /renderUsageAppearancePreview\(\)/);
 });
 
 test('unselected cache candidates render at their original message positions only in the full body view', () => {

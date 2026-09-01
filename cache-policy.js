@@ -7,6 +7,15 @@ export const MAX_IGNORED_ANCHORS = 5;
 export const INITIAL_EVALUATION_IGNORED_ANCHORS = 0;
 export const ANCHOR_EVALUATION_REQUESTS = 3;
 export const ANCHOR_EVALUATION_SAMPLE_SIZE = 3;
+export const CACHE_POLICY_PROCESSING_STAGES = Object.freeze([
+    'fixed-head',
+    'ignore-tail',
+    'cache-anchor',
+    'tail-fill',
+    'protected-tail-anchor',
+    'last-gateway-cache-point-5m',
+]);
+export const DEFAULT_CACHE_POLICY_PROCESSING_ORDER = CACHE_POLICY_PROCESSING_STAGES;
 export const DEFAULT_CACHE_POLICY = Object.freeze({
     fixedHeadBreakpointCount: 0,
     cacheAnchorMode: 'off',
@@ -21,7 +30,9 @@ export const DEFAULT_CACHE_ENHANCEMENTS = Object.freeze({
 
 const VALID_PROTOCOLS = new Set(['openai', 'anthropic']);
 const VALID_ANCHOR_MODES = new Set(['off', 'single', 'rolling']);
+const VALID_PROCESSING_STAGES = new Set(CACHE_POLICY_PROCESSING_STAGES);
 const CACHE_CONTROL_KEY = 'cache_control';
+const ANCHOR_STORE_STATE_VERSION = 1;
 
 export class CachePolicyError extends Error {
     constructor(message, code = 'CACHE_POLICY_ERROR', details = {}) {
@@ -356,6 +367,46 @@ export function hashPromptBlock(value, metadata = null, definitions = markerDefi
     });
 }
 
+export function normalizeCachePolicyProcessingOrder(value, { strict = false } = {}) {
+    if (value === undefined || value === null || value === '') {
+        return [...DEFAULT_CACHE_POLICY_PROCESSING_ORDER];
+    }
+
+    if (!Array.isArray(value)) {
+        if (strict) {
+            throw new CachePolicyError(
+                'cachePolicyProcessingOrder must be an array containing every supported stage exactly once.',
+                'INVALID_CACHE_POLICY_PROCESSING_ORDER',
+                { cachePolicyProcessingOrder: value },
+            );
+        }
+
+        return [...DEFAULT_CACHE_POLICY_PROCESSING_ORDER];
+    }
+
+    const normalized = value.map((stage) => String(stage ?? '').trim().toLowerCase());
+    const valid = normalized.length === CACHE_POLICY_PROCESSING_STAGES.length
+        && new Set(normalized).size === CACHE_POLICY_PROCESSING_STAGES.length
+        && normalized.every((stage) => VALID_PROCESSING_STAGES.has(stage));
+
+    if (!valid) {
+        if (strict) {
+            throw new CachePolicyError(
+                'cachePolicyProcessingOrder must contain every supported stage exactly once.',
+                'INVALID_CACHE_POLICY_PROCESSING_ORDER',
+                {
+                    cachePolicyProcessingOrder: value,
+                    requiredStages: [...CACHE_POLICY_PROCESSING_STAGES],
+                },
+            );
+        }
+
+        return [...DEFAULT_CACHE_POLICY_PROCESSING_ORDER];
+    }
+
+    return normalized;
+}
+
 export function normalizeCachePolicy(input = {}) {
     const source = input || {};
     const fixedHeadBreakpointCount = Number(
@@ -419,6 +470,17 @@ export function normalizeCachePolicy(input = {}) {
         'ignoreLastAnchors',
         'ignoredAnchors',
     ];
+
+    if (hasOwn(source, 'cachePolicyProcessingOrder')) {
+        result.cachePolicyProcessingOrder = normalizeCachePolicyProcessingOrder(
+            source.cachePolicyProcessingOrder,
+            { strict: true },
+        );
+    } else {
+        Object.defineProperty(result, 'cachePolicyProcessingOrder', {
+            value: [...DEFAULT_CACHE_POLICY_PROCESSING_ORDER],
+        });
+    }
 
     if (enhancementKeys.some((key) => hasOwn(source, key))) {
         Object.assign(result, normalizeCacheEnhancements(source, { allowEvaluationOverflow: true }));
@@ -1629,6 +1691,45 @@ function cloneAnchor(anchor) {
     };
 }
 
+function snapshotInteger(value, field, { minimum = 0, fallback = null } = {}) {
+    const number = Number(value);
+
+    if (Number.isInteger(number) && number >= minimum) {
+        return number;
+    }
+
+    if (fallback !== null) {
+        return fallback;
+    }
+
+    throw new TypeError(`${field} must be an integer greater than or equal to ${minimum}.`);
+}
+
+function normalizeAnchorSnapshot(value, field = 'anchor') {
+    if (!isObject(value) || typeof value.prefixHash !== 'string' || value.prefixHash.length === 0) {
+        throw new TypeError(`${field}.prefixHash must be a non-empty string.`);
+    }
+
+    const markerKinds = value.markerKinds === undefined
+        ? undefined
+        : (Array.isArray(value.markerKinds)
+            ? value.markerKinds.map((kind) => String(kind))
+            : null);
+
+    if (markerKinds === null) {
+        throw new TypeError(`${field}.markerKinds must be an array when provided.`);
+    }
+
+    return cloneAnchor({
+        prefixHash: value.prefixHash,
+        logicalIndex: snapshotInteger(value.logicalIndex, `${field}.logicalIndex`),
+        contentPrefixHash: typeof value.contentPrefixHash === 'string' ? value.contentPrefixHash : null,
+        markerHistoryHash: typeof value.markerHistoryHash === 'string' ? value.markerHistoryHash : null,
+        markerKinds,
+        blockHash: typeof value.blockHash === 'string' ? value.blockHash : null,
+    });
+}
+
 export class AnchorStore {
     constructor(options = {}) {
         const maxContexts = Number(options.maxContexts ?? 32);
@@ -1682,6 +1783,111 @@ export class AnchorStore {
             lastReason: this.lastReason,
             lastUpdatedAt: this.lastUpdatedAt,
         };
+    }
+
+    exportState() {
+        return {
+            schemaVersion: ANCHOR_STORE_STATE_VERSION,
+            maxContexts: this.maxContexts,
+            generation: this.generation,
+            planSequence: this.planSequence,
+            commitSequence: this.commitSequence,
+            nextContextId: this.nextContextId,
+            lastAction: this.lastAction,
+            lastPauseReason: this.lastPauseReason,
+            lastReason: this.lastReason,
+            lastUpdatedAt: this.lastUpdatedAt,
+            contexts: [...this.contexts.values()].map((context) => ({
+                id: context.id,
+                scopeKey: context.scopeKey,
+                scopeHash: context.scopeHash,
+                anchorMode: context.anchorMode,
+                anchors: context.anchors.map(cloneAnchor),
+                initialLastAnchor: context.initialLastAnchor
+                    ? cloneAnchor(context.initialLastAnchor)
+                    : null,
+                frontierDepth: context.frontierDepth,
+                version: context.version,
+                lastPlanSequence: context.lastPlanSequence,
+                lastUsedOrder: context.lastUsedOrder,
+            })),
+        };
+    }
+
+    restoreState(snapshot) {
+        if (!isObject(snapshot) || Number(snapshot.schemaVersion) !== ANCHOR_STORE_STATE_VERSION) {
+            throw new TypeError(`AnchorStore snapshot schemaVersion must be ${ANCHOR_STORE_STATE_VERSION}.`);
+        }
+
+        const maxContexts = snapshotInteger(snapshot.maxContexts, 'maxContexts', { minimum: 1 });
+        const rawContexts = Array.isArray(snapshot.contexts) ? snapshot.contexts : null;
+
+        if (!rawContexts) {
+            throw new TypeError('AnchorStore snapshot contexts must be an array.');
+        }
+
+        const contexts = new Map();
+        for (const [index, raw] of rawContexts.entries()) {
+            if (!isObject(raw) || typeof raw.id !== 'string' || raw.id.length === 0) {
+                throw new TypeError(`contexts[${index}].id must be a non-empty string.`);
+            }
+            if (contexts.has(raw.id)) {
+                throw new TypeError(`Duplicate AnchorStore context id: ${raw.id}.`);
+            }
+            if (typeof raw.scopeKey !== 'string' || typeof raw.scopeHash !== 'string') {
+                throw new TypeError(`contexts[${index}] must include string scopeKey and scopeHash values.`);
+            }
+            if (!['single', 'rolling'].includes(raw.anchorMode)) {
+                throw new TypeError(`contexts[${index}].anchorMode must be single or rolling.`);
+            }
+            if (!Array.isArray(raw.anchors)) {
+                throw new TypeError(`contexts[${index}].anchors must be an array.`);
+            }
+
+            const context = {
+                id: raw.id,
+                scopeKey: raw.scopeKey,
+                scopeHash: raw.scopeHash,
+                anchorMode: raw.anchorMode,
+                anchors: raw.anchors.map((anchor, anchorIndex) => (
+                    normalizeAnchorSnapshot(anchor, `contexts[${index}].anchors[${anchorIndex}]`)
+                )),
+                initialLastAnchor: raw.initialLastAnchor
+                    ? normalizeAnchorSnapshot(raw.initialLastAnchor, `contexts[${index}].initialLastAnchor`)
+                    : null,
+                frontierDepth: snapshotInteger(raw.frontierDepth, `contexts[${index}].frontierDepth`),
+                version: snapshotInteger(raw.version, `contexts[${index}].version`, { minimum: 1 }),
+                lastPlanSequence: snapshotInteger(raw.lastPlanSequence, `contexts[${index}].lastPlanSequence`),
+                lastUsedOrder: snapshotInteger(raw.lastUsedOrder, `contexts[${index}].lastUsedOrder`),
+            };
+            contexts.set(context.id, context);
+        }
+
+        const keptContexts = [...contexts.values()]
+            .sort((left, right) => left.lastUsedOrder - right.lastUsedOrder)
+            .slice(-maxContexts);
+
+        this.maxContexts = maxContexts;
+        this.contexts = new Map(keptContexts.map((context) => [context.id, context]));
+        this.generation = snapshotInteger(snapshot.generation, 'generation');
+        this.planSequence = snapshotInteger(snapshot.planSequence, 'planSequence');
+        this.commitSequence = Math.max(
+            snapshotInteger(snapshot.commitSequence, 'commitSequence'),
+            ...keptContexts.map((context) => context.lastUsedOrder),
+            0,
+        );
+        this.nextContextId = snapshotInteger(snapshot.nextContextId, 'nextContextId', { minimum: 1 });
+        this.lastAction = typeof snapshot.lastAction === 'string' ? snapshot.lastAction : 'idle';
+        this.lastPauseReason = snapshot.lastPauseReason === null || typeof snapshot.lastPauseReason === 'string'
+            ? snapshot.lastPauseReason
+            : null;
+        this.lastReason = snapshot.lastReason === null || typeof snapshot.lastReason === 'string'
+            ? snapshot.lastReason
+            : null;
+        this.lastUpdatedAt = snapshot.lastUpdatedAt === null || typeof snapshot.lastUpdatedAt === 'string'
+            ? snapshot.lastUpdatedAt
+            : null;
+        return true;
     }
 
     _nextPlanSequence() {
@@ -2174,22 +2380,11 @@ function resolveCandidateCacheControl(candidate, options) {
     return resolved[0]?.value ?? resolveCacheControl(options.cacheControl);
 }
 
-const ANCHOR_SELECTION_REASONS = new Set([
-    'learned-anchor',
-    'active-anchor',
-    'promoted-anchor',
-]);
-
-function isAnchorSelectionReason(reason) {
-    return ANCHOR_SELECTION_REASONS.has(reason);
-}
-
 function applyLastAnchorShortTtl({
     enabled,
     body,
     candidates,
     selectedTargets,
-    selectionReasons,
     callerOwnedTargets,
     candidateCacheControls,
 }) {
@@ -2206,19 +2401,15 @@ function applyLastAnchorShortTtl({
         return diagnostics;
     }
 
-    const anchors = candidates
-        .filter((candidate) => {
-            if (!selectedTargets.has(candidate.target) || callerOwnedTargets.has(candidate.target)) {
-                return false;
-            }
-
-            const reasons = selectionReasons.get(candidate.target) || [];
-            return reasons.some(isAnchorSelectionReason);
-        })
+    const gatewayPoints = candidates
+        .filter((candidate) => (
+            selectedTargets.has(candidate.target) && !callerOwnedTargets.has(candidate.target)
+        ))
         .sort((left, right) => left.order - right.order);
-    const lastAnchor = anchors.at(-1);
+    const lastAnchor = gatewayPoints.at(-1);
 
     if (!lastAnchor) {
+        diagnostics.reason = 'no-gateway-cache-point';
         return diagnostics;
     }
 
@@ -2239,7 +2430,13 @@ function applyLastAnchorShortTtl({
         .some((control) => getEffectiveClaudeCacheTtl(control.value) === '1h');
 
     if (laterOneHour) {
-        diagnostics.reason = 'ttl-order';
+        const laterCallerOneHour = controls
+            .slice(selectedControlIndex + 1)
+            .some((control) => (
+                callerOwnedTargets.has(control.target)
+                && getEffectiveClaudeCacheTtl(control.value) === '1h'
+            ));
+        diagnostics.reason = laterCallerOneHour ? 'caller-later-1h' : 'ttl-order';
         diagnostics.path = `${lastAnchor.path}.cache_control`;
         return diagnostics;
     }
@@ -2292,6 +2489,8 @@ function disabledPlan(body, protocol, policy, marker, shortMarker, maxBreakpoint
             disabled: true,
             protocol,
             policy,
+            processingOrder: [...policy.cachePolicyProcessingOrder],
+            processingStages: [],
             existingBreakpoints: assertion.cacheControlCount,
             injected: 0,
             selectedBreakpoints: sortBreakpointDiagnostics(assertion.cacheControlPaths.map((path) => ({
@@ -2337,7 +2536,12 @@ export function planCacheBreaks(body, options = {}) {
     }
 
     const protocol = normalizeProtocol(options.protocol);
-    const policy = normalizeCachePolicy(options.policy);
+    const policy = normalizeCachePolicy({
+        ...(options.policy || {}),
+        ...(options.cachePolicyProcessingOrder === undefined
+            ? {}
+            : { cachePolicyProcessingOrder: options.cachePolicyProcessingOrder }),
+    });
     const enhancements = normalizeCacheEnhancements({
         ...(options.policy || {}),
         ...options,
@@ -2366,15 +2570,8 @@ export function planCacheBreaks(body, options = {}) {
     const existing = collectCacheControls(normalization.body);
     const candidateCacheControls = new Map();
 
-    // Ignored tail anchors are excluded from gateway selection, but caller
-    // controls remain authoritative and are never silently removed.  The
-    // numeric option is literal: x=4 on twenty candidates makes only the first
-    // sixteen candidates eligible, even when the ignored suffix reaches a
-    // configured fixed-head position.
     const requestedIgnoredAnchorCount = enhancements.ignoreLastAnchorCount;
-    const ignoredStart = Math.max(0, candidates.length - requestedIgnoredAnchorCount);
-    const ignoredTargets = new Set(candidates.slice(ignoredStart).map((candidate) => candidate.target));
-    const eligibleCandidates = candidates.slice(0, ignoredStart);
+    const ignoredTargets = new Set();
 
     if (existing.controls.length > maxBreakpoints) {
         assertCachePlan(normalization.body, {
@@ -2387,10 +2584,29 @@ export function planCacheBreaks(body, options = {}) {
 
     const legacyMode = policy.fixedHeadBreakpointCount === 0 && policy.cacheAnchorMode === 'off';
     const selectedTargets = new Set(existing.controls.map((control) => control.target));
+    const callerOwnedTargets = new Set(existing.controls.map((record) => record.target));
+    const fixedTargets = new Set();
     const selectionReasons = new Map();
     const scopeInfo = normalizeScope(options.scope, normalization.body, protocol);
+    const processingOrder = [...policy.cachePolicyProcessingOrder];
+    const processingStages = [];
     let injected = 0;
     let pauseReason = null;
+    let anchorStageExecuted = false;
+    let protectedLastAnchorHeld = false;
+    let protectedLastAnchorReleased = false;
+    let lastAnchorTtlConversion = {
+        enabled: Boolean(enhancements.autoConvertLastAnchorTo5m),
+        applied: false,
+        path: null,
+        from: null,
+        to: null,
+        reason: enhancements.autoConvertLastAnchorTo5m ? 'not-processed' : 'disabled',
+    };
+
+    function availableCandidates() {
+        return candidates.filter((candidate) => !ignoredTargets.has(candidate.target));
+    }
 
     function getCandidateCacheControl(candidate) {
         if (!candidateCacheControls.has(candidate.target)) {
@@ -2423,9 +2639,8 @@ export function planCacheBreaks(body, options = {}) {
         }
     }
 
-    // Caller-owned cache controls are already present on the final wire and
-    // therefore selected regardless of the gateway's remaining four-point
-    // budget. Validate every marker that lands on one before policy traversal.
+    // Caller-owned cache controls are immutable and always precede every
+    // configurable gateway stage.
     for (const candidate of candidates) {
         validateExistingCandidateControl(candidate);
     }
@@ -2440,7 +2655,6 @@ export function planCacheBreaks(body, options = {}) {
         }
 
         const expectedCacheControl = getCandidateCacheControl(candidate);
-
         const reasons = selectionReasons.get(candidate.target) || [];
 
         if (!reasons.includes(reason)) {
@@ -2459,10 +2673,31 @@ export function planCacheBreaks(body, options = {}) {
         return true;
     }
 
-    if (legacyMode) {
-        for (const candidate of eligibleCandidates) {
-            selectCandidate(candidate, existing.byTarget.has(candidate.target) ? 'existing-control' : 'legacy-head');
-        }
+    function candidateDiagnosticPath(candidate) {
+        return `${candidate.path}.cache_control`;
+    }
+
+    function runProcessingStage(stage, index, callback) {
+        const selectedBefore = new Set(selectedTargets);
+        const ignoredBefore = new Set(ignoredTargets);
+        const details = callback() || {};
+        const selectedAdded = candidates
+            .filter((candidate) => selectedTargets.has(candidate.target) && !selectedBefore.has(candidate.target))
+            .map(candidateDiagnosticPath);
+        const ignoredAdded = candidates
+            .filter((candidate) => ignoredTargets.has(candidate.target) && !ignoredBefore.has(candidate.target))
+            .map(candidateDiagnosticPath);
+        const record = {
+            stage,
+            index,
+            selectedBefore: selectedBefore.size,
+            selectedAfter: selectedTargets.size,
+            selectedAdded,
+            ignoredAdded,
+            ...details,
+        };
+        processingStages.push(record);
+        return record;
     }
 
     let anchorDecision = {
@@ -2477,153 +2712,237 @@ export function planCacheBreaks(body, options = {}) {
         protectedLastAnchor: null,
     };
 
-    if (!legacyMode) {
-        const fixedCandidates = eligibleCandidates.slice(0, policy.fixedHeadBreakpointCount);
-        const neededFixed = uniqueNewTargets(fixedCandidates, selectedTargets);
+    const stageHandlers = {
+        'fixed-head': () => {
+            const fixedCandidates = candidates.slice(0, policy.fixedHeadBreakpointCount);
+            const callerRequired = uniqueNewTargets(fixedCandidates, callerOwnedTargets);
 
-        if (selectedTargets.size + neededFixed > maxBreakpoints) {
-            throw new CachePolicyError(
-                'Existing cache_control entries leave insufficient budget for the configured fixed head breakpoints.',
-                'FIXED_HEAD_BUDGET_CONFLICT',
-                {
-                    existingBreakpoints: existing.controls.length,
-                    fixedHeadBreakpointCount: policy.fixedHeadBreakpointCount,
-                    requiredAdditionalBreakpoints: neededFixed,
-                    maxBreakpoints,
-                },
-            );
-        }
-
-        for (const candidate of fixedCandidates) {
-            selectCandidate(candidate, 'fixed-head');
-        }
-
-        const fixedTargets = new Set(fixedCandidates.map((candidate) => candidate.target));
-        const callerOwnedTargets = new Set(existing.controls.map((record) => record.target));
-        const reservedBreakpointCount = selectedTargets.size;
-
-        anchorDecision = buildAnchorDecision({
-            store: options.store,
-            scopeInfo,
-            candidates,
-            eligibleCandidates,
-            policy,
-            maxAnchorCount: Math.max(0, maxBreakpoints - reservedBreakpointCount),
-            callerOwnedTargets,
-        });
-
-        if (!anchorDecision.needsSeed) {
-            let anchorItems = anchorDecision.required;
-            const neededAnchors = uniqueNewTargets(anchorItems, selectedTargets);
-
-            if (selectedTargets.size + neededAnchors > maxBreakpoints) {
-                pauseReason = anchorDecision.action === 'promote'
-                    ? 'anchor-overlap-budget'
-                    : 'anchor-budget-unavailable';
-                anchorItems = anchorDecision.active
-                    .slice()
-                    .reverse()
-                    .map((item) => ({ candidate: item.candidate, reason: 'active-anchor' }));
+            if (callerOwnedTargets.size + callerRequired > maxBreakpoints) {
+                throw new CachePolicyError(
+                    'Existing cache_control entries leave insufficient budget for the configured fixed head breakpoints.',
+                    'FIXED_HEAD_BUDGET_CONFLICT',
+                    {
+                        existingBreakpoints: existing.controls.length,
+                        fixedHeadBreakpointCount: policy.fixedHeadBreakpointCount,
+                        requiredAdditionalBreakpoints: callerRequired,
+                        maxBreakpoints,
+                    },
+                );
             }
 
-            for (const item of anchorItems) {
-                if (!selectCandidate(item.candidate, item.reason)) {
-                    pauseReason ||= 'anchor-budget-unavailable';
+            const blocked = [];
+            const unavailable = [];
+            for (const candidate of fixedCandidates) {
+                if (selectCandidate(candidate, 'fixed-head')) {
+                    fixedTargets.add(candidate.target);
+                } else if (ignoredTargets.has(candidate.target)) {
+                    blocked.push(candidateDiagnosticPath(candidate));
+                } else {
+                    unavailable.push(candidateDiagnosticPath(candidate));
                 }
             }
-        }
 
-        // Tail selection initializes a rolling queue once. After that, only an
-        // interval promotion may introduce a new cache boundary.
-        if (policy.cacheAnchorMode !== 'rolling' || anchorDecision.needsSeed) {
-            for (let index = eligibleCandidates.length - 1; index >= 0 && selectedTargets.size < maxBreakpoints; index--) {
-                selectCandidate(eligibleCandidates[index], 'tail');
+            return {
+                requested: fixedCandidates.length,
+                protected: fixedCandidates.filter((candidate) => fixedTargets.has(candidate.target)).length,
+                blocked,
+                unavailable,
+            };
+        },
+        'ignore-tail': () => {
+            const ignoredStart = Math.max(0, candidates.length - requestedIgnoredAnchorCount);
+            const requestedCandidates = candidates.slice(ignoredStart);
+            const protectedPaths = [];
+
+            for (const candidate of requestedCandidates) {
+                if (selectedTargets.has(candidate.target)) {
+                    protectedPaths.push(candidateDiagnosticPath(candidate));
+                    continue;
+                }
+                ignoredTargets.add(candidate.target);
             }
-        }
 
-        if (anchorDecision.needsSeed) {
-            const learnedCandidates = candidates.filter((candidate) => (
-                selectedTargets.has(candidate.target) && !fixedTargets.has(candidate.target)
+            return {
+                requested: requestedIgnoredAnchorCount,
+                considered: requestedCandidates.length,
+                effective: requestedCandidates.length - protectedPaths.length,
+                protectedPaths,
+            };
+        },
+        'cache-anchor': () => {
+            anchorStageExecuted = true;
+            const eligibleCandidates = availableCandidates();
+            const reservedBreakpointCount = selectedTargets.size;
+            anchorDecision = buildAnchorDecision({
+                store: options.store,
+                scopeInfo,
+                candidates,
+                eligibleCandidates,
+                policy,
+                maxAnchorCount: Math.max(0, maxBreakpoints - reservedBreakpointCount),
+                callerOwnedTargets,
+            });
+
+            if (!anchorDecision.needsSeed) {
+                let anchorItems = anchorDecision.required;
+                const neededAnchors = uniqueNewTargets(anchorItems, selectedTargets);
+
+                if (selectedTargets.size + neededAnchors > maxBreakpoints) {
+                    pauseReason = anchorDecision.action === 'promote'
+                        ? 'anchor-overlap-budget'
+                        : 'anchor-budget-unavailable';
+                    anchorItems = anchorDecision.active
+                        .slice()
+                        .reverse()
+                        .map((item) => ({ candidate: item.candidate, reason: 'active-anchor' }));
+                }
+
+                for (const item of anchorItems) {
+                    if (!selectCandidate(item.candidate, item.reason)) {
+                        pauseReason ||= 'anchor-budget-unavailable';
+                    }
+                }
+            }
+
+            return {
+                action: anchorDecision.action,
+                needsSeed: Boolean(anchorDecision.needsSeed),
+                pauseReason,
+            };
+        },
+        'tail-fill': () => {
+            const eligibleCandidates = availableCandidates();
+            const shouldFill = legacyMode
+                || policy.cacheAnchorMode !== 'rolling'
+                || !anchorStageExecuted
+                || anchorDecision.needsSeed;
+
+            if (!shouldFill) {
+                return { skippedReason: 'rolling-queue-frozen' };
+            }
+
+            const traversal = legacyMode ? eligibleCandidates : [...eligibleCandidates].reverse();
+            for (const candidate of traversal) {
+                if (selectedTargets.size >= maxBreakpoints) {
+                    break;
+                }
+                if (selectedTargets.has(candidate.target)) {
+                    continue;
+                }
+                const reason = existing.byTarget.has(candidate.target)
+                    ? 'existing-control'
+                    : (legacyMode ? 'legacy-head' : 'tail');
+                selectCandidate(candidate, reason);
+            }
+
+            return { mode: legacyMode ? 'legacy-head' : 'tail' };
+        },
+        'protected-tail-anchor': () => {
+            if (policy.cacheAnchorMode !== 'rolling' || !anchorDecision.protectedLastAnchor) {
+                return { skippedReason: anchorStageExecuted ? 'no-protected-anchor' : 'anchor-stage-not-run' };
+            }
+
+            const protectedAnchor = anchorDecision.protectedLastAnchor;
+            const protectedCandidate = candidates.find((candidate) => (
+                candidate.prefixHash === protectedAnchor.prefixHash
+                || (protectedAnchor.blockHash && candidate.blockHash === protectedAnchor.blockHash)
             ));
-            const learned = policy.cacheAnchorMode === 'rolling'
-                ? learnedCandidates.filter((candidate) => !callerOwnedTargets.has(candidate.target))
-                : learnedCandidates.slice(0, 1);
+            const isPendingEviction = Boolean(
+                anchorDecision.pendingEviction
+                && (anchorDecision.pendingEviction.anchor?.prefixHash === protectedAnchor.prefixHash
+                    || (anchorDecision.pendingEviction.anchor?.blockHash
+                        && anchorDecision.pendingEviction.anchor.blockHash === protectedAnchor.blockHash)),
+            );
 
-            if (learned.length > 0) {
-                for (const candidate of learned) {
-                    const currentReasons = selectionReasons.get(candidate.target) || [];
-                    selectionReasons.set(candidate.target, [
-                        'learned-anchor',
-                        ...currentReasons.filter((reason) => reason !== 'learned-anchor'),
-                    ]);
+            if (protectedCandidate && !isPendingEviction && !selectedTargets.has(protectedCandidate.target)) {
+                protectedLastAnchorHeld = selectCandidate(protectedCandidate, 'active-anchor');
+                if (!protectedLastAnchorHeld) {
+                    pauseReason ||= ignoredTargets.has(protectedCandidate.target)
+                        ? 'protected-last-anchor-ignored'
+                        : 'protected-last-anchor-budget';
                 }
-
-                anchorDecision = {
-                    ...anchorDecision,
-                    required: learned.map((candidate) => ({ candidate, reason: 'learned-anchor' })),
-                    nextAnchors: learned.map((candidate) => ({
-                        prefixHash: candidate.prefixHash,
-                        logicalIndex: candidate.logicalIndex,
-                        contentPrefixHash: candidate.contentPrefixHash,
-                        markerHistoryHash: candidate.markerHistoryHash,
-                        markerKinds: candidate.markerKinds,
-                        blockHash: candidate.blockHash,
-                    })),
-                    protectedLastAnchor: learned.at(-1)
-                        ? {
-                            prefixHash: learned.at(-1).prefixHash,
-                            logicalIndex: learned.at(-1).logicalIndex,
-                            contentPrefixHash: learned.at(-1).contentPrefixHash,
-                            markerHistoryHash: learned.at(-1).markerHistoryHash,
-                            markerKinds: learned.at(-1).markerKinds,
-                            blockHash: learned.at(-1).blockHash,
-                        }
-                        : null,
-                    canPersist: true,
-                    needsSeed: false,
-                };
-            } else {
-                pauseReason = 'anchor-budget-unavailable';
+            } else if (isPendingEviction) {
+                protectedLastAnchorReleased = true;
+            } else if (protectedCandidate && selectedTargets.has(protectedCandidate.target)) {
+                protectedLastAnchorHeld = true;
             }
-        }
+
+            return {
+                held: protectedLastAnchorHeld,
+                released: protectedLastAnchorReleased,
+                pauseReason,
+            };
+        },
+        'last-gateway-cache-point-5m': () => {
+            lastAnchorTtlConversion = applyLastAnchorShortTtl({
+                enabled: enhancements.autoConvertLastAnchorTo5m,
+                body: normalization.body,
+                candidates,
+                selectedTargets,
+                callerOwnedTargets,
+                candidateCacheControls,
+            });
+            return { conversion: cloneJson(lastAnchorTtlConversion) };
+        },
+    };
+
+    for (const [index, stage] of processingOrder.entries()) {
+        runProcessingStage(stage, index, stageHandlers[stage]);
     }
 
-    let protectedLastAnchorHeld = false;
-    let protectedLastAnchorReleased = false;
-    if (policy.cacheAnchorMode === 'rolling' && anchorDecision.protectedLastAnchor) {
-        const protectedAnchor = anchorDecision.protectedLastAnchor;
-        const protectedCandidate = candidates.find((candidate) => (
-            candidate.prefixHash === protectedAnchor.prefixHash
-            || (protectedAnchor.blockHash && candidate.blockHash === protectedAnchor.blockHash)
+    if (!legacyMode && anchorDecision.needsSeed) {
+        const learnedCandidates = candidates.filter((candidate) => (
+            selectedTargets.has(candidate.target) && !fixedTargets.has(candidate.target)
         ));
-        const isPendingEviction = Boolean(
-            anchorDecision.pendingEviction
-            && (anchorDecision.pendingEviction.anchor?.prefixHash === protectedAnchor.prefixHash
-                || (anchorDecision.pendingEviction.anchor?.blockHash
-                    && anchorDecision.pendingEviction.anchor.blockHash === protectedAnchor.blockHash)),
-        );
+        const learned = policy.cacheAnchorMode === 'rolling'
+            ? learnedCandidates.filter((candidate) => !callerOwnedTargets.has(candidate.target))
+            : learnedCandidates.slice(0, 1);
 
-        if (protectedCandidate && !isPendingEviction && !selectedTargets.has(protectedCandidate.target)) {
-            protectedLastAnchorHeld = selectCandidate(protectedCandidate, 'active-anchor');
-            if (!protectedLastAnchorHeld) {
-                pauseReason ||= 'protected-last-anchor-budget';
+        if (learned.length > 0) {
+            for (const candidate of learned) {
+                const currentReasons = selectionReasons.get(candidate.target) || [];
+                selectionReasons.set(candidate.target, [
+                    'learned-anchor',
+                    ...currentReasons.filter((reason) => reason !== 'learned-anchor'),
+                ]);
             }
-        } else if (isPendingEviction) {
-            protectedLastAnchorReleased = true;
-        } else if (protectedCandidate && selectedTargets.has(protectedCandidate.target)) {
-            protectedLastAnchorHeld = true;
+
+            anchorDecision = {
+                ...anchorDecision,
+                required: learned.map((candidate) => ({ candidate, reason: 'learned-anchor' })),
+                nextAnchors: learned.map((candidate) => ({
+                    prefixHash: candidate.prefixHash,
+                    logicalIndex: candidate.logicalIndex,
+                    contentPrefixHash: candidate.contentPrefixHash,
+                    markerHistoryHash: candidate.markerHistoryHash,
+                    markerKinds: candidate.markerKinds,
+                    blockHash: candidate.blockHash,
+                })),
+                protectedLastAnchor: learned.at(-1)
+                    ? {
+                        prefixHash: learned.at(-1).prefixHash,
+                        logicalIndex: learned.at(-1).logicalIndex,
+                        contentPrefixHash: learned.at(-1).contentPrefixHash,
+                        markerHistoryHash: learned.at(-1).markerHistoryHash,
+                        markerKinds: learned.at(-1).markerKinds,
+                        blockHash: learned.at(-1).blockHash,
+                    }
+                    : null,
+                canPersist: true,
+                needsSeed: false,
+            };
+        } else {
+            pauseReason = 'anchor-budget-unavailable';
+        }
+
+        const anchorStage = processingStages.find((stage) => stage.stage === 'cache-anchor');
+        if (anchorStage) {
+            anchorStage.action = anchorDecision.action;
+            anchorStage.needsSeed = Boolean(anchorDecision.needsSeed);
+            anchorStage.learnedPaths = learned.map(candidateDiagnosticPath);
+            anchorStage.pauseReason = pauseReason;
         }
     }
-
-    const lastAnchorTtlConversion = applyLastAnchorShortTtl({
-        enabled: enhancements.autoConvertLastAnchorTo5m,
-        body: normalization.body,
-        candidates,
-        selectedTargets,
-        selectionReasons,
-        callerOwnedTargets: new Set(existing.controls.map((record) => record.target)),
-        candidateCacheControls,
-    });
 
     const statePlan = makeStatePlan({
         store: options.store,
@@ -2742,6 +3061,8 @@ export function planCacheBreaks(body, options = {}) {
         disabled: false,
         protocol,
         policy,
+        processingOrder,
+        processingStages,
         legacyMode,
         existingBreakpoints: existing.controls.length,
         injected,

@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import {
     AnchorStore,
     ANCHOR_EVALUATION_REQUESTS,
+    CACHE_POLICY_PROCESSING_STAGES,
+    DEFAULT_CACHE_POLICY_PROCESSING_ORDER,
     CachePolicyError,
     MARKER,
     SHORT_MARKER,
@@ -15,6 +17,7 @@ import {
     hashPromptBlock,
     normalizeCacheEnhancements,
     normalizeCachePolicy,
+    normalizeCachePolicyProcessingOrder,
     recordAnchorEvaluation,
     planCacheBreaks,
     preprocessAutomaticCacheBreaks,
@@ -90,6 +93,26 @@ test('normalizes and validates policy values', () => {
         () => normalizeCachePolicy({ cacheAnchorMode: 'sometimes' }),
         (error) => error.code === 'INVALID_ANCHOR_MODE',
     );
+    assert.deepEqual(
+        normalizeCachePolicyProcessingOrder(undefined),
+        DEFAULT_CACHE_POLICY_PROCESSING_ORDER,
+    );
+    assert.deepEqual(
+        normalizeCachePolicyProcessingOrder([...CACHE_POLICY_PROCESSING_STAGES].reverse(), { strict: true }),
+        [...CACHE_POLICY_PROCESSING_STAGES].reverse(),
+    );
+    for (const invalid of [
+        ['fixed-head'],
+        [...CACHE_POLICY_PROCESSING_STAGES, 'fixed-head'],
+        CACHE_POLICY_PROCESSING_STAGES.map((stage, index) => index === 0 ? 'unknown-stage' : stage),
+        'fixed-head',
+    ]) {
+        assert.throws(
+            () => normalizeCachePolicyProcessingOrder(invalid, { strict: true }),
+            (error) => error instanceof CachePolicyError
+                && error.code === 'INVALID_CACHE_POLICY_PROCESSING_ORDER',
+        );
+    }
 });
 
 test('canonical hashing is key-order independent and returns full SHA-256', () => {
@@ -1845,6 +1868,125 @@ test('last-anchor short TTL conversion is valid in native order', () => {
     assert.equal(plan.diagnostics.lastAnchorTtlConversion.applied, true);
 });
 
+test('one fixed-only gateway point survives ignored-tail and becomes the 5m endpoint', () => {
+    const plan = planCacheBreaks(blockBody('A'), {
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+            ignoreLastAnchorsMode: 'fixed',
+            ignoreLastAnchorCount: 1,
+            autoConvertLastAnchorTo5m: true,
+        },
+        cacheControl: { type: 'ephemeral', ttl: '1h' },
+        store: new AnchorStore(),
+    });
+
+    assert.equal(plan.diagnostics.cacheControlCount, 1);
+    assert.deepEqual(plan.diagnostics.ignoredCandidateLogicalIndexes, []);
+    assert.equal(plan.body.messages[0].content[0].cache_control.ttl, '5m');
+    assert.equal(plan.diagnostics.lastAnchorTtlConversion.applied, true);
+    assert.deepEqual(plan.diagnostics.selectedBreakpoints[0].reasons, ['fixed-head']);
+});
+
+test('ordinary gateway tail points participate in last-point 5m conversion', () => {
+    const plan = planCacheBreaks(blockBody('ABCDE'), {
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'off',
+            cacheAnchorIntervalBlocks: 3,
+            autoConvertLastAnchorTo5m: true,
+        },
+        cacheControl: { type: 'ephemeral', ttl: '1h' },
+    });
+
+    const controls = plan.body.messages
+        .flatMap((message) => message.content || [])
+        .filter((block) => block.cache_control)
+        .map((block) => block.cache_control.ttl);
+    assert.deepEqual(controls, ['1h', '1h', '1h', '5m']);
+    assert.equal(plan.diagnostics.lastAnchorTtlConversion.applied, true);
+});
+
+test('moving 5m conversion before selection processes only the intermediate empty result', () => {
+    const plan = planCacheBreaks(blockBody('ABCDE'), {
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'off',
+            cacheAnchorIntervalBlocks: 3,
+            autoConvertLastAnchorTo5m: true,
+            cachePolicyProcessingOrder: [
+                'last-gateway-cache-point-5m',
+                'fixed-head',
+                'ignore-tail',
+                'cache-anchor',
+                'tail-fill',
+                'protected-tail-anchor',
+            ],
+        },
+        cacheControl: { type: 'ephemeral', ttl: '1h' },
+    });
+
+    assert.equal(plan.diagnostics.lastAnchorTtlConversion.applied, false);
+    assert.equal(plan.diagnostics.lastAnchorTtlConversion.reason, 'no-gateway-cache-point');
+    assert.deepEqual(
+        plan.body.messages
+            .flatMap((message) => message.content || [])
+            .filter((block) => block.cache_control)
+            .map((block) => block.cache_control.ttl),
+        ['1h', '1h', '1h', '1h'],
+    );
+});
+
+test('a later caller-owned 1h point skips gateway 5m conversion with an explicit reason', () => {
+    const body = {
+        model: 'caller-later-1h',
+        messages: [
+            { role: 'user', content: [{ type: 'text', text: `A${MARKER}` }] },
+            { role: 'user', content: [{ type: 'text', text: 'B', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+        ],
+    };
+    const plan = planCacheBreaks(body, {
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'off',
+            cacheAnchorIntervalBlocks: 3,
+            autoConvertLastAnchorTo5m: true,
+        },
+        cacheControl: { type: 'ephemeral', ttl: '1h' },
+    });
+
+    assert.equal(plan.diagnostics.lastAnchorTtlConversion.applied, false);
+    assert.equal(plan.diagnostics.lastAnchorTtlConversion.reason, 'caller-later-1h');
+    assert.equal(plan.body.messages[0].content[0].cache_control.ttl, '1h');
+    assert.equal(plan.body.messages[1].content[0].cache_control.ttl, '1h');
+});
+
+test('AnchorStore state round-trips learned contexts and rejects malformed snapshots', () => {
+    const store = new AnchorStore();
+    const policy = {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'rolling',
+        cacheAnchorIntervalBlocks: 3,
+    };
+    const first = planCacheBreaks(blockBody('ABCDEFG'), { policy, store });
+    assert.equal(first.commit(), true);
+
+    const snapshot = store.exportState();
+    const restored = new AnchorStore({ maxContexts: 1 });
+    assert.equal(restored.restoreState(snapshot), true);
+    assert.deepEqual(restored.getStats(), store.getStats());
+
+    const grown = planCacheBreaks(blockBody('ABCDEFGHI'), { policy, store: restored });
+    assert.equal(grown.diagnostics.anchorAction, 'match');
+    assert.deepEqual(grown.statePlan.initialLastAnchor, first.statePlan.initialLastAnchor);
+
+    assert.throws(
+        () => restored.restoreState({ schemaVersion: 1, maxContexts: 32, contexts: [{ id: 'broken' }] }),
+        TypeError,
+    );
+});
+
 test('ignored tail diagnostics mark exactly the requested newest candidates', () => {
     const plan = planCacheBreaks(blockBody('ABCDEFGHIJKLMNOPQRST'), {
         policy: {
@@ -1863,7 +2005,7 @@ test('ignored tail diagnostics mark exactly the requested newest candidates', ()
     );
 });
 
-test('ignored tail slicing can consume fixed-head candidates and clamp to the available suffix', () => {
+test('default order protects fixed heads before ignored-tail slicing and clamps to unclaimed candidates', () => {
     const plan = planCacheBreaks(blockBody('ABCDE'), {
         policy: {
             fixedHeadBreakpointCount: 4,
@@ -1875,8 +2017,34 @@ test('ignored tail slicing can consume fixed-head candidates and clamp to the av
     });
 
     assert.equal(plan.diagnostics.ignoredAnchorCount, 99);
-    assert.equal(plan.diagnostics.ignoredCandidateCount, 5);
-    assert.deepEqual(plan.diagnostics.ignoredCandidateLogicalIndexes, [1, 2, 3, 4, 5]);
+    assert.equal(plan.diagnostics.ignoredCandidateCount, 1);
+    assert.deepEqual(plan.diagnostics.ignoredCandidateLogicalIndexes, [5]);
+    assert.deepEqual(selectedLogicalIndexes(plan), [1, 2, 3, 4]);
+    assert.equal(plan.diagnostics.cacheControlCount, 4);
+});
+
+test('moving ignored-tail before fixed-head can deliberately block the only candidate', () => {
+    const plan = planCacheBreaks(blockBody('A'), {
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'rolling',
+            cacheAnchorIntervalBlocks: 3,
+            ignoreLastAnchorsMode: 'fixed',
+            ignoreLastAnchorCount: 1,
+            cachePolicyProcessingOrder: [
+                'ignore-tail',
+                'fixed-head',
+                'cache-anchor',
+                'tail-fill',
+                'protected-tail-anchor',
+                'last-gateway-cache-point-5m',
+            ],
+        },
+        store: new AnchorStore(),
+    });
+
     assert.equal(plan.diagnostics.cacheControlCount, 0);
+    assert.deepEqual(plan.diagnostics.ignoredCandidateLogicalIndexes, [1]);
+    assert.equal(plan.diagnostics.processingStages[1].blocked.length, 1);
 });
 

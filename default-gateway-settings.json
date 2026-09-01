@@ -1,9 +1,10 @@
 {
-  "schemaVersion": 10,
+  "schemaVersion": 11,
   "cacheTranslationEnabled": true,
   "systemMessageHandlingMode": "default",
   "autoGenerateCacheBreakpointsMode": "auto",
   "captureRequests": true,
+  "maxRequestCaptures": 20,
   "usageAppearance": {
     "input": {
       "textColor": "#127852",
@@ -40,10 +41,44 @@
       }
     }
   },
+  "usagePreviewSample": {
+    "inputTokens": 148792,
+    "outputTokens": 546,
+    "cacheReadTokens": 141558,
+    "cacheWriteTokens": 6924,
+    "cacheHitRatePercent": 95.14
+  },
+  "requestCacheAppearance": {
+    "prefixLock": {
+      "textColor": "#191919",
+      "backgroundColor": null
+    },
+    "cacheAnchor": {
+      "textColor": "#191919",
+      "backgroundColor": null
+    },
+    "cacheBudgetInsufficient": {
+      "textColor": "#B25E00",
+      "backgroundColor": "#FBF1E6"
+    },
+    "blockHashChange": {
+      "textColor": "#B25E00",
+      "backgroundColor": "#FBF1E6"
+    }
+  },
+  "prefixLockEnabled": false,
   "cacheTtl": "manual",
   "fixedHeadBreakpointCount": 1,
   "cacheAnchorMode": "rolling",
   "cacheAnchorIntervalBlocks": 3,
+  "cachePolicyProcessingOrder": [
+    "fixed-head",
+    "ignore-tail",
+    "cache-anchor",
+    "tail-fill",
+    "protected-tail-anchor",
+    "last-gateway-cache-point-5m"
+  ],
   "autoConvertLastAnchorTo5m": false,
   "ignoreLastAnchorsMode": "evaluation",
   "ignoreLastAnchorCount": 0,

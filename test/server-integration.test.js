@@ -17,6 +17,14 @@ const DEFAULT_POLICY = {
     cacheAnchorMode: 'off',
     cacheAnchorIntervalBlocks: 3,
 };
+const FETCH_FORBIDDEN_PORTS = new Set([
+    3659, 4045, 4190, 5060, 5061, 6000, 6566,
+    6665, 6666, 6667, 6668, 6669, 6697, 10080,
+]);
+
+function isFetchSafePort(port) {
+    return Number.isInteger(port) && port > 0 && !FETCH_FORBIDDEN_PORTS.has(port);
+}
 
 function markerBody(model = 'integration-model', letters = 'ABCDEFG') {
     return {
@@ -360,12 +368,21 @@ async function startMockUpstream() {
         }
     });
 
-    await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', resolve);
-    });
-
-    const address = server.address();
+    let address;
+    while (!address) {
+        await new Promise((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(0, '127.0.0.1', resolve);
+        });
+        const candidate = server.address();
+        if (isFetchSafePort(candidate.port)) {
+            address = candidate;
+        } else {
+            await new Promise((resolve, reject) => {
+                server.close((error) => error ? reject(error) : resolve());
+            });
+        }
+    }
     return {
         requests,
         baseUrl: `http://127.0.0.1:${address.port}`,
@@ -379,16 +396,20 @@ async function startMockUpstream() {
 }
 
 async function getUnusedPort() {
-    const server = createServer();
-    await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', resolve);
-    });
-    const { port } = server.address();
-    await new Promise((resolve, reject) => {
-        server.close((error) => error ? reject(error) : resolve());
-    });
-    return port;
+    while (true) {
+        const server = createServer();
+        await new Promise((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(0, '127.0.0.1', resolve);
+        });
+        const { port } = server.address();
+        await new Promise((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve());
+        });
+        if (isFetchSafePort(port)) {
+            return port;
+        }
+    }
 }
 
 function collectProcessOutput(child) {
@@ -451,11 +472,18 @@ async function startGatewayFixture({
     ignoreLastAnchorsMode,
     ignoreLastAnchorCount,
     usageAppearance,
+    usagePreviewSample,
+    requestCacheAppearance,
+    prefixLockEnabled,
+    maxRequestCaptures,
+    cachePolicyProcessingOrder,
     environmentCacheTranslationEnabled = 'true',
 }) {
     const upstream = await startMockUpstream();
     const temporaryDirectory = await mkdtemp(join(tmpdir(), 'st-cache-gateway-integration-'));
     const settingsPath = join(temporaryDirectory, 'gateway-settings.json');
+    const runtimeStatePath = join(temporaryDirectory, 'gateway-runtime-state.json');
+    const requestLogsPath = join(temporaryDirectory, 'gateway-request-logs.json');
     let child = null;
     let exitPromise = Promise.resolve();
     let closed = false;
@@ -480,6 +508,11 @@ async function startGatewayFixture({
                 ...(ignoreLastAnchorsMode === undefined ? {} : { ignoreLastAnchorsMode }),
                 ...(ignoreLastAnchorCount === undefined ? {} : { ignoreLastAnchorCount }),
                 ...(usageAppearance === undefined ? {} : { usageAppearance }),
+                ...(usagePreviewSample === undefined ? {} : { usagePreviewSample }),
+                ...(requestCacheAppearance === undefined ? {} : { requestCacheAppearance }),
+                ...(prefixLockEnabled === undefined ? {} : { prefixLockEnabled }),
+                ...(maxRequestCaptures === undefined ? {} : { maxRequestCaptures }),
+                ...(cachePolicyProcessingOrder === undefined ? {} : { cachePolicyProcessingOrder }),
                 activeChannelId: 'integration-upstream',
                 channels: [{
                     id: 'integration-upstream',
@@ -548,11 +581,24 @@ async function startGatewayFixture({
             ...upstream,
             gatewayBaseUrl: baseUrl,
             settingsPath,
+            runtimeStatePath,
+            requestLogsPath,
+            temporaryDirectory,
+            async stopGateway() {
+                if (child) {
+                    await stopChild(child, exitPromise);
+                    child = null;
+                    exitPromise = Promise.resolve();
+                }
+            },
+            async startGateway() {
+                if (!child) {
+                    await launchGateway();
+                }
+            },
             async restart() {
-                await stopChild(child, exitPromise);
-                child = null;
-                exitPromise = Promise.resolve();
-                await launchGateway();
+                await this.stopGateway();
+                await this.startGateway();
             },
             async close() {
                 if (closed) {
@@ -724,12 +770,12 @@ test('schema 9 migrates the old automatic breakpoint boolean and persists the ca
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 10);
+                assert.equal(savedSettings.schemaVersion, 11);
                 assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'autoGenerateCacheBreakpoints'),
                     false,
-                    'schema 10 must persist only the canonical three-state field',
+                    'schema 11 must persist only the canonical three-state field',
                 );
             } finally {
                 await fixture.close();
@@ -758,12 +804,12 @@ test('schema 9 remaps schema 8 system-message modes to the corrected canonical m
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 10);
+                assert.equal(savedSettings.schemaVersion, 11);
                 assert.equal(savedSettings.systemMessageHandlingMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'),
                     false,
-                    'schema 10 must persist only the canonical mode',
+                    'schema 11 must persist only the canonical mode',
                 );
             } finally {
                 await fixture.close();
@@ -792,12 +838,12 @@ test('schema 9 migrates schema 7 system-message booleans and persists only the c
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 10);
+                assert.equal(savedSettings.schemaVersion, 11);
                 assert.equal(savedSettings.systemMessageHandlingMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'),
                     false,
-                    'schema 10 must not persist the legacy boolean field',
+                    'schema 11 must not persist the legacy boolean field',
                 );
             } finally {
                 await fixture.close();
@@ -840,7 +886,7 @@ test('system-message handling API strictly validates and persists every mode acr
         assert.equal(state.systemMessageHandlingMode, mode);
 
         const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-        assert.equal(savedSettings.schemaVersion, 10);
+        assert.equal(savedSettings.schemaVersion, 11);
         assert.equal(savedSettings.systemMessageHandlingMode, mode);
         assert.equal(Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'), false);
 
@@ -936,7 +982,7 @@ test('automatic breakpoint API validates mode atomically and accepts the legacy 
     assert.equal(legacyOff.autoGenerateCacheBreakpointsMode, 'off');
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 10);
+    assert.equal(savedSettings.schemaVersion, 11);
     assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, 'off');
     state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     assert.equal(state.autoGenerateCacheBreakpoints, false);
@@ -988,7 +1034,7 @@ test('TTL modes send no ttl for Auto and native ttl values for 5m and 1h', async
     assertGatewayCacheTtl(fixture.requests[3], null);
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 10);
+    assert.equal(savedSettings.schemaVersion, 11);
     assert.equal(savedSettings.cacheTtl, 'auto');
 });
 
@@ -1160,7 +1206,7 @@ test('legacy default TTL aliases migrate to canonical Auto in state and saved se
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 10);
+                assert.equal(savedSettings.schemaVersion, 11);
                 assert.equal(savedSettings.cacheTtl, 'auto');
             } finally {
                 await fixture.close();
@@ -1391,7 +1437,7 @@ test('Auto generation enables only when the final request has no explicit marker
     assert.equal(capture.gateway.cachePolicy.autoGeneratedBreakpoints.suppressionReason, 'existing-cache-control');
 });
 
-test('request capture setting persists across a gateway restart while captures remain in-memory only', async (t) => {
+test('request capture setting and complete diagnostic logs persist across a gateway restart', async (t) => {
     const fixture = await startGatewayFixture({
         upstreamMode: 'openai',
         schemaVersion: 4,
@@ -1408,13 +1454,60 @@ test('request capture setting persists across a gateway restart while captures r
     assert.equal(beforeRestart.capturedRequests, 1);
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 10);
+    assert.equal(savedSettings.schemaVersion, 11);
     assert.equal(savedSettings.captureRequests, true, 'POST /console/capture must persist the setting');
 
     await fixture.restart();
     const afterRestart = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     assert.equal(afterRestart.captureRequests, true);
-    assert.equal(afterRestart.capturedRequests, 0, 'captured request bodies must not survive restart');
+    assert.equal(afterRestart.capturedRequests, 1, 'complete diagnostic captures must survive restart');
+    const restoredList = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    assert.equal(restoredList.requests.length, 1);
+    assert.equal(restoredList.requests[0].model, 'capture-persistence-model');
+    assert.equal(restoredList.requests[0].channelName, 'Integration upstream');
+    const restoredDetail = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(restoredList.requests[0].id)}`,
+    );
+    assert.equal(restoredDetail.upstream.body.model, 'capture-persistence-model');
+    assert.equal(restoredDetail.gateway.channelId, 'integration-upstream');
+    const persistedLogs = JSON.parse(await readFile(fixture.requestLogsPath, 'utf8'));
+    assert.equal(persistedLogs.schemaVersion, 1);
+    assert.equal(persistedLogs.captures.length, 1);
+});
+
+test('request log retention trims immediately and persists across restart and clear', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 10,
+        captureRequests: true,
+    });
+    t.after(() => fixture.close());
+
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.maxRequestCaptures, 20);
+    for (const model of ['retention-one', 'retention-two', 'retention-three']) {
+        await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody(model));
+    }
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/request-log-settings', { maxRequestCaptures: 2 });
+    assert.equal(state.maxRequestCaptures, 2);
+    assert.equal(state.capturedRequests, 2);
+    let list = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    assert.deepEqual(list.requests.map((item) => item.model), ['retention-three', 'retention-two']);
+
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.maxRequestCaptures, 2);
+    assert.equal(state.capturedRequests, 2);
+    list = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    assert.deepEqual(list.requests.map((item) => item.model), ['retention-three', 'retention-two']);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/clear', {});
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.capturedRequests, 0);
+    list = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    assert.equal(list.requests.length, 0);
 });
 
 test('OpenAI inbound -> Anthropic upstream converts before applying the fixed-head policy', async (t) => {
@@ -1448,8 +1541,16 @@ test('global Usage appearance validates, persists, survives channel changes, and
             le100: { textColor: '#127852', backgroundColor: null },
         },
     };
+    const defaultSample = {
+        inputTokens: 148792,
+        outputTokens: 546,
+        cacheReadTokens: 141558,
+        cacheWriteTokens: 6924,
+        cacheHitRatePercent: 95.14,
+    };
     let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     assert.deepEqual(state.usageAppearance, defaults);
+    assert.deepEqual(state.usagePreviewSample, defaultSample);
 
     const custom = {
         input: { textColor: '#010203', backgroundColor: '#F1F2F3' },
@@ -1463,8 +1564,19 @@ test('global Usage appearance validates, persists, survives channel changes, and
             le100: { textColor: '#717273', backgroundColor: null },
         },
     };
-    state = await postJson(fixture.gatewayBaseUrl, '/console/usage-appearance', { value: custom });
+    const customSample = {
+        inputTokens: 1000,
+        outputTokens: 200,
+        cacheReadTokens: 800,
+        cacheWriteTokens: 50,
+        cacheHitRatePercent: 84.25,
+    };
+    state = await postJson(fixture.gatewayBaseUrl, '/console/usage-appearance', {
+        value: custom,
+        previewSample: customSample,
+    });
     assert.deepEqual(state.usageAppearance, custom);
+    assert.deepEqual(state.usagePreviewSample, customSample);
 
     state = await postJson(fixture.gatewayBaseUrl, '/console/channels', {
         name: 'Appearance channel',
@@ -1474,11 +1586,13 @@ test('global Usage appearance validates, persists, survives channel changes, and
     assert.deepEqual(state.usageAppearance, custom, 'channel changes must not alter global appearance');
 
     let savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 10);
+    assert.equal(savedSettings.schemaVersion, 11);
     assert.deepEqual(savedSettings.usageAppearance, custom);
+    assert.deepEqual(savedSettings.usagePreviewSample, customSample);
     await fixture.restart();
     state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     assert.deepEqual(state.usageAppearance, custom);
+    assert.deepEqual(state.usagePreviewSample, customSample);
 
     const invalid = await fetch(`${fixture.gatewayBaseUrl}/console/usage-appearance`, {
         method: 'POST',
@@ -1491,8 +1605,107 @@ test('global Usage appearance validates, persists, survives channel changes, and
 
     state = await postJson(fixture.gatewayBaseUrl, '/console/usage-appearance', { reset: true });
     assert.deepEqual(state.usageAppearance, defaults);
+    assert.deepEqual(state.usagePreviewSample, customSample, 'resetting colors must keep the editable sample');
+    state = await postJson(fixture.gatewayBaseUrl, '/console/usage-appearance', { resetSample: true });
+    assert.deepEqual(state.usagePreviewSample, defaultSample);
     savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
     assert.deepEqual(savedSettings.usageAppearance, defaults);
+    assert.deepEqual(savedSettings.usagePreviewSample, defaultSample);
+});
+
+test('Prefix and cache-anchor appearance validates, persists, and resets globally', async (t) => {
+    const fixture = await startGatewayFixture({ upstreamMode: 'openai', schemaVersion: 10 });
+    t.after(() => fixture.close());
+    const defaults = {
+        prefixLock: { textColor: '#191919', backgroundColor: null },
+        cacheAnchor: { textColor: '#191919', backgroundColor: null },
+        cacheBudgetInsufficient: { textColor: '#B25E00', backgroundColor: '#FBF1E6' },
+        blockHashChange: { textColor: '#B25E00', backgroundColor: '#FBF1E6' },
+    };
+    const custom = {
+        prefixLock: { textColor: '#123456', backgroundColor: '#EEF0F2' },
+        cacheAnchor: { textColor: '#654321', backgroundColor: null },
+        cacheBudgetInsufficient: { textColor: '#334455', backgroundColor: '#FAFBFC' },
+        blockHashChange: { textColor: '#556677', backgroundColor: null },
+    };
+
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.requestCacheAppearance, defaults);
+    state = await postJson(fixture.gatewayBaseUrl, '/console/request-cache-appearance', { value: custom });
+    assert.deepEqual(state.requestCacheAppearance, custom);
+    let saved = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.deepEqual(saved.requestCacheAppearance, custom);
+
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.requestCacheAppearance, custom);
+
+    const invalid = await fetch(`${fixture.gatewayBaseUrl}/console/request-cache-appearance`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ value: { prefixLock: { textColor: 'black', backgroundColor: null } } }),
+    });
+    assert.equal(invalid.status, 400);
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.requestCacheAppearance, custom);
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/request-cache-appearance', { reset: true });
+    assert.deepEqual(state.requestCacheAppearance, defaults);
+    saved = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.deepEqual(saved.requestCacheAppearance, defaults);
+});
+
+test('configuration export, import, and default restore preserve the active upstream connection', async (t) => {
+    const fixture = await startGatewayFixture({ upstreamMode: 'openai', schemaVersion: 10 });
+    t.after(() => fixture.close());
+    const before = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    const exported = await fetchJson(`${fixture.gatewayBaseUrl}/console/config/export`);
+    assert.equal(exported.schemaVersion, 11);
+    const downloadResponse = await fetch(`${fixture.gatewayBaseUrl}/console/config/export?download=1`);
+    assert.equal(downloadResponse.status, 200);
+    assert.match(downloadResponse.headers.get('content-disposition') || '', /attachment/i);
+    assert.match(downloadResponse.headers.get('content-type') || '', /application\/json/i);
+    assert.equal(JSON.parse(await downloadResponse.text()).schemaVersion, 11);
+    assert.equal(exported.upstreamMode, before.upstreamMode);
+    assert.equal(exported.upstreamBaseUrl, before.upstreamBaseUrl);
+    assert.equal(Object.prototype.hasOwnProperty.call(exported, 'anchorState'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(exported, 'cacheAnchorState'), false);
+
+    let state = await postJson(fixture.gatewayBaseUrl, '/console/config/import', {
+        ...exported,
+        upstreamMode: 'anthropic',
+        upstreamBaseUrl: 'https://must-not-be-applied.example/v1',
+        fixedHeadBreakpointCount: 2,
+        cacheAnchorMode: 'single',
+        cacheAnchorIntervalBlocks: 7,
+        anchorState: { malicious: true },
+        cacheAnchorState: { malicious: true },
+    });
+    assert.equal(state.upstreamMode, before.upstreamMode);
+    assert.equal(state.upstreamBaseUrl, before.upstreamBaseUrl);
+    assert.equal(state.fixedHeadBreakpointCount, 2);
+    assert.equal(state.cacheAnchorMode, 'single');
+    assert.equal(state.cacheAnchorIntervalBlocks, 7);
+    assert.equal(state.cacheAnchorState.contextCount, 0);
+
+    await writeFile(join(fixture.temporaryDirectory, 'default-gateway-settings.json'), JSON.stringify({
+        schemaVersion: 11,
+        cacheTtl: '5m',
+        fixedHeadBreakpointCount: 4,
+        cacheAnchorMode: 'off',
+        cacheAnchorIntervalBlocks: 9,
+        upstreamMode: 'anthropic',
+        upstreamBaseUrl: 'https://default-must-not-replace.example',
+        anchorState: { ignored: true },
+    }, null, 2));
+    state = await postJson(fixture.gatewayBaseUrl, '/console/config/reset', {});
+    assert.equal(state.upstreamMode, before.upstreamMode);
+    assert.equal(state.upstreamBaseUrl, before.upstreamBaseUrl);
+    assert.equal(state.cacheTtl, '5m');
+    assert.equal(state.fixedHeadBreakpointCount, 4);
+    assert.equal(state.cacheAnchorMode, 'off');
+    assert.equal(state.cacheAnchorIntervalBlocks, 9);
+    assert.equal(state.cacheAnchorState.contextCount, 0);
 });
 
 test('partial legacy Usage appearance fills every missing nested field from defaults', async (t) => {
@@ -2100,6 +2313,155 @@ test('cache policy API is atomic and mutually exclusive with Prefix Lock', async
     assert.equal(invalid.status, 400, 'partial policy updates must be rejected');
 });
 
+test('cache policy processing order validates, persists, and clears incompatible learning data', async (t) => {
+    const fixture = await startGatewayFixture({ upstreamMode: 'openai', schemaVersion: 10 });
+    t.after(() => fixture.close());
+    const defaultOrder = [
+        'fixed-head',
+        'ignore-tail',
+        'cache-anchor',
+        'tail-fill',
+        'protected-tail-anchor',
+        'last-gateway-cache-point-5m',
+    ];
+    const customOrder = [
+        'ignore-tail',
+        'fixed-head',
+        'tail-fill',
+        'cache-anchor',
+        'protected-tail-anchor',
+        'last-gateway-cache-point-5m',
+    ];
+
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.cachePolicyProcessingOrder, defaultOrder);
+    await postJson(fixture.gatewayBaseUrl, '/console/prefix-lock', { enabled: true });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('order-prefix-learning'));
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.prefixLockActive, true);
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/cache-policy', {
+        fixedHeadBreakpointCount: 1,
+        cacheAnchorMode: 'off',
+        cacheAnchorIntervalBlocks: 3,
+        cachePolicyProcessingOrder: customOrder,
+    });
+    assert.deepEqual(state.cachePolicyProcessingOrder, customOrder);
+    assert.equal(state.prefixLockEnabled, true);
+    assert.equal(state.prefixLockActive, false, 'changing order must clear learned Prefix content');
+    assert.equal(state.cacheAnchorState.contextCount, 0);
+
+    const invalid = await fetch(`${fixture.gatewayBaseUrl}/console/cache-policy`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'off',
+            cacheAnchorIntervalBlocks: 3,
+            cachePolicyProcessingOrder: [...customOrder.slice(0, -1), 'ignore-tail'],
+        }),
+    });
+    assert.equal(invalid.status, 400);
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.cachePolicyProcessingOrder, customOrder);
+
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.cachePolicyProcessingOrder, customOrder);
+    assert.equal(state.prefixLockEnabled, true);
+    assert.equal(state.prefixLockActive, false);
+});
+
+test('learned cache-anchor state survives restart and is reused by the next request', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 10,
+        captureRequests: true,
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'single',
+            cacheAnchorIntervalBlocks: 3,
+        },
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('persisted-anchor', 'ABCDEFG'));
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheAnchorState.contextCount, 1);
+    assert.equal(state.cacheAnchorState.activeAnchorCount, 1);
+
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.cacheAnchorState.contextCount, 1);
+    assert.equal(state.cacheAnchorState.activeAnchorCount, 1);
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('persisted-anchor', 'ABCDEFGHIJ'));
+    const list = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    assert.equal(list.requests[0].cachePolicyAction, 'match');
+    assert.ok(findCacheControlledTexts(fixture.requests.at(-1).body.messages).includes('E'));
+
+    const persisted = JSON.parse(await readFile(fixture.runtimeStatePath, 'utf8'));
+    assert.equal(persisted.schemaVersion, 1);
+    assert.equal(persisted.anchorStore.contexts.length, 1);
+});
+
+test('learned Prefix Lock content and statistics survive restart', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 10,
+        policy: {
+            fixedHeadBreakpointCount: 1,
+            cacheAnchorMode: 'off',
+            cacheAnchorIntervalBlocks: 3,
+        },
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/console/prefix-lock', { enabled: true });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('persisted-prefix', 'ABCDEFG'));
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    const learnedHash = state.prefixLockHash;
+    assert.equal(state.prefixLockActive, true);
+    assert.ok(learnedHash);
+
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.prefixLockEnabled, true);
+    assert.equal(state.prefixLockActive, true);
+    assert.equal(state.prefixLockHash, learnedHash);
+
+    const changed = markerBody('persisted-prefix', 'ABCDEFG');
+    changed.messages[0].content[0].text = `Changed${MARKER}`;
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', changed);
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.ok(state.prefixLockReplacements >= 1);
+    assert.equal(findCacheControlledTexts(fixture.requests.at(-1).body.messages)[0], 'A');
+});
+
+test('corrupt local state and request-log files fall back safely without blocking startup', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 10,
+        captureRequests: true,
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('corrupt-state-seed'));
+    await fixture.stopGateway();
+    await Promise.all([
+        writeFile(fixture.runtimeStatePath, '{broken runtime json'),
+        writeFile(fixture.requestLogsPath, '{broken logs json'),
+    ]);
+    await fixture.startGateway();
+
+    const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(state.capturedRequests, 0);
+    assert.equal(state.cacheAnchorState.contextCount, 0);
+    assert.ok(state.persistence.runtimeState.lastError);
+    assert.ok(state.persistence.requestLogs.lastError);
+    const response = await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', markerBody('corrupt-state-recovery'));
+    assert.equal(response.object, 'chat.completion');
+});
+
 test('per-block hashes compare successive requests and expose token summary statistics', async (t) => {
     const fixture = await startGatewayFixture({
         upstreamMode: 'openai',
@@ -2224,9 +2586,13 @@ test('evaluation mode starts at zero and applies a stable result after three con
         '/v1/chat/completions',
         markerBody('evaluation-model', 'ABCDEFGHIJKLMNOPQRST'),
     );
-    const restarted = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    let restarted = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     assert.equal(restarted.anchorIgnoreEvaluation.requestsCompleted, 1);
     assert.match(restarted.anchorIgnoreEvaluation.notice, /重新开始/);
+    await fixture.restart();
+    restarted = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.equal(restarted.anchorIgnoreEvaluation.requestsCompleted, 1, 'evaluation progress must survive restart');
+    assert.equal(restarted.anchorIgnoreEvaluation.requestsRemaining, 2);
 
     for (let index = 0; index < 2; index += 1) {
         await postJson(
