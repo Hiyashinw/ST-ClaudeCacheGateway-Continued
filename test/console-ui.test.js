@@ -44,7 +44,8 @@ function loadConsoleHelpers() {
     vm.runInContext(`${withoutBootstrap}\n;globalThis.__helpers = {\n`
         + 'tableCell, countCharacters, getOrderedBodySegments, groupBodySegmentsForDisplay, displayGroupCharacterCount, '
         + 'promptTokensFromUsage, usageStatistics, usageRateLabel, usageRateBand, renderUsageLines, getPromptTokenEstimate, renderRequestBodyStream, '
-        + 'candidateBreakpoints, unusedCandidateBreakpoints, getBlockHashEntries, estimatedTokens, promptEstimateLabel, inputPromptTokenLabel, systemMessageHandlingMode, systemMessageHandlingLabel\n};', context);
+        + 'candidateBreakpoints, unusedCandidateBreakpoints, getBlockHashEntries, estimatedTokens, promptEstimateLabel, inputPromptTokenLabel, systemMessageHandlingMode, systemMessageHandlingLabel, '
+        + 'prefixLockStatusLabel, requestCacheAnchorMode, cacheAnchorRequestLabel, anchorActionLabel, anchorReasonLabel, renderRequestCacheSummary\n};', context);
     return context.__helpers;
 }
 
@@ -60,6 +61,11 @@ function elementsByClass(root, className) {
     visit(root);
     return matches;
 }
+function renderedText(root) {
+    if (!root || typeof root !== 'object') return '';
+    if (root.nodeType === 3) return String(root.textContent || '');
+    return `${root.textContent || ''}${(root.children || []).map(renderedText).join('')}`;
+}
 
 test('request-log container cells keep explicit empty strings empty', () => {
     const row = fakeElement('tr');
@@ -69,6 +75,109 @@ test('request-log container cells keep explicit empty strings empty', () => {
     assert.equal(cell.className, 'log-action-cell');
     assert.equal(cell.dataset.label, '详情');
     assert.equal(row.children[0], cell);
+});
+
+test('request-log Prefix and anchor summary uses Chinese rows and severity chips', () => {
+    const root = fakeElement('td');
+    helpers.renderRequestCacheSummary(root, {
+        prefixLockEnabled: false,
+        prefixLockAction: 'skipped',
+        prefixLockReason: 'cache-anchor-enabled',
+        cacheAnchorMode: 'rolling',
+        cacheTranslationEnabled: true,
+        cachePolicyAction: 'promote',
+        cachePolicyReason: 'deeper-anchor-mismatch',
+        cacheContextHash: '6124045f59ab',
+        prefixHash: 'd7c556a594deadbeef',
+        changedBlockCount: 6,
+    });
+
+    assert.deepEqual(
+        elementsByClass(root, 'request-cache-summary-label').map((entry) => entry.textContent),
+        ['强制 Prefix 锁定', '缓存锚点', '锚点状态', '锚点上下文 ID', '块哈希变更'],
+    );
+    assert.deepEqual(
+        elementsByClass(root, 'request-cache-summary-value').map(renderedText),
+        ['关闭', '滚动锚点', '晋升部分缓存锚点失效', '6124045f59', '6'],
+    );
+
+    const visible = renderedText(root);
+    assert.doesNotMatch(visible, /d7c556a594|promote|deeper-anchor-mismatch/);
+    assert.equal(elementsByClass(root, 'danger')[0].textContent, '部分缓存锚点失效');
+    assert.equal(elementsByClass(root, 'warning')[0].textContent, '6');
+
+    const offRoot = fakeElement('td');
+    helpers.renderRequestCacheSummary(offRoot, {
+        prefixLockEnabled: true,
+        prefixLockAction: 'replaced',
+        cacheAnchorMode: 'off',
+        cachePolicyAction: 'promote',
+        cachePolicyReason: 'deeper-anchor-mismatch',
+        cacheContextHash: 'should-not-render',
+        changedBlockCount: 0,
+    });
+    assert.deepEqual(
+        elementsByClass(offRoot, 'request-cache-summary-label').map((entry) => entry.textContent),
+        ['强制 Prefix 锁定', '缓存锚点'],
+    );
+});
+
+test('request-log Prefix statuses cover every request outcome in Chinese', () => {
+    const cases = [
+        [{ prefixLockEnabled: false, prefixLockAction: 'skipped', prefixLockReason: 'cache-anchor-enabled' }, '关闭'],
+        [{ prefixLockEnabled: true, prefixLockAction: 'created' }, '开启 · 已学习'],
+        [{ prefixLockEnabled: true, prefixLockAction: 'replaced' }, '开启 · 已应用'],
+        [{ prefixLockEnabled: true, prefixLockAction: 'skipped', prefixLockReason: 'no-cache-control' }, '开启 · 本次无缓存点'],
+        [{ prefixLockEnabled: true, prefixLockAction: 'skipped', prefixLockReason: 'mode-mismatch' }, '开启 · 上游格式不一致'],
+        [{ prefixLockEnabled: true, prefixLockAction: 'skipped', prefixLockReason: 'cache-translation-disabled' }, '开启 · 已暂停'],
+        [{ prefixLockEnabled: true, prefixLockAction: 'skipped', prefixLockReason: 'future-reason' }, '开启 · 本次跳过'],
+        [{ prefixLockEnabled: true, prefixLockAction: 'future-action' }, '开启 · 状态未知'],
+    ];
+
+    for (const [item, expected] of cases) {
+        assert.equal(helpers.prefixLockStatusLabel(item), expected);
+    }
+});
+
+test('request-log anchor modes, actions and reasons have complete Chinese labels', () => {
+    assert.equal(helpers.cacheAnchorRequestLabel({ cacheAnchorMode: 'off' }), '关闭');
+    assert.equal(helpers.cacheAnchorRequestLabel({ cacheAnchorMode: 'single', cacheTranslationEnabled: true }), '单锚点');
+    assert.equal(helpers.cacheAnchorRequestLabel({ cacheAnchorMode: 'rolling', cacheTranslationEnabled: false }), '滚动锚点 · 已暂停');
+    assert.equal(helpers.cacheAnchorRequestLabel({ cacheAnchorMode: 'future-mode' }), '状态未知');
+
+    const actions = {
+        learn: '学习',
+        match: '复用',
+        promote: '晋升',
+        reset: '重新学习',
+        'rotation-paused': '轮换暂停',
+        'no-candidates': '无可用锚点',
+    };
+    for (const [code, expected] of Object.entries(actions)) {
+        assert.equal(helpers.anchorActionLabel(code), expected);
+    }
+    assert.equal(helpers.anchorActionLabel('future-action'), '未知状态');
+
+    const reasons = {
+        'deeper-anchor-mismatch': '部分缓存锚点失效',
+        'caller-control-reserved': '调用方缓存点占用',
+        'anchor-capacity-reduced': '可用锚点容量减少',
+        'anchor-overlap-budget': '晋升锚点超出缓存点额度',
+        'anchor-budget-unavailable': '缓存点额度不足',
+        'protected-last-anchor-budget': '保护尾锚点额度不足',
+    };
+    for (const [code, expected] of Object.entries(reasons)) {
+        assert.equal(helpers.anchorReasonLabel(code), expected);
+    }
+    assert.equal(helpers.anchorReasonLabel('future-reason'), '其他原因');
+});
+
+test('request-log Prefix and anchor CSS aligns rows and uses warning and danger colors', () => {
+    assert.match(consoleCss, /\.request-cache-summary-row\s*\{[^}]*grid-template-columns:\s*9em minmax\(0, 1fr\)/s);
+    assert.match(consoleCss, /\.request-cache-status-chip\.warning\s*\{[^}]*var\(--warning-soft\)[^}]*var\(--warning\)/s);
+    assert.match(consoleCss, /\.request-cache-status-chip\.danger\s*\{[^}]*var\(--danger-soft\)[^}]*var\(--danger\)/s);
+    assert.match(consoleCss, /@media \(max-width: 980px\)[\s\S]*\.request-cache-cell\s*\{\s*min-width:\s*0;/);
+    assert.match(consoleCss, /@media \(max-width: 980px\)[\s\S]*\.request-cache-summary-row\s*\{[^}]*grid-template-columns:\s*8\.5em minmax\(0, 1fr\)/);
 });
 
 test('Anthropic prompt tokens include uncached, cache-read and cache-created input', () => {

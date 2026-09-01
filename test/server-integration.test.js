@@ -2040,6 +2040,11 @@ test('single mode learns the first non-fixed breakpoint that actually survived t
 
     const captureList = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
     assert.equal(captureList.requests.length, 2);
+    assert.equal(captureList.requests[0].cacheAnchorMode, 'single');
+    assert.equal(captureList.requests[0].prefixLockEnabled, false);
+    assert.equal(captureList.requests[0].prefixLockAction, 'skipped');
+    assert.equal(captureList.requests[0].prefixLockReason, 'cache-anchor-enabled');
+    assert.equal(Object.hasOwn(captureList.requests[0], 'prefixHash'), true, 'existing summary fields must remain available');
     const secondCapture = await fetchJson(
         `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(captureList.requests[0].id)}`,
     );

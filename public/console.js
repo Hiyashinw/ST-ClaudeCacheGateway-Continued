@@ -290,10 +290,129 @@ function cacheInjectLabel(item) {
   return '未注入';
 }
 
-function prefixActionLabel(item) {
-  const action = item?.prefixLockAction || 'disabled';
-  const reason = item?.prefixLockReason;
-  return reason ? `${action} · ${reason}` : action;
+function normalizedDiagnosticCode(value) {
+  return String(value || '').trim().toLowerCase().replaceAll('_', '-');
+}
+
+function prefixLockStatusLabel(item) {
+  const enabled = item?.prefixLockEnabled;
+  const action = normalizedDiagnosticCode(item?.prefixLockAction);
+  const reason = normalizedDiagnosticCode(item?.prefixLockReason);
+
+  if (enabled === false || action === 'disabled' || reason === 'cache-anchor-enabled') return '关闭';
+  if (action === 'created') return '开启 · 已学习';
+  if (action === 'replaced') return '开启 · 已应用';
+  if (action === 'cleared') return '关闭 · 已清空';
+  if (action === 'learning') return '开启 · 待学习';
+  if (action === 'skipped') {
+    if (reason === 'cache-translation-disabled') return '开启 · 已暂停';
+    if (reason === 'no-cache-control') return '开启 · 本次无缓存点';
+    if (reason === 'mode-mismatch') return '开启 · 上游格式不一致';
+    return enabled === true ? '开启 · 本次跳过' : '关闭';
+  }
+  if (action === 'enabled' || (enabled === true && !action)) return '开启';
+  if (enabled === true) return '开启 · 状态未知';
+  return action ? '状态未知' : '关闭';
+}
+
+function requestCacheAnchorMode(item, diagnostics = getCaptureCachePolicy(item)) {
+  const value = item?.cacheAnchorMode ?? diagnostics?.policy?.cacheAnchorMode;
+  if (value === null || value === undefined || value === '') return 'off';
+  const normalized = normalizedDiagnosticCode(value);
+  return ['off', 'single', 'rolling'].includes(normalized) ? normalized : 'unknown';
+}
+
+function cacheAnchorRequestLabel(item, diagnostics = getCaptureCachePolicy(item)) {
+  const mode = requestCacheAnchorMode(item, diagnostics);
+  if (mode === 'unknown') return '状态未知';
+  if (mode === 'off') return '关闭';
+  const label = cacheAnchorModeLabel(mode);
+  return item?.cacheTranslationEnabled === false ? `${label} · 已暂停` : label;
+}
+
+function anchorActionLabel(value) {
+  const labels = {
+    learn: '学习',
+    match: '复用',
+    promote: '晋升',
+    reset: '重新学习',
+    'rotation-paused': '轮换暂停',
+    'no-candidates': '无可用锚点',
+    disabled: '已关闭',
+    off: '已关闭',
+  };
+  return labels[normalizedDiagnosticCode(value)] || '未知状态';
+}
+
+function anchorReasonLabel(value) {
+  if (!value) return null;
+  const labels = {
+    'deeper-anchor-mismatch': '部分缓存锚点失效',
+    'caller-control-reserved': '调用方缓存点占用',
+    'anchor-capacity-reduced': '可用锚点容量减少',
+    'anchor-overlap-budget': '晋升锚点超出缓存点额度',
+    'anchor-budget-unavailable': '缓存点额度不足',
+    'protected-last-anchor-budget': '保护尾锚点额度不足',
+  };
+  return labels[normalizedDiagnosticCode(value)] || '其他原因';
+}
+
+function anchorReasonClass(value) {
+  return normalizedDiagnosticCode(value) === 'deeper-anchor-mismatch' ? 'danger' : '';
+}
+
+function appendRequestCacheSummaryRow(root, label) {
+  const row = document.createElement('div');
+  row.className = 'request-cache-summary-row';
+  appendText(row, 'dt', label, 'request-cache-summary-label');
+  const value = document.createElement('dd');
+  value.className = 'request-cache-summary-value';
+  row.appendChild(value);
+  root.appendChild(row);
+  return value;
+}
+
+function renderRequestCacheSummary(root, item) {
+  clearNode(root);
+  const summary = document.createElement('dl');
+  summary.className = 'request-cache-summary';
+  const diagnostics = getCaptureCachePolicy(item);
+
+  let value = appendRequestCacheSummaryRow(summary, '强制 Prefix 锁定');
+  appendText(value, 'span', prefixLockStatusLabel(item), 'request-cache-summary-text');
+
+  value = appendRequestCacheSummaryRow(summary, '缓存锚点');
+  appendText(value, 'span', cacheAnchorRequestLabel(item, diagnostics), 'request-cache-summary-text');
+
+  const anchorMode = requestCacheAnchorMode(item, diagnostics);
+  const anchorAction = normalizedDiagnosticCode(diagnostics.action);
+  if (['single', 'rolling'].includes(anchorMode) && anchorAction && !['off', 'disabled'].includes(anchorAction)) {
+    value = appendRequestCacheSummaryRow(summary, '锚点状态');
+    appendText(value, 'span', anchorActionLabel(anchorAction), 'request-cache-summary-text');
+    if (diagnostics.reason) {
+      const reasonClass = anchorReasonClass(diagnostics.reason);
+      appendText(
+        value,
+        'span',
+        anchorReasonLabel(diagnostics.reason),
+        `request-cache-status-chip ${reasonClass}`.trim(),
+      );
+    }
+  }
+
+  if (['single', 'rolling'].includes(anchorMode) && diagnostics.contextHash) {
+    value = appendRequestCacheSummaryRow(summary, '锚点上下文 ID');
+    appendText(value, 'span', compactHash(diagnostics.contextHash), 'request-cache-summary-id');
+  }
+
+  const changedBlockCount = Number(item?.changedBlockCount || 0);
+  if (Number.isFinite(changedBlockCount) && changedBlockCount > 0) {
+    value = appendRequestCacheSummaryRow(summary, '块哈希变更');
+    appendText(value, 'span', changedBlockCount, 'request-cache-status-chip warning request-cache-summary-id');
+  }
+
+  root.appendChild(summary);
+  return summary;
 }
 
 function compactHash(value) {
@@ -1042,24 +1161,8 @@ function renderRequests() {
       appendText(injection, 'small', summaryBreakpoints.map(breakpointReasonsLabel).join(' / '));
     }
 
-    const prefix = tableCell(tr, '', 'td-mono', 'Prefix / 锚点');
-    prefix.append(document.createTextNode(`Prefix ${prefixActionLabel(item)}`));
-    if (item.prefixHash) {
-      prefix.appendChild(document.createElement('br'));
-      appendText(prefix, 'small', compactHash(item.prefixHash));
-    }
-    const policyDiagnostics = getCaptureCachePolicy(item);
-    if (policyDiagnostics.action || policyDiagnostics.reason || policyDiagnostics.contextHash) {
-      prefix.appendChild(document.createElement('br'));
-      const anchorDetails = [policyDiagnostics.action, policyDiagnostics.reason, policyDiagnostics.contextHash ? compactHash(policyDiagnostics.contextHash) : null]
-        .filter(Boolean)
-        .join(' · ');
-      appendText(prefix, 'small', `锚点 ${anchorDetails}`);
-    }
-    if (item.changedBlockCount > 0) {
-      prefix.appendChild(document.createElement('br'));
-      appendText(prefix, 'small', `块哈希变更 ${item.changedBlockCount}`);
-    }
+    const prefix = tableCell(tr, '', 'request-cache-cell', 'Prefix 锁定 / 缓存锚点');
+    renderRequestCacheSummary(prefix, item);
 
     const stats = tableCell(tr, '', '', 'Usage');
     renderUsageLines(stats, {

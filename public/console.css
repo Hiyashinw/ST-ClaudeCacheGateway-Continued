@@ -363,6 +363,17 @@ table { width: 100%; border-collapse: collapse; min-width: 900px; }
 th, td { padding: 12px 14px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
 th { background-color: var(--bg-app); color: var(--text-muted); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid var(--border-strong); }
 td { font-size: 13.5px; }
+.request-cache-cell { min-width: 280px; font-family: var(--font-sans); }
+.request-cache-summary { display: grid; gap: 6px; margin: 0; }
+.request-cache-summary-row { display: grid; grid-template-columns: 9em minmax(0, 1fr); gap: 8px; align-items: start; min-width: 0; }
+.request-cache-summary-label, .request-cache-summary-value { margin: 0; }
+.request-cache-summary-label { color: var(--text-muted); font-size: 11.5px; font-weight: 800; line-height: 1.5; white-space: nowrap; }
+.request-cache-summary-value { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; min-width: 0; color: var(--text-main); line-height: 1.5; overflow-wrap: anywhere; }
+.request-cache-summary-text { min-width: 0; }
+.request-cache-summary-id { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.request-cache-status-chip { display: inline-flex; align-items: center; min-height: 20px; max-width: 100%; padding: 1px 7px; border: 1px solid var(--border-strong); border-radius: 999px; background-color: var(--bg-app); color: var(--text-muted); font-size: 11.5px; font-weight: 800; line-height: 1.4; white-space: normal; }
+.request-cache-status-chip.warning { border-color: #eccfb3; background-color: var(--warning-soft); color: var(--warning); }
+.request-cache-status-chip.danger { border-color: #fca5a5; background-color: var(--danger-soft); color: var(--danger); }
 tr:hover td { background-color: var(--bg-app); }
 .pagination { display: flex; justify-content: center; align-items: center; gap: 12px; margin-top: 14px; }
 
@@ -566,6 +577,8 @@ tr:hover td { background-color: var(--bg-app); }
   td:last-child { border-bottom: 0; }
   td::before { content: attr(data-label); display: block; margin-bottom: 3px; color: var(--text-muted); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; }
   td small { color: var(--text-muted); }
+  .request-cache-cell { min-width: 0; }
+  .request-cache-summary-row { grid-template-columns: 8.5em minmax(0, 1fr); }
   .log-action-cell { padding-top: 4px; padding-bottom: 2px; }
   .log-action-cell::before { display: none; }
   .log-action-cell button { width: 100%; }
