@@ -43,8 +43,8 @@ function loadConsoleHelpers() {
     });
     vm.runInContext(`${withoutBootstrap}\n;globalThis.__helpers = {\n`
         + 'tableCell, countCharacters, getOrderedBodySegments, groupBodySegmentsForDisplay, displayGroupCharacterCount, '
-        + 'promptTokensFromUsage, usageStatistics, usageRateLabel, renderUsageLines, getPromptTokenEstimate, renderRequestBodyStream, '
-        + 'getBlockHashEntries, estimatedTokens, promptEstimateLabel, inputPromptTokenLabel, systemMessageHandlingMode, systemMessageHandlingLabel\n};', context);
+        + 'promptTokensFromUsage, usageStatistics, usageRateLabel, usageRateBand, renderUsageLines, getPromptTokenEstimate, renderRequestBodyStream, '
+        + 'candidateBreakpoints, unusedCandidateBreakpoints, getBlockHashEntries, estimatedTokens, promptEstimateLabel, inputPromptTokenLabel, systemMessageHandlingMode, systemMessageHandlingLabel\n};', context);
     return context.__helpers;
 }
 
@@ -205,6 +205,7 @@ test('collapsed message cards keep cache dividers visible while ordinary bodies 
     assert.match(consoleCss, /\.msg-card\.collapsed:not\(\.has-cache-breakpoints\) \.msg-body\s*\{\s*display:\s*none;/);
     assert.match(consoleCss, /\.msg-card\.collapsed\.has-cache-breakpoints \.msg-content-block\s*\{\s*display:\s*none;/);
     assert.doesNotMatch(consoleCss, /\.msg-card\.collapsed \.msg-body\s*\{\s*display:\s*none;/);
+    assert.match(consoleCss, /\.cache-divider\.unused-cache-divider\s*\{[^}]*min-height:\s*24px;/s);
 });
 
 test('display grouping never hides genuinely adjacent same-role messages', () => {
@@ -375,11 +376,25 @@ test('Usage statistics expose input, output and cache hit rate without the old r
         cacheReadTokens: 39552,
         cacheHitRatePercent: 99.93,
     }, 'compact');
-    assert.equal(elementsByClass(root, 'usage-line').length, 3);
+    assert.equal(elementsByClass(root, 'usage-metric').length, 4);
+    assert.equal(elementsByClass(root, 'usage-grid-divider').length, 2);
+    assert.equal(elementsByClass(root, 'usage-rate-row').length, 1);
+    assert.deepEqual(
+        elementsByClass(root, 'usage-label').map((entry) => entry.textContent),
+        ['输入', '输出', '缓存命中', '创建', '缓存命中率'],
+    );
     assert.deepEqual(
         elementsByClass(root, 'usage-value').map((entry) => entry.textContent),
-        ['39579', '376', '0', '39552', '99.93%'],
+        ['39579', '376', '39552', '0', '99.93%'],
     );
+    assert.equal(helpers.usageRateBand(50), 'rate-le50');
+    assert.equal(helpers.usageRateBand(50.01), 'rate-le70');
+    assert.equal(helpers.usageRateBand(70), 'rate-le70');
+    assert.equal(helpers.usageRateBand(70.01), 'rate-le90');
+    assert.equal(helpers.usageRateBand(90), 'rate-le90');
+    assert.equal(helpers.usageRateBand(90.01), 'rate-le100');
+    assert.equal(helpers.usageRateBand(100), 'rate-le100');
+    assert.equal(helpers.usageRateBand(null), null);
 
     const html = readFileSync(new URL('../public/console.html', import.meta.url), 'utf8');
     const script = readFileSync(new URL('../public/console.js', import.meta.url), 'utf8');
@@ -388,6 +403,100 @@ test('Usage statistics expose input, output and cache hit rate without the old r
     assert.match(html, /detailUsageStats/);
     assert.match(script, /缓存命中率/);
     assert.doesNotMatch(script, /upstreamStatsLabel/);
+});
+
+test('Usage appearance controls expose every metric and CSS variable', () => {
+    const html = readFileSync(new URL('../public/console.html', import.meta.url), 'utf8');
+    for (const key of ['input', 'output', 'cacheRead', 'cacheWrite', 'hitRate.le50', 'hitRate.le70', 'hitRate.le90', 'hitRate.le100']) {
+        assert.match(html, new RegExp(`data-usage-style="${key.replace('.', '\\.')}"`));
+    }
+    assert.match(html, /id="usageAppearanceApply"/);
+    assert.match(html, /id="usageAppearanceReset"/);
+    assert.match(consoleCss, /--usage-input-text:\s*#127852/i);
+    assert.match(consoleCss, /--usage-output-text:\s*#7c3aed/i);
+    assert.match(consoleCss, /grid-template-columns:\s*minmax\(0, 1fr\) 1px minmax\(0, 1fr\)/);
+    assert.match(consoleCss, /font-variant-numeric:\s*tabular-nums/);
+});
+
+test('unselected cache candidates render at their original message positions only in the full body view', () => {
+    const selectedIndexes = new Set([0, 7, 8, 9]);
+    const messages = Array.from({ length: 10 }, (_, index) => ({
+        role: index % 2 === 0 ? 'user' : 'assistant',
+        content: [{
+            type: 'text',
+            text: String.fromCharCode(65 + index),
+            ...(selectedIndexes.has(index) ? { cache_control: { type: 'ephemeral' } } : {}),
+        }],
+    }));
+    const candidates = messages.map((_, index) => ({
+        order: index,
+        path: `messages[${index}].content[0].cache_control`,
+        selected: selectedIndexes.has(index),
+        reason: selectedIndexes.has(index) ? 'tail' : 'overflow',
+    }));
+    const selectedBreakpoints = candidates.filter((candidate) => candidate.selected);
+    const capture = {
+        upstream: {
+            mode: 'openai',
+            body: { messages },
+            cache: {
+                cacheControlCount: 4,
+                selectedBreakpoints,
+                cacheControlPaths: selectedBreakpoints.map((entry) => entry.path),
+            },
+        },
+        gateway: { cachePolicy: { candidates, selectedBreakpoints }, cacheTtl: 'auto' },
+        response: { usage: { inputTokens: 100 } },
+    };
+    const root = fakeElement('div');
+    helpers.renderRequestBodyStream(root, capture);
+
+    const cards = elementsByClass(root, 'msg-card');
+    assert.equal(cards.length, 10);
+    assert.equal(elementsByClass(root, 'unused-cache-divider').length, 6);
+    assert.equal(elementsByClass(root, 'cache-divider').length, 10);
+    for (let index = 0; index < 10; index++) {
+        const unused = elementsByClass(cards[index], 'unused-cache-divider');
+        assert.equal(unused.length, selectedIndexes.has(index) ? 0 : 1);
+        if (unused.length) {
+            assert.equal(elementsByClass(unused[0], 'unused-cache-title')[0].textContent, '未使用缓存点');
+            assert.equal(elementsByClass(unused[0], 'cache-icon').length, 0);
+            assert.equal(elementsByClass(unused[0], 'cache-sub').length, 0);
+        }
+    }
+
+    assert.equal(helpers.candidateBreakpoints(capture).length, 10);
+    assert.equal(helpers.unusedCandidateBreakpoints(capture).length, 6);
+    const prefixRoot = fakeElement('div');
+    helpers.renderRequestBodyStream(prefixRoot, capture, true);
+    assert.equal(elementsByClass(prefixRoot, 'unused-cache-divider').length, 0);
+});
+
+test('unused cache points are not capacity placeholders when every candidate is selected', () => {
+    const candidates = [0, 1].map((index) => ({
+        order: index,
+        path: `messages[${index}].content[0].cache_control`,
+        selected: true,
+        reason: 'tail',
+    }));
+    const capture = {
+        upstream: {
+            mode: 'openai',
+            body: {
+                messages: candidates.map((_, index) => ({
+                    role: 'user',
+                    content: [{ type: 'text', text: String(index), cache_control: { type: 'ephemeral' } }],
+                })),
+            },
+            cache: { selectedBreakpoints: candidates },
+        },
+        gateway: { cachePolicy: { candidates, selectedBreakpoints: candidates } },
+        response: { usage: { inputTokens: 10 } },
+    };
+    const root = fakeElement('div');
+    helpers.renderRequestBodyStream(root, capture);
+    assert.equal(elementsByClass(root, 'unused-cache-divider').length, 0);
+    assert.equal(elementsByClass(root, 'cache-divider').length, 2);
 });
 
 test('block hash entries are available to the diagnostic renderer', () => {

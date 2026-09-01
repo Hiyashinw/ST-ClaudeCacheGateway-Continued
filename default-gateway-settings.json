@@ -1,9 +1,45 @@
 {
-  "schemaVersion": 9,
+  "schemaVersion": 10,
   "cacheTranslationEnabled": true,
   "systemMessageHandlingMode": "default",
   "autoGenerateCacheBreakpointsMode": "auto",
   "captureRequests": true,
+  "usageAppearance": {
+    "input": {
+      "textColor": "#127852",
+      "backgroundColor": null
+    },
+    "output": {
+      "textColor": "#7C3AED",
+      "backgroundColor": null
+    },
+    "cacheRead": {
+      "textColor": "#2563EB",
+      "backgroundColor": null
+    },
+    "cacheWrite": {
+      "textColor": "#A16207",
+      "backgroundColor": null
+    },
+    "hitRate": {
+      "le50": {
+        "textColor": "#B91C1C",
+        "backgroundColor": null
+      },
+      "le70": {
+        "textColor": "#A16207",
+        "backgroundColor": null
+      },
+      "le90": {
+        "textColor": "#2563EB",
+        "backgroundColor": null
+      },
+      "le100": {
+        "textColor": "#127852",
+        "backgroundColor": null
+      }
+    }
+  },
   "cacheTtl": "manual",
   "fixedHeadBreakpointCount": 1,
   "cacheAnchorMode": "rolling",

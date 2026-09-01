@@ -302,6 +302,67 @@
 
     <section class="page" id="page-advanced">
       <section class="panel">
+        <div class="panel-head"><h3>Usage 外观</h3><span id="usageAppearanceBadge" class="badge">加载中</span></div>
+        <p class="note">全局显示配置，适用于所有渠道的请求列表和 Usage 详情。背景默认透明；修改中的效果会在右侧即时预览，点击“应用配色”后才会持久保存。</p>
+        <div class="usage-appearance-layout">
+          <div class="usage-color-grid" id="usageAppearanceControls">
+            <div class="usage-color-row" data-usage-style="input">
+              <strong class="usage-color-name">输入</strong>
+              <label class="usage-color-control"><span>文字</span><input type="color" value="#127852" data-usage-text-color aria-label="输入文字颜色"></label>
+              <label class="usage-color-control"><span>背景</span><input type="color" value="#FFFFFF" data-usage-background-color aria-label="输入背景颜色" disabled></label>
+              <label class="usage-transparent-control"><input type="checkbox" data-usage-background-transparent checked><span>透明</span></label>
+            </div>
+            <div class="usage-color-row" data-usage-style="output">
+              <strong class="usage-color-name">输出</strong>
+              <label class="usage-color-control"><span>文字</span><input type="color" value="#7C3AED" data-usage-text-color aria-label="输出文字颜色"></label>
+              <label class="usage-color-control"><span>背景</span><input type="color" value="#FFFFFF" data-usage-background-color aria-label="输出背景颜色" disabled></label>
+              <label class="usage-transparent-control"><input type="checkbox" data-usage-background-transparent checked><span>透明</span></label>
+            </div>
+            <div class="usage-color-row" data-usage-style="cacheRead">
+              <strong class="usage-color-name">缓存命中</strong>
+              <label class="usage-color-control"><span>文字</span><input type="color" value="#2563EB" data-usage-text-color aria-label="缓存命中文字颜色"></label>
+              <label class="usage-color-control"><span>背景</span><input type="color" value="#FFFFFF" data-usage-background-color aria-label="缓存命中背景颜色" disabled></label>
+              <label class="usage-transparent-control"><input type="checkbox" data-usage-background-transparent checked><span>透明</span></label>
+            </div>
+            <div class="usage-color-row" data-usage-style="cacheWrite">
+              <strong class="usage-color-name">缓存创建</strong>
+              <label class="usage-color-control"><span>文字</span><input type="color" value="#A16207" data-usage-text-color aria-label="缓存创建文字颜色"></label>
+              <label class="usage-color-control"><span>背景</span><input type="color" value="#FFFFFF" data-usage-background-color aria-label="缓存创建背景颜色" disabled></label>
+              <label class="usage-transparent-control"><input type="checkbox" data-usage-background-transparent checked><span>透明</span></label>
+            </div>
+            <div class="usage-color-row" data-usage-style="hitRate.le50">
+              <strong class="usage-color-name">命中率 ≤ 50%</strong>
+              <label class="usage-color-control"><span>文字</span><input type="color" value="#B91C1C" data-usage-text-color aria-label="命中率 ≤ 50%文字颜色"></label>
+              <label class="usage-color-control"><span>背景</span><input type="color" value="#FFFFFF" data-usage-background-color aria-label="命中率 ≤ 50%背景颜色" disabled></label>
+              <label class="usage-transparent-control"><input type="checkbox" data-usage-background-transparent checked><span>透明</span></label>
+            </div>
+            <div class="usage-color-row" data-usage-style="hitRate.le70">
+              <strong class="usage-color-name">命中率 ≤ 70%</strong>
+              <label class="usage-color-control"><span>文字</span><input type="color" value="#A16207" data-usage-text-color aria-label="命中率 ≤ 70%文字颜色"></label>
+              <label class="usage-color-control"><span>背景</span><input type="color" value="#FFFFFF" data-usage-background-color aria-label="命中率 ≤ 70%背景颜色" disabled></label>
+              <label class="usage-transparent-control"><input type="checkbox" data-usage-background-transparent checked><span>透明</span></label>
+            </div>
+            <div class="usage-color-row" data-usage-style="hitRate.le90">
+              <strong class="usage-color-name">命中率 ≤ 90%</strong>
+              <label class="usage-color-control"><span>文字</span><input type="color" value="#2563EB" data-usage-text-color aria-label="命中率 ≤ 90%文字颜色"></label>
+              <label class="usage-color-control"><span>背景</span><input type="color" value="#FFFFFF" data-usage-background-color aria-label="命中率 ≤ 90%背景颜色" disabled></label>
+              <label class="usage-transparent-control"><input type="checkbox" data-usage-background-transparent checked><span>透明</span></label>
+            </div>
+            <div class="usage-color-row" data-usage-style="hitRate.le100">
+              <strong class="usage-color-name">命中率 > 90%</strong>
+              <label class="usage-color-control"><span>文字</span><input type="color" value="#127852" data-usage-text-color aria-label="命中率 > 90%文字颜色"></label>
+              <label class="usage-color-control"><span>背景</span><input type="color" value="#FFFFFF" data-usage-background-color aria-label="命中率 > 90%背景颜色" disabled></label>
+              <label class="usage-transparent-control"><input type="checkbox" data-usage-background-transparent checked><span>透明</span></label>
+            </div>
+          </div>
+          <div class="usage-preview-box">
+            <div class="param-head"><h4>即时预览</h4><span>示例数据</span></div>
+            <div id="usageAppearancePreview" class="usage-lines detail usage-preview"></div>
+          </div>
+        </div>
+        <div class="button-row usage-appearance-actions"><button id="usageAppearanceReset">恢复默认</button><button id="usageAppearanceApply" class="primary">应用配色</button></div>
+      </section>
+      <section class="panel">
         <div class="panel-head"><h3>主体参数处理</h3><span id="extraJsonBadge" class="badge">加载中</span></div>
         <p class="note">只在 OpenAI-compatible 上游格式生效。包含参数会深度合并到最终请求体；排除参数会在发送上游前按字段路径删除。不要在这里填写 API Key。</p>
         <div class="advanced-grid">
@@ -482,12 +543,13 @@
       <section class="guide-section" id="g-advanced">
         <h3>高级配置</h3>
         <ul>
+          <li>Usage 外观：全局设置输入、输出、缓存命中、缓存创建和四档命中率的文字色与背景色；背景默认透明，并支持即时预览和恢复默认。</li>
           <li>包含主体参数：把 JSON 对象深度合并到最终请求体，同时支持 OpenAI-compatible 和 Anthropic native 上游；请只填写目标协议支持的字段。</li>
           <li>排除主体参数：按字段路径删除请求体字段，例如 <code>stream_options</code> 或 <code>metadata.trace_id</code>。</li>
           <li>包含请求头：添加 / 覆写非密钥 header，例如 <code>HTTP-Referer</code>、<code>X-Title</code>。</li>
           <li>排除请求头：发送上游前删除指定 header，例如 <code>x-real-ip</code>、<code>x-forwarded-for</code>。</li>
         </ul>
-        <p class="guide-callout">高级配置按当前渠道保存。Authorization、x-api-key、Cookie、token、secret、password 等密钥类字段会被拒绝保存。</p>
+        <p class="guide-callout">Usage 外观全局保存；主体参数和请求头按当前渠道保存。Authorization、x-api-key、Cookie、token、secret、password 等密钥类字段会被拒绝保存。</p>
         <p class="guide-callout">全局缺省值来自项目根目录的 <code>default-gateway-settings.json</code>；当 <code>gateway-settings.json</code> 缺少全局参数时会回退到该文件，但不会从默认文件导入渠道 Profile。</p>
       </section>
       <section class="guide-section" id="g-diagnostics">
@@ -497,7 +559,8 @@
           <li>诊断会记录最终请求体，可能包含私密提示词；不要公开导出的诊断 JSON。</li>
           <li>可通过诊断查看最终请求体、全部缓存断点、每个断点的选择原因、Prefix hash、suffix hash 和上游缓存用量。</li>
           <li>最终请求体中的每个提示词块都会在消息标题栏显示 10 位 SHA-256 短哈希；与同渠道、同协议、同模型的上一次请求不同或新增的块会加粗，完整哈希保留在诊断 JSON。</li>
-          <li>请求列表和 Usage 页会按三行显示输入、输出、缓存创建、缓存命中和缓存命中率；原始 Usage JSON 仍保留在统计行下方。</li>
+          <li>请求列表和 Usage 页使用双列对齐显示输入、输出、缓存命中和创建，命中率单独成行并按区间着色；原始 Usage JSON 仍保留在统计区下方。</li>
+          <li>候选缓存点中未发送的点会在最终请求体的原始位置显示为灰色单行“未使用缓存点”；它表示候选被预算或忽略规则排除，不表示四点额度尚未占满。</li>
         </ul>
       </section>
       <section class="guide-section" id="g-faq">

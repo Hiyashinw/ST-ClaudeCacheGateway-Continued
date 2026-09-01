@@ -450,6 +450,7 @@ async function startGatewayFixture({
     autoConvertLastAnchorTo5m,
     ignoreLastAnchorsMode,
     ignoreLastAnchorCount,
+    usageAppearance,
     environmentCacheTranslationEnabled = 'true',
 }) {
     const upstream = await startMockUpstream();
@@ -463,7 +464,7 @@ async function startGatewayFixture({
         await Promise.all([
             copyFile(join(PROJECT_DIR, 'server.js'), join(temporaryDirectory, 'server.js')),
             copyFile(join(PROJECT_DIR, 'cache-policy.js'), join(temporaryDirectory, 'cache-policy.js')),
-            copyFile(join(PROJECT_DIR, 'default-gateway-settings.json'), join(temporaryDirectory, 'default-gateway-settings.json')),
+            writeFile(join(temporaryDirectory, 'default-gateway-settings.json'), '{}\n'),
             writeFile(join(temporaryDirectory, 'package.json'), '{"type":"module"}\n'),
             writeFile(settingsPath, `${JSON.stringify({
                 schemaVersion,
@@ -478,6 +479,7 @@ async function startGatewayFixture({
                 ...(autoConvertLastAnchorTo5m === undefined ? {} : { autoConvertLastAnchorTo5m }),
                 ...(ignoreLastAnchorsMode === undefined ? {} : { ignoreLastAnchorsMode }),
                 ...(ignoreLastAnchorCount === undefined ? {} : { ignoreLastAnchorCount }),
+                ...(usageAppearance === undefined ? {} : { usageAppearance }),
                 activeChannelId: 'integration-upstream',
                 channels: [{
                     id: 'integration-upstream',
@@ -722,12 +724,12 @@ test('schema 9 migrates the old automatic breakpoint boolean and persists the ca
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 9);
+                assert.equal(savedSettings.schemaVersion, 10);
                 assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'autoGenerateCacheBreakpoints'),
                     false,
-                    'schema 9 must persist only the canonical three-state field',
+                    'schema 10 must persist only the canonical three-state field',
                 );
             } finally {
                 await fixture.close();
@@ -756,12 +758,12 @@ test('schema 9 remaps schema 8 system-message modes to the corrected canonical m
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 9);
+                assert.equal(savedSettings.schemaVersion, 10);
                 assert.equal(savedSettings.systemMessageHandlingMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'),
                     false,
-                    'schema 9 must persist only the canonical mode',
+                    'schema 10 must persist only the canonical mode',
                 );
             } finally {
                 await fixture.close();
@@ -790,12 +792,12 @@ test('schema 9 migrates schema 7 system-message booleans and persists only the c
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 9);
+                assert.equal(savedSettings.schemaVersion, 10);
                 assert.equal(savedSettings.systemMessageHandlingMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'),
                     false,
-                    'schema 9 must not persist the legacy boolean field',
+                    'schema 10 must not persist the legacy boolean field',
                 );
             } finally {
                 await fixture.close();
@@ -838,7 +840,7 @@ test('system-message handling API strictly validates and persists every mode acr
         assert.equal(state.systemMessageHandlingMode, mode);
 
         const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-        assert.equal(savedSettings.schemaVersion, 9);
+        assert.equal(savedSettings.schemaVersion, 10);
         assert.equal(savedSettings.systemMessageHandlingMode, mode);
         assert.equal(Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'), false);
 
@@ -934,7 +936,7 @@ test('automatic breakpoint API validates mode atomically and accepts the legacy 
     assert.equal(legacyOff.autoGenerateCacheBreakpointsMode, 'off');
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 9);
+    assert.equal(savedSettings.schemaVersion, 10);
     assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, 'off');
     state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     assert.equal(state.autoGenerateCacheBreakpoints, false);
@@ -986,7 +988,7 @@ test('TTL modes send no ttl for Auto and native ttl values for 5m and 1h', async
     assertGatewayCacheTtl(fixture.requests[3], null);
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 9);
+    assert.equal(savedSettings.schemaVersion, 10);
     assert.equal(savedSettings.cacheTtl, 'auto');
 });
 
@@ -1158,7 +1160,7 @@ test('legacy default TTL aliases migrate to canonical Auto in state and saved se
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 9);
+                assert.equal(savedSettings.schemaVersion, 10);
                 assert.equal(savedSettings.cacheTtl, 'auto');
             } finally {
                 await fixture.close();
@@ -1406,7 +1408,7 @@ test('request capture setting persists across a gateway restart while captures r
     assert.equal(beforeRestart.capturedRequests, 1);
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 9);
+    assert.equal(savedSettings.schemaVersion, 10);
     assert.equal(savedSettings.captureRequests, true, 'POST /console/capture must persist the setting');
 
     await fixture.restart();
@@ -1428,6 +1430,83 @@ test('OpenAI inbound -> Anthropic upstream converts before applying the fixed-he
     assert.equal(request.body.max_tokens, 32);
     assert.ok(request.headers['anthropic-version']);
     assertFinalUpstreamBody(request);
+});
+
+test('global Usage appearance validates, persists, survives channel changes, and resets', async (t) => {
+    const fixture = await startGatewayFixture({ upstreamMode: 'openai', schemaVersion: 9 });
+    t.after(() => fixture.close());
+
+    const defaults = {
+        input: { textColor: '#127852', backgroundColor: null },
+        output: { textColor: '#7C3AED', backgroundColor: null },
+        cacheRead: { textColor: '#2563EB', backgroundColor: null },
+        cacheWrite: { textColor: '#A16207', backgroundColor: null },
+        hitRate: {
+            le50: { textColor: '#B91C1C', backgroundColor: null },
+            le70: { textColor: '#A16207', backgroundColor: null },
+            le90: { textColor: '#2563EB', backgroundColor: null },
+            le100: { textColor: '#127852', backgroundColor: null },
+        },
+    };
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.usageAppearance, defaults);
+
+    const custom = {
+        input: { textColor: '#010203', backgroundColor: '#F1F2F3' },
+        output: { textColor: '#111213', backgroundColor: null },
+        cacheRead: { textColor: '#212223', backgroundColor: '#E1E2E3' },
+        cacheWrite: { textColor: '#313233', backgroundColor: null },
+        hitRate: {
+            le50: { textColor: '#414243', backgroundColor: '#D1D2D3' },
+            le70: { textColor: '#515253', backgroundColor: null },
+            le90: { textColor: '#616263', backgroundColor: '#C1C2C3' },
+            le100: { textColor: '#717273', backgroundColor: null },
+        },
+    };
+    state = await postJson(fixture.gatewayBaseUrl, '/console/usage-appearance', { value: custom });
+    assert.deepEqual(state.usageAppearance, custom);
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/channels', {
+        name: 'Appearance channel',
+        baseUrl: fixture.baseUrl,
+        upstreamMode: 'anthropic',
+    });
+    assert.deepEqual(state.usageAppearance, custom, 'channel changes must not alter global appearance');
+
+    let savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.equal(savedSettings.schemaVersion, 10);
+    assert.deepEqual(savedSettings.usageAppearance, custom);
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.usageAppearance, custom);
+
+    const invalid = await fetch(`${fixture.gatewayBaseUrl}/console/usage-appearance`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ value: { ...custom, input: { ...custom.input, textColor: 'red' } } }),
+    });
+    assert.equal(invalid.status, 400);
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.usageAppearance, custom, 'invalid updates must not replace the saved appearance');
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/usage-appearance', { reset: true });
+    assert.deepEqual(state.usageAppearance, defaults);
+    savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.deepEqual(savedSettings.usageAppearance, defaults);
+});
+
+test('partial legacy Usage appearance fills every missing nested field from defaults', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'openai',
+        schemaVersion: 9,
+        usageAppearance: { input: { textColor: '#010203' } },
+    });
+    t.after(() => fixture.close());
+
+    const state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.usageAppearance.input, { textColor: '#010203', backgroundColor: null });
+    assert.deepEqual(state.usageAppearance.output, { textColor: '#7C3AED', backgroundColor: null });
+    assert.deepEqual(state.usageAppearance.hitRate.le50, { textColor: '#B91C1C', backgroundColor: null });
 });
 
 test('OpenAI inbound -> Anthropic applies the corrected system-message handling matrix in stable order', async (t) => {
@@ -2245,11 +2324,14 @@ test('default settings fill missing global fields without importing channel prof
     t.after(() => fixture.close());
 
     const defaults = {
-        schemaVersion: 9,
+        schemaVersion: 10,
         cacheTranslationEnabled: false,
         systemMessageHandlingMode: 'top',
         autoGenerateCacheBreakpointsMode: 'on',
         captureRequests: true,
+        usageAppearance: {
+            input: { textColor: '#010203', backgroundColor: '#F1F2F3' },
+        },
         cacheTtl: '5m',
         fixedHeadBreakpointCount: 2,
         cacheAnchorMode: 'single',
@@ -2267,6 +2349,7 @@ test('default settings fill missing global fields without importing channel prof
         'systemMessageHandlingMode',
         'autoGenerateCacheBreakpointsMode',
         'captureRequests',
+        'usageAppearance',
         'cacheTtl',
         'fixedHeadBreakpointCount',
         'cacheAnchorMode',
@@ -2285,6 +2368,8 @@ test('default settings fill missing global fields without importing channel prof
     assert.equal(state.systemMessageHandlingMode, 'top');
     assert.equal(state.autoGenerateCacheBreakpointsMode, 'on');
     assert.equal(state.captureRequests, true);
+    assert.deepEqual(state.usageAppearance.input, { textColor: '#010203', backgroundColor: '#F1F2F3' });
+    assert.deepEqual(state.usageAppearance.output, { textColor: '#7C3AED', backgroundColor: null });
     assert.equal(state.cacheTtl, '5m');
     assert.equal(state.fixedHeadBreakpointCount, 2);
     assert.equal(state.cacheAnchorMode, 'single');

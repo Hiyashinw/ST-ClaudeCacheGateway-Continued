@@ -11,6 +11,17 @@ const state = {
   channelDrafts: [],
 };
 
+const USAGE_APPEARANCE_FIELDS = [
+  { path: ['input'], cssKey: 'input', label: '输入' },
+  { path: ['output'], cssKey: 'output', label: '输出' },
+  { path: ['cacheRead'], cssKey: 'cache-read', label: '缓存命中' },
+  { path: ['cacheWrite'], cssKey: 'cache-write', label: '缓存创建' },
+  { path: ['hitRate', 'le50'], cssKey: 'rate-le50', label: '命中率 ≤ 50%' },
+  { path: ['hitRate', 'le70'], cssKey: 'rate-le70', label: '命中率 ≤ 70%' },
+  { path: ['hitRate', 'le90'], cssKey: 'rate-le90', label: '命中率 ≤ 90%' },
+  { path: ['hitRate', 'le100'], cssKey: 'rate-le100', label: '命中率 > 90%' },
+];
+
 const pages = {
   dashboard: '网关概览',
   channels: '渠道配置',
@@ -319,6 +330,73 @@ function appendText(parent, tag, value, className) {
   el.textContent = text(value);
   parent.appendChild(el);
   return el;
+}
+
+function usageAppearanceStyle(appearance, path) {
+  let current = appearance;
+  for (const key of path) current = current?.[key];
+  return current && typeof current === 'object' ? current : null;
+}
+
+function setUsageAppearanceVariables(appearance, root = document.documentElement) {
+  if (!appearance || !root?.style?.setProperty) return;
+  for (const field of USAGE_APPEARANCE_FIELDS) {
+    const style = usageAppearanceStyle(appearance, field.path);
+    if (!style) continue;
+    root.style.setProperty(`--usage-${field.cssKey}-text`, style.textColor);
+    root.style.setProperty(`--usage-${field.cssKey}-background`, style.backgroundColor || 'transparent');
+  }
+}
+
+function usageAppearanceControl(field) {
+  return document.querySelector(`[data-usage-style="${field.path.join('.')}"]`);
+}
+
+function collectUsageAppearanceDraft() {
+  const appearance = { hitRate: {} };
+  for (const field of USAGE_APPEARANCE_FIELDS) {
+    const row = usageAppearanceControl(field);
+    if (!row) continue;
+    const value = {
+      textColor: row.querySelector('[data-usage-text-color]').value.toUpperCase(),
+      backgroundColor: row.querySelector('[data-usage-background-transparent]').checked
+        ? null
+        : row.querySelector('[data-usage-background-color]').value.toUpperCase(),
+    };
+    if (field.path.length === 1) appearance[field.path[0]] = value;
+    else appearance[field.path[0]][field.path[1]] = value;
+  }
+  return appearance;
+}
+
+function renderUsageAppearancePreview(appearance = collectUsageAppearanceDraft()) {
+  const preview = $('usageAppearancePreview');
+  if (!preview) return;
+  setUsageAppearanceVariables(appearance, preview);
+  renderUsageLines(preview, {
+    inputTokens: 148792,
+    outputTokens: 546,
+    cacheReadTokens: 141558,
+    cacheWriteTokens: 6924,
+    cacheHitRatePercent: 95.14,
+  }, 'detail usage-preview');
+}
+
+function renderUsageAppearanceControls(appearance) {
+  if (!appearance) return;
+  for (const field of USAGE_APPEARANCE_FIELDS) {
+    const row = usageAppearanceControl(field);
+    const style = usageAppearanceStyle(appearance, field.path);
+    if (!row || !style) continue;
+    const textInput = row.querySelector('[data-usage-text-color]');
+    const backgroundInput = row.querySelector('[data-usage-background-color]');
+    const transparentInput = row.querySelector('[data-usage-background-transparent]');
+    textInput.value = style.textColor;
+    backgroundInput.value = style.backgroundColor || '#FFFFFF';
+    transparentInput.checked = style.backgroundColor === null;
+    backgroundInput.disabled = transparentInput.checked;
+  }
+  renderUsageAppearancePreview(appearance);
 }
 
 function renderKv(root, entries) {
@@ -868,6 +946,9 @@ function renderAdvanced() {
   const headerExcludeText = runtime.upstreamExcludeHeadersEnabled ? `排除 ${runtime.upstreamExcludeHeaders.length}` : '排除 0';
   $('headerOverrideBadge').textContent = `${headerIncludeText} / ${headerExcludeText}`;
   $('headerOverrideBadge').className = `badge ${runtime.upstreamHeadersEnabled || runtime.upstreamExcludeHeadersEnabled ? 'success' : ''}`;
+  $('usageAppearanceBadge').textContent = '全局配置';
+  $('usageAppearanceBadge').className = 'badge success';
+  renderUsageAppearanceControls(runtime.usageAppearance);
   $('cacheControl').textContent = JSON.stringify({
     cacheTranslationEnabled: runtime.cacheTranslationEnabled,
     systemMessageHandlingMode: systemMessageHandlingMode(runtime),
@@ -896,6 +977,7 @@ function renderAdvanced() {
     upstreamExcludePaths: runtime.upstreamExcludePaths,
     upstreamHeaders: runtime.upstreamHeaders,
     upstreamExcludeHeaders: runtime.upstreamExcludeHeaders,
+    usageAppearance: runtime.usageAppearance,
   }, null, 2);
 }
 
@@ -1004,6 +1086,7 @@ function renderRequests() {
 }
 
 function renderAll() {
+  setUsageAppearanceVariables(state.runtime?.usageAppearance);
   renderTopbar();
   renderDashboard();
   renderCaptureControls();
@@ -1183,6 +1266,34 @@ function selectedBreakpoints(capture, segments = []) {
     seen.add(key);
     return true;
   });
+}
+
+function breakpointPathsMatch(left, right) {
+  const normalize = (value) => String(value || '').replace(/\.cache_control$/, '');
+  return Boolean(left && right) && normalize(left) === normalize(right);
+}
+
+function candidateBreakpoints(capture) {
+  const candidates = getCaptureCachePolicy(capture)?.candidates;
+  if (!Array.isArray(candidates)) return [];
+  return candidates
+    .map((entry, index) => ({
+      path: entry?.path || entry?.cacheControlPath || entry?.targetPath || '',
+      order: Number.isFinite(Number(entry?.order)) ? Number(entry.order) : index,
+      selected: entry?.selected === true ? true : entry?.selected === false ? false : null,
+      ignored: Boolean(entry?.ignored),
+      reason: entry?.reason || null,
+      reasons: Array.isArray(entry?.reasons) ? entry.reasons : [],
+    }))
+    .filter((entry) => entry.path)
+    .sort((left, right) => left.order - right.order);
+}
+
+function unusedCandidateBreakpoints(capture, selected = selectedBreakpoints(capture)) {
+  return candidateBreakpoints(capture).filter((candidate) => (
+    candidate.selected === false
+    && !selected.some((breakpoint) => breakpointPathsMatch(candidate.path, breakpoint.path))
+  ));
 }
 
 function getBlockHashEntries(capture) {
@@ -1405,36 +1516,62 @@ function usageNumberLabel(value) {
   return value === null || value === undefined ? '暂不可用' : String(value);
 }
 
-function appendUsagePair(root, label, value) {
-  const pair = document.createElement('span');
-  pair.className = 'usage-pair';
-  appendText(pair, 'span', `${label} `, 'usage-label');
-  appendText(pair, 'strong', usageNumberLabel(value), 'usage-value');
-  root.appendChild(pair);
+function usageRateBand(value) {
+  const rate = nonNegativeNumber(value);
+  if (rate === null) return null;
+  if (rate <= 50) return 'rate-le50';
+  if (rate <= 70) return 'rate-le70';
+  if (rate <= 90) return 'rate-le90';
+  return 'rate-le100';
+}
+
+function appendUsageMetric(root, label, value, kind) {
+  const metric = document.createElement('div');
+  metric.className = `usage-metric usage-metric-${kind}`;
+  appendText(metric, 'span', label, 'usage-label');
+  const available = value !== null && value !== undefined;
+  appendText(
+    metric,
+    'strong',
+    usageNumberLabel(value),
+    `usage-value usage-value-${kind} ${available ? '' : 'unavailable'}`.trim(),
+  );
+  root.appendChild(metric);
+  return metric;
+}
+
+function appendUsageDivider(root) {
+  const divider = document.createElement('span');
+  divider.className = 'usage-grid-divider';
+  divider.setAttribute?.('aria-hidden', 'true');
+  root.appendChild(divider);
 }
 
 function renderUsageLines(root, stats, variant = '') {
   clearNode(root);
   root.className = `usage-lines ${variant}`.trim();
 
-  const first = document.createElement('div');
-  first.className = 'usage-line';
-  appendUsagePair(first, '输入', stats.inputTokens);
-  appendText(first, 'span', '/', 'usage-separator');
-  appendUsagePair(first, '输出', stats.outputTokens);
+  const grid = document.createElement('div');
+  grid.className = 'usage-grid';
+  appendUsageMetric(grid, '输入', stats.inputTokens, 'input');
+  appendUsageDivider(grid);
+  appendUsageMetric(grid, '输出', stats.outputTokens, 'output');
+  appendUsageMetric(grid, '缓存命中', stats.cacheReadTokens, 'cache-read');
+  appendUsageDivider(grid);
+  appendUsageMetric(grid, '创建', stats.cacheWriteTokens, 'cache-write');
 
-  const second = document.createElement('div');
-  second.className = 'usage-line';
-  appendUsagePair(second, '缓存创建', stats.cacheWriteTokens);
-  appendText(second, 'span', '/', 'usage-separator');
-  appendUsagePair(second, '缓存命中', stats.cacheReadTokens);
-
-  const third = document.createElement('div');
-  third.className = 'usage-line';
-  appendText(third, 'span', '缓存命中率 ', 'usage-label');
-  appendText(third, 'strong', usageRateLabel(stats.cacheHitRatePercent), 'usage-value');
-
-  root.append(first, second, third);
+  const rate = document.createElement('div');
+  rate.className = 'usage-rate-row';
+  appendText(rate, 'span', '缓存命中率', 'usage-label');
+  const band = usageRateBand(stats.cacheHitRatePercent);
+  appendText(
+    rate,
+    'strong',
+    usageRateLabel(stats.cacheHitRatePercent),
+    `usage-value usage-rate-value ${band || 'unavailable'}`,
+  );
+  grid.appendChild(rate);
+  root.appendChild(grid);
   return stats;
 }
 
@@ -1468,9 +1605,9 @@ function tokenMultiplierLabel(tokensPerCharacter) {
   return `${Number(tokensPerCharacter.toFixed(4))} token/字符`;
 }
 
-function breakpointsForSegment(segment, breakpoints) {
+function breakpointsForSegment(segment, breakpoints, includeActualFallback = true) {
   const matches = breakpoints.filter((breakpoint) => pathMatches(segment.path, breakpoint.path));
-  if (!matches.length && segment.cache) {
+  if (includeActualFallback && !matches.length && segment.cache) {
     matches.push({ path: `${segment.path}.cache_control`, reason: null, reasons: [], prefixHash: null });
   }
   return matches;
@@ -1518,7 +1655,9 @@ function renderHeaderBlockHashes(root, segments, hashByPath) {
 function renderMessageCard(root, group, index, isPrefix, tokensPerCharacter = null, options = {}) {
   const segments = group.segments || [group];
   const segmentBreakpoints = segments.map((segment) => breakpointsForSegment(segment, options.breakpoints || []));
-  const hasCacheBreakpoints = segmentBreakpoints.some((matches) => matches.length > 0);
+  const segmentUnusedBreakpoints = segments.map((segment) => breakpointsForSegment(segment, options.unusedBreakpoints || [], false));
+  const hasCacheBreakpoints = segmentBreakpoints.some((matches) => matches.length > 0)
+    || segmentUnusedBreakpoints.some((matches) => matches.length > 0);
   const card = document.createElement('div');
   card.className = `msg-card ${isPrefix ? 'is-prefix' : ''} ${hasCacheBreakpoints ? 'has-cache-breakpoints' : ''}`.trim();
   const head = document.createElement('div');
@@ -1565,6 +1704,9 @@ function renderMessageCard(root, group, index, isPrefix, tokensPerCharacter = nu
         segment.cacheTtl ?? options.cacheTtl,
       );
     }
+    for (const breakpoint of segmentUnusedBreakpoints[segmentIndex]) {
+      renderUnusedCacheDivider(body, breakpoint);
+    }
   }
 
   card.append(head, body);
@@ -1583,6 +1725,13 @@ function renderCacheDivider(root, cache, breakpoint = {}, ordinal = 1, total = 1
   const hash = breakpoint.prefixHash || (ordinal === 1 ? cache?.prefixHash : null);
   appendText(textWrap, 'span', `${breakpoint.path || '路径未记录'} · Prefix ${compactHash(hash)}`, 'cache-sub');
   divider.append(icon, textWrap);
+  root.appendChild(divider);
+}
+
+function renderUnusedCacheDivider(root) {
+  const divider = document.createElement('div');
+  divider.className = 'cache-divider unused-cache-divider';
+  appendText(divider, 'span', '未使用缓存点', 'unused-cache-title');
   root.appendChild(divider);
 }
 
@@ -1629,6 +1778,7 @@ function renderRequestBodyStream(root, capture, prefixOnly = false) {
   const segments = getOrderedBodySegments(body, mode);
   const promptEstimate = getPromptTokenEstimate(segments, capture?.response?.usage, mode);
   const breakpoints = selectedBreakpoints(capture, segments);
+  const unusedBreakpoints = prefixOnly ? [] : unusedCandidateBreakpoints(capture, breakpoints);
   const firstCachePath = cache.firstCacheControlPath;
   let cacheIndex = segments.findIndex((segment) => segment.cache || pathMatches(segment.path, firstCachePath) || breakpoints.some((breakpoint) => pathMatches(segment.path, breakpoint.path)));
   if (cacheIndex < 0 && prefixOnly) cacheIndex = segments.length - 1;
@@ -1644,6 +1794,7 @@ function renderRequestBodyStream(root, capture, prefixOnly = false) {
     const isPrefix = cacheIndex >= 0 && group.endIndex <= cacheIndex;
     renderMessageCard(root, group, index, isPrefix, promptEstimate.tokensPerCharacter, {
       breakpoints,
+      unusedBreakpoints,
       cache,
       cacheTtl: capture?.gateway?.cacheTtl,
       blockHashByPath: blockHashByPath(capture),
@@ -1950,6 +2101,29 @@ function bindEvents() {
   $('pageSize').onchange = () => { state.pageSize = Number($('pageSize').value); state.page = 1; renderRequests(); };
   $('prevPage').onclick = () => { state.page -= 1; renderRequests(); };
   $('nextPage').onclick = () => { state.page += 1; renderRequests(); };
+
+  for (const row of document.querySelectorAll('[data-usage-style]')) {
+    const textInput = row.querySelector('[data-usage-text-color]');
+    const backgroundInput = row.querySelector('[data-usage-background-color]');
+    const transparentInput = row.querySelector('[data-usage-background-transparent]');
+    const updatePreview = () => {
+      backgroundInput.disabled = transparentInput.checked;
+      renderUsageAppearancePreview();
+    };
+    textInput.oninput = updatePreview;
+    backgroundInput.oninput = updatePreview;
+    transparentInput.onchange = updatePreview;
+  }
+  $('usageAppearanceApply').onclick = async () => {
+    await postJson('/console/usage-appearance', { value: collectUsageAppearanceDraft() });
+    await refreshAll();
+    setStatus('Usage 配色已应用');
+  };
+  $('usageAppearanceReset').onclick = async () => {
+    await postJson('/console/usage-appearance', { reset: true });
+    await refreshAll();
+    setStatus('Usage 配色已恢复默认');
+  };
 
   $('extraJsonOff').onclick = async () => { await postJson('/console/upstream-extra-json', { value: {} }); await refreshAll(); setStatus('包含主体参数已清空'); };
   $('extraJsonFormat').onclick = () => { $('upstreamExtraJson').value = JSON.stringify(JSON.parse($('upstreamExtraJson').value || '{}'), null, 2); setStatus('包含主体参数已格式化'); };

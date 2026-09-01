@@ -21,8 +21,20 @@ import {
 
 const MARKER = '[[CACHE_BREAK]]';
 const MAX_BREAKPOINTS = 4;
-const SETTINGS_SCHEMA_VERSION = 9;
+const SETTINGS_SCHEMA_VERSION = 10;
 const DEFAULT_UPSTREAM_BASE_URL = 'https://api.pioneer.ai';
+const DEFAULT_USAGE_APPEARANCE = Object.freeze({
+    input: Object.freeze({ textColor: '#127852', backgroundColor: null }),
+    output: Object.freeze({ textColor: '#7C3AED', backgroundColor: null }),
+    cacheRead: Object.freeze({ textColor: '#2563EB', backgroundColor: null }),
+    cacheWrite: Object.freeze({ textColor: '#A16207', backgroundColor: null }),
+    hitRate: Object.freeze({
+        le50: Object.freeze({ textColor: '#B91C1C', backgroundColor: null }),
+        le70: Object.freeze({ textColor: '#A16207', backgroundColor: null }),
+        le90: Object.freeze({ textColor: '#2563EB', backgroundColor: null }),
+        le100: Object.freeze({ textColor: '#127852', backgroundColor: null }),
+    }),
+});
 const SETTINGS_FILE = new URL('./gateway-settings.json', import.meta.url);
 const DEFAULT_SETTINGS_FILE = new URL('./default-gateway-settings.json', import.meta.url);
 const CHANNEL_SETTING_KEYS = new Set([
@@ -71,6 +83,7 @@ let upstreamHeaders = normalizeUpstreamHeaders(getRuntimeConfigValue('UPSTREAM_H
 let upstreamExcludeHeaders = normalizeUpstreamExcludeHeaders(getRuntimeConfigValue('UPSTREAM_EXCLUDE_HEADERS', runtimeSettings.upstreamExcludeHeaders || getActiveChannel()?.upstreamExcludeHeaders, []));
 syncActiveChannelFromRuntime();
 let captureRequests = normalizeBoolean(runtimeSettings.captureRequests, false);
+let usageAppearance = normalizeUsageAppearance(runtimeSettings.usageAppearance);
 let prefixLockEnabled = false;
 let prefixLock = null;
 const prefixLockStats = {
@@ -453,6 +466,7 @@ function migrateRuntimeSettings(rawSettings = {}) {
                 : (normalizeBoolean(rawSettings.autoGenerateCacheBreakpoints, false) ? 'on' : 'off'),
         ),
         captureRequests: normalizeBoolean(rawSettings.captureRequests, false),
+        usageAppearance: normalizeUsageAppearance(rawSettings.usageAppearance),
         fixedHeadBreakpointCount: normalizeFixedHeadBreakpointCount(rawSettings.fixedHeadBreakpointCount),
         cacheAnchorMode: normalizeCacheAnchorMode(rawSettings.cacheAnchorMode),
         cacheAnchorIntervalBlocks: normalizeCacheAnchorIntervalBlocks(rawSettings.cacheAnchorIntervalBlocks),
@@ -535,6 +549,7 @@ function saveRuntimeSettings() {
         systemMessageHandlingMode,
         autoGenerateCacheBreakpointsMode,
         captureRequests,
+        usageAppearance,
         cacheTtl: getCacheTtlLabel(),
         fixedHeadBreakpointCount,
         cacheAnchorMode,
@@ -599,6 +614,85 @@ function normalizeBoolean(value, defaultValue = false) {
     }
 
     return defaultValue;
+}
+
+function normalizeUsageHexColor(value, { allowNull = false, strict = false, fallback = null, path = 'color' } = {}) {
+    if (allowNull && value === null) {
+        return null;
+    }
+
+    if (typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value.trim())) {
+        return value.trim().toUpperCase();
+    }
+
+    if (strict) {
+        throw new Error(`${path} must be a #RRGGBB color${allowNull ? ' or null' : ''}.`);
+    }
+
+    return fallback;
+}
+
+function normalizeUsageColorStyle(value, fallback, { strict = false, path = 'usageAppearance' } = {}) {
+    const source = isPlainObject(value) ? value : {};
+
+    if (strict && !isPlainObject(value)) {
+        throw new Error(`${path} must be an object.`);
+    }
+
+    if (strict && (!Object.prototype.hasOwnProperty.call(source, 'textColor')
+        || !Object.prototype.hasOwnProperty.call(source, 'backgroundColor'))) {
+        throw new Error(`${path} must include textColor and backgroundColor.`);
+    }
+
+    return {
+        textColor: normalizeUsageHexColor(source.textColor, {
+            strict,
+            fallback: fallback.textColor,
+            path: `${path}.textColor`,
+        }),
+        backgroundColor: normalizeUsageHexColor(source.backgroundColor, {
+            allowNull: true,
+            strict,
+            fallback: fallback.backgroundColor,
+            path: `${path}.backgroundColor`,
+        }),
+    };
+}
+
+function normalizeUsageAppearance(value, { strict = false } = {}) {
+    const source = isPlainObject(value) ? value : {};
+
+    if (strict && !isPlainObject(value)) {
+        throw new Error('usageAppearance must be an object.');
+    }
+
+    const requiredKeys = ['input', 'output', 'cacheRead', 'cacheWrite', 'hitRate'];
+    if (strict && requiredKeys.some((key) => !Object.prototype.hasOwnProperty.call(source, key))) {
+        throw new Error('usageAppearance must include input, output, cacheRead, cacheWrite, and hitRate.');
+    }
+
+    const hitRate = isPlainObject(source.hitRate) ? source.hitRate : {};
+    if (strict && !isPlainObject(source.hitRate)) {
+        throw new Error('usageAppearance.hitRate must be an object.');
+    }
+
+    const requiredRateKeys = ['le50', 'le70', 'le90', 'le100'];
+    if (strict && requiredRateKeys.some((key) => !Object.prototype.hasOwnProperty.call(hitRate, key))) {
+        throw new Error('usageAppearance.hitRate must include le50, le70, le90, and le100.');
+    }
+
+    return {
+        input: normalizeUsageColorStyle(source.input, DEFAULT_USAGE_APPEARANCE.input, { strict, path: 'usageAppearance.input' }),
+        output: normalizeUsageColorStyle(source.output, DEFAULT_USAGE_APPEARANCE.output, { strict, path: 'usageAppearance.output' }),
+        cacheRead: normalizeUsageColorStyle(source.cacheRead, DEFAULT_USAGE_APPEARANCE.cacheRead, { strict, path: 'usageAppearance.cacheRead' }),
+        cacheWrite: normalizeUsageColorStyle(source.cacheWrite, DEFAULT_USAGE_APPEARANCE.cacheWrite, { strict, path: 'usageAppearance.cacheWrite' }),
+        hitRate: {
+            le50: normalizeUsageColorStyle(hitRate.le50, DEFAULT_USAGE_APPEARANCE.hitRate.le50, { strict, path: 'usageAppearance.hitRate.le50' }),
+            le70: normalizeUsageColorStyle(hitRate.le70, DEFAULT_USAGE_APPEARANCE.hitRate.le70, { strict, path: 'usageAppearance.hitRate.le70' }),
+            le90: normalizeUsageColorStyle(hitRate.le90, DEFAULT_USAGE_APPEARANCE.hitRate.le90, { strict, path: 'usageAppearance.hitRate.le90' }),
+            le100: normalizeUsageColorStyle(hitRate.le100, DEFAULT_USAGE_APPEARANCE.hitRate.le100, { strict, path: 'usageAppearance.hitRate.le100' }),
+        },
+    };
 }
 
 function normalizeSystemMessageHandlingMode(value, { strict = false } = {}) {
@@ -1291,6 +1385,7 @@ function getRuntimeState() {
         upstreamExcludeHeadersText: getUpstreamExcludeHeadersText(),
         upstreamExcludeHeadersEnabled: upstreamExcludeHeaders.length > 0,
         captureRequests,
+        usageAppearance: safeJsonClone(usageAppearance),
         capturedRequests: requestCaptures.length,
         anthropicInboundEnabled: true,
         prefixLockEnabled,
@@ -4279,6 +4374,22 @@ async function handleConsoleApi(request, url) {
         syncActiveChannelFromRuntime();
         saveRuntimeSettings();
         log('Updated upstream excluded headers from console.', { activeChannelId, upstreamExcludeHeaders });
+        return jsonResponse(getRuntimeState());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/console/usage-appearance') {
+        const body = await readJsonRequest(request);
+
+        try {
+            usageAppearance = body?.reset === true
+                ? normalizeUsageAppearance(DEFAULT_USAGE_APPEARANCE)
+                : normalizeUsageAppearance(body?.value, { strict: true });
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
+
+        saveRuntimeSettings();
+        log('Updated Usage appearance from console.', { reset: body?.reset === true });
         return jsonResponse(getRuntimeState());
     }
 
