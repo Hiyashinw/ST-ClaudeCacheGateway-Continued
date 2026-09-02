@@ -467,6 +467,7 @@ async function startGatewayFixture({
     autoGenerateCacheBreakpointsMode,
     captureRequests,
     systemMessageHandlingMode,
+    anthropicOptimizationModelWhitelist,
     moveSystemMessagesToTop,
     autoConvertLastAnchorTo5m,
     ignoreLastAnchorsMode,
@@ -503,6 +504,7 @@ async function startGatewayFixture({
                 ...(autoGenerateCacheBreakpointsMode === undefined ? {} : { autoGenerateCacheBreakpointsMode }),
                 ...(captureRequests === undefined ? {} : { captureRequests }),
                 ...(systemMessageHandlingMode === undefined ? {} : { systemMessageHandlingMode }),
+                ...(anthropicOptimizationModelWhitelist === undefined ? {} : { anthropicOptimizationModelWhitelist }),
                 ...(moveSystemMessagesToTop === undefined ? {} : { moveSystemMessagesToTop }),
                 ...(autoConvertLastAnchorTo5m === undefined ? {} : { autoConvertLastAnchorTo5m }),
                 ...(ignoreLastAnchorsMode === undefined ? {} : { ignoreLastAnchorsMode }),
@@ -770,12 +772,12 @@ test('schema 9 migrates the old automatic breakpoint boolean and persists the ca
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 11);
+                assert.equal(savedSettings.schemaVersion, 12);
                 assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'autoGenerateCacheBreakpoints'),
                     false,
-                    'schema 11 must persist only the canonical three-state field',
+                    'schema 12 must persist only the canonical three-state field',
                 );
             } finally {
                 await fixture.close();
@@ -804,12 +806,12 @@ test('schema 9 remaps schema 8 system-message modes to the corrected canonical m
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 11);
+                assert.equal(savedSettings.schemaVersion, 12);
                 assert.equal(savedSettings.systemMessageHandlingMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'),
                     false,
-                    'schema 11 must persist only the canonical mode',
+                    'schema 12 must persist only the canonical mode',
                 );
             } finally {
                 await fixture.close();
@@ -838,12 +840,12 @@ test('schema 9 migrates schema 7 system-message booleans and persists only the c
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 11);
+                assert.equal(savedSettings.schemaVersion, 12);
                 assert.equal(savedSettings.systemMessageHandlingMode, testCase.expected);
                 assert.equal(
                     Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'),
                     false,
-                    'schema 11 must not persist the legacy boolean field',
+                    'schema 12 must not persist the legacy boolean field',
                 );
             } finally {
                 await fixture.close();
@@ -886,7 +888,7 @@ test('system-message handling API strictly validates and persists every mode acr
         assert.equal(state.systemMessageHandlingMode, mode);
 
         const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-        assert.equal(savedSettings.schemaVersion, 11);
+        assert.equal(savedSettings.schemaVersion, 12);
         assert.equal(savedSettings.systemMessageHandlingMode, mode);
         assert.equal(Object.prototype.hasOwnProperty.call(savedSettings, 'moveSystemMessagesToTop'), false);
 
@@ -982,7 +984,7 @@ test('automatic breakpoint API validates mode atomically and accepts the legacy 
     assert.equal(legacyOff.autoGenerateCacheBreakpointsMode, 'off');
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 11);
+    assert.equal(savedSettings.schemaVersion, 12);
     assert.equal(savedSettings.autoGenerateCacheBreakpointsMode, 'off');
     state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     assert.equal(state.autoGenerateCacheBreakpoints, false);
@@ -1034,7 +1036,7 @@ test('TTL modes send no ttl for Auto and native ttl values for 5m and 1h', async
     assertGatewayCacheTtl(fixture.requests[3], null);
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 11);
+    assert.equal(savedSettings.schemaVersion, 12);
     assert.equal(savedSettings.cacheTtl, 'auto');
 });
 
@@ -1206,7 +1208,7 @@ test('legacy default TTL aliases migrate to canonical Auto in state and saved se
 
                 await postJson(fixture.gatewayBaseUrl, '/console/capture', { enabled: false });
                 const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-                assert.equal(savedSettings.schemaVersion, 11);
+                assert.equal(savedSettings.schemaVersion, 12);
                 assert.equal(savedSettings.cacheTtl, 'auto');
             } finally {
                 await fixture.close();
@@ -1454,7 +1456,7 @@ test('request capture setting and complete diagnostic logs persist across a gate
     assert.equal(beforeRestart.capturedRequests, 1);
 
     const savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 11);
+    assert.equal(savedSettings.schemaVersion, 12);
     assert.equal(savedSettings.captureRequests, true, 'POST /console/capture must persist the setting');
 
     await fixture.restart();
@@ -1586,7 +1588,7 @@ test('global Usage appearance validates, persists, survives channel changes, and
     assert.deepEqual(state.usageAppearance, custom, 'channel changes must not alter global appearance');
 
     let savedSettings = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
-    assert.equal(savedSettings.schemaVersion, 11);
+    assert.equal(savedSettings.schemaVersion, 12);
     assert.deepEqual(savedSettings.usageAppearance, custom);
     assert.deepEqual(savedSettings.usagePreviewSample, customSample);
     await fixture.restart();
@@ -1660,12 +1662,12 @@ test('configuration export, import, and default restore preserve the active upst
     t.after(() => fixture.close());
     const before = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
     const exported = await fetchJson(`${fixture.gatewayBaseUrl}/console/config/export`);
-    assert.equal(exported.schemaVersion, 11);
+    assert.equal(exported.schemaVersion, 12);
     const downloadResponse = await fetch(`${fixture.gatewayBaseUrl}/console/config/export?download=1`);
     assert.equal(downloadResponse.status, 200);
     assert.match(downloadResponse.headers.get('content-disposition') || '', /attachment/i);
     assert.match(downloadResponse.headers.get('content-type') || '', /application\/json/i);
-    assert.equal(JSON.parse(await downloadResponse.text()).schemaVersion, 11);
+    assert.equal(JSON.parse(await downloadResponse.text()).schemaVersion, 12);
     assert.equal(exported.upstreamMode, before.upstreamMode);
     assert.equal(exported.upstreamBaseUrl, before.upstreamBaseUrl);
     assert.equal(Object.prototype.hasOwnProperty.call(exported, 'anchorState'), false);
@@ -1706,6 +1708,87 @@ test('configuration export, import, and default restore preserve the active upst
     assert.equal(state.cacheAnchorMode, 'off');
     assert.equal(state.cacheAnchorIntervalBlocks, 9);
     assert.equal(state.cacheAnchorState.contextCount, 0);
+});
+
+test('Anthropic optimization whitelist persists, normalizes, imports, exports, resets, and rejects invalid updates atomically', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 11,
+    });
+    t.after(() => fixture.close());
+
+    let state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.anthropicOptimizationModelWhitelist, ['claude-fable-5-1']);
+
+    const requested = [
+        '  Claude-Fable-5-1  ',
+        'claude-fable-5-1',
+        '',
+        ' CLAUDE-OPUS-* ',
+        'claude-opus-*',
+        'claude-ha?ku',
+    ];
+    state = await postJson(fixture.gatewayBaseUrl, '/console/anthropic-optimization-whitelist', { models: requested });
+    assert.deepEqual(state.anthropicOptimizationModelWhitelist, [
+        'Claude-Fable-5-1',
+        'CLAUDE-OPUS-*',
+        'claude-ha?ku',
+    ]);
+
+    let saved = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.equal(saved.schemaVersion, 12);
+    assert.deepEqual(saved.anthropicOptimizationModelWhitelist, state.anthropicOptimizationModelWhitelist);
+
+    let invalid = await fetch(`${fixture.gatewayBaseUrl}/console/anthropic-optimization-whitelist`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ models: ['valid-model', 42] }),
+    });
+    assert.equal(invalid.status, 400);
+    await invalid.text();
+    invalid = await fetch(`${fixture.gatewayBaseUrl}/console/anthropic-optimization-whitelist`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ models: 'claude-opus-*' }),
+    });
+    assert.equal(invalid.status, 400);
+    await invalid.text();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.anthropicOptimizationModelWhitelist, [
+        'Claude-Fable-5-1',
+        'CLAUDE-OPUS-*',
+        'claude-ha?ku',
+    ], 'failed whitelist updates must not partially write the old value');
+
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.anthropicOptimizationModelWhitelist, [
+        'Claude-Fable-5-1',
+        'CLAUDE-OPUS-*',
+        'claude-ha?ku',
+    ]);
+
+    let exported = await fetchJson(`${fixture.gatewayBaseUrl}/console/config/export`);
+    assert.deepEqual(exported.anthropicOptimizationModelWhitelist, state.anthropicOptimizationModelWhitelist);
+    state = await postJson(fixture.gatewayBaseUrl, '/console/config/import', {
+        anthropicOptimizationModelWhitelist: ['claude-sonnet-*'],
+    });
+    assert.deepEqual(state.anthropicOptimizationModelWhitelist, ['claude-sonnet-*']);
+
+    state = await postJson(fixture.gatewayBaseUrl, '/console/anthropic-optimization-whitelist', { models: [] });
+    assert.deepEqual(state.anthropicOptimizationModelWhitelist, []);
+    await fixture.restart();
+    state = await fetchJson(`${fixture.gatewayBaseUrl}/console/state`);
+    assert.deepEqual(state.anthropicOptimizationModelWhitelist, [], 'an explicitly saved empty list must survive restart');
+
+    await writeFile(
+        join(fixture.temporaryDirectory, 'default-gateway-settings.json'),
+        JSON.stringify({ schemaVersion: 12, anthropicOptimizationModelWhitelist: ['claude-fable-5-1'] }, null, 2),
+    );
+    state = await postJson(fixture.gatewayBaseUrl, '/console/config/reset', {});
+    assert.deepEqual(state.anthropicOptimizationModelWhitelist, ['claude-fable-5-1']);
+    saved = JSON.parse(await readFile(fixture.settingsPath, 'utf8'));
+    assert.deepEqual(saved.anthropicOptimizationModelWhitelist, ['claude-fable-5-1']);
 });
 
 test('partial legacy Usage appearance fills every missing nested field from defaults', async (t) => {
@@ -1805,6 +1888,105 @@ test('OpenAI inbound -> Anthropic applies the corrected system-message handling 
     ]);
 });
 
+test('Anthropic whitelist preserves interleaved SYSTEM roles and message boundaries in default and off modes', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 12,
+        systemMessageHandlingMode: 'default',
+        anthropicOptimizationModelWhitelist: ['claude-fable-5-1', 'claude-opus-*'],
+        captureRequests: true,
+    });
+    t.after(() => fixture.close());
+
+    const originalMessages = interleavedSystemOpenAiBody().messages;
+    const cases = [
+        ['default', 'CLAUDE-FABLE-5-1', 'claude-fable-5-1'],
+        ['off', 'Claude-Opus-2026', 'claude-opus-*'],
+    ];
+
+    for (const [mode, model, pattern] of cases) {
+        if (mode !== 'default') {
+            await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode });
+        }
+
+        await postJson(
+            fixture.gatewayBaseUrl,
+            '/v1/chat/completions',
+            interleavedSystemOpenAiBody(model),
+        );
+        const wire = fixture.requests.at(-1).body;
+        assert.equal(Object.prototype.hasOwnProperty.call(wire, 'system'), false);
+        assert.deepEqual(wire.messages, originalMessages, `${mode} whitelist path must preserve every message boundary`);
+
+        const summaries = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+        const detail = await fetchJson(
+            `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(summaries.requests[0].id)}`,
+        );
+        assert.equal(detail.gateway.systemMessageHandlingEffectiveMode, 'preserve');
+        assert.equal(detail.gateway.systemMessageHandlingModel, model);
+        assert.equal(detail.gateway.anthropicOptimizationWhitelistMatched, true);
+        assert.equal(detail.gateway.anthropicOptimizationWhitelistPattern, pattern);
+    }
+
+    await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode: 'top' });
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('claude-opus-2026'),
+    );
+    let wire = fixture.requests.at(-1).body;
+    assert.deepEqual(wire.system, [
+        { type: 'text', text: 'Leading system' },
+        { type: 'text', text: 'Later system' },
+    ]);
+    assert.deepEqual(wire.messages, [
+        { role: 'user', content: 'First user' },
+        { role: 'user', content: 'Adjacent user' },
+        { role: 'assistant', content: 'First assistant' },
+        { role: 'assistant', content: 'Adjacent assistant' },
+        { role: 'user', content: 'Second user' },
+        { role: 'user', content: 'Adjacent second user' },
+    ]);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/system-message-handling', { mode: 'default' });
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('claude-sonnet-unlisted'),
+    );
+    wire = fixture.requests.at(-1).body;
+    assert.deepEqual(wire.system, [{ type: 'text', text: 'Leading system' }]);
+    assert.deepEqual(wire.messages, [
+        {
+            role: 'user',
+            content: [
+                { type: 'text', text: 'First user' },
+                { type: 'text', text: 'Adjacent user' },
+            ],
+        },
+        {
+            role: 'assistant',
+            content: [
+                { type: 'text', text: 'First assistant' },
+                { type: 'text', text: 'Adjacent assistant' },
+            ],
+        },
+        {
+            role: 'user',
+            content: [
+                { type: 'text', text: 'Later system' },
+                { type: 'text', text: 'Second user' },
+                { type: 'text', text: 'Adjacent second user' },
+            ],
+        },
+    ]);
+    const summaries = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    const detail = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(summaries.requests[0].id)}`,
+    );
+    assert.equal(detail.gateway.anthropicOptimizationWhitelistMatched, false);
+});
+
 test('Anthropic native inbound remains unchanged in every system-message handling mode', async (t) => {
     const fixture = await startGatewayFixture({
         upstreamMode: 'anthropic',
@@ -1840,6 +2022,51 @@ test('Anthropic native inbound remains unchanged in every system-message handlin
         assert.deepEqual(fixture.requests[index].body.system, system);
         assert.deepEqual(fixture.requests[index].body.messages, messages);
     }
+});
+
+test('Anthropic whitelist matching follows the final channel model override and exclusion', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 12,
+        systemMessageHandlingMode: 'default',
+        anthropicOptimizationModelWhitelist: ['claude-opus-*'],
+        upstreamExtraJson: { model: 'CLAUDE-OPUS-4' },
+        captureRequests: true,
+    });
+    t.after(() => fixture.close());
+
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('caller-model'),
+    );
+    let wire = fixture.requests.at(-1).body;
+    assert.equal(wire.model, 'CLAUDE-OPUS-4');
+    assert.equal(Object.prototype.hasOwnProperty.call(wire, 'system'), false);
+    assert.equal(wire.messages.length, interleavedSystemOpenAiBody().messages.length);
+    let summaries = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    let detail = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(summaries.requests[0].id)}`,
+    );
+    assert.equal(detail.gateway.systemMessageHandlingModel, 'CLAUDE-OPUS-4');
+    assert.equal(detail.gateway.anthropicOptimizationWhitelistMatched, true);
+
+    await postJson(fixture.gatewayBaseUrl, '/console/upstream-exclude-paths', { paths: ['model'] });
+    await postJson(
+        fixture.gatewayBaseUrl,
+        '/v1/chat/completions',
+        interleavedSystemOpenAiBody('caller-model-after-exclude'),
+    );
+    wire = fixture.requests.at(-1).body;
+    assert.equal(wire.model, undefined, 'excluding model must affect the effective match model and final wire body');
+    assert.deepEqual(wire.system, [{ type: 'text', text: 'Leading system' }]);
+    assert.equal(wire.messages.length, 3);
+    summaries = await fetchJson(`${fixture.gatewayBaseUrl}/console/requests`);
+    detail = await fetchJson(
+        `${fixture.gatewayBaseUrl}/console/requests/${encodeURIComponent(summaries.requests[0].id)}`,
+    );
+    assert.equal(detail.gateway.systemMessageHandlingModel, null);
+    assert.equal(detail.gateway.anthropicOptimizationWhitelistMatched, false);
 });
 
 test('default Anthropic optimization preserves block order and cache controls while absorbing empty same-role messages', async (t) => {
@@ -1941,6 +2168,56 @@ test('default Anthropic optimization re-merges adjacent roles after Prefix Lock 
             { type: 'text', text: 'Current assistant' },
         ],
     });
+});
+
+test('whitelisted Anthropic Prefix Lock rebuild preserves SYSTEM roles and avoids group-key collisions', async (t) => {
+    const fixture = await startGatewayFixture({
+        upstreamMode: 'anthropic',
+        schemaVersion: 12,
+        systemMessageHandlingMode: 'default',
+        anthropicOptimizationModelWhitelist: ['claude-fable-5-1'],
+    });
+    t.after(() => fixture.close());
+
+    await postJson(fixture.gatewayBaseUrl, '/console/prefix-lock', { enabled: true });
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', {
+        model: 'claude-fable-5-1',
+        max_tokens: 32,
+        messages: [
+            { role: 'system', content: 'Stable system' },
+            { role: 'user', content: 'Locked user one' },
+            { role: 'user', content: 'Locked user two' },
+            { role: 'assistant', content: 'Locked assistant one' },
+            { role: 'assistant', content: 'Locked assistant two' + MARKER },
+            { role: 'user', content: 'Locked tail' },
+        ],
+    });
+
+    await postJson(fixture.gatewayBaseUrl, '/v1/chat/completions', {
+        model: 'claude-fable-5-1',
+        max_tokens: 32,
+        messages: [
+            { role: 'system', content: 'Current system' },
+            { role: 'user', content: 'Current user' },
+            { role: 'assistant', content: 'Current assistant one' },
+            { role: 'assistant', content: 'Current assistant two' + MARKER },
+            { role: 'user', content: 'Current tail' },
+        ],
+    });
+
+    const wire = fixture.requests.at(-1).body;
+    assert.equal(Object.prototype.hasOwnProperty.call(wire, 'system'), false);
+    assert.deepEqual(wire.messages.map((message) => message.role), [
+        'system', 'user', 'user', 'assistant', 'assistant', 'user',
+    ]);
+    assert.equal(wire.messages.at(-1).role, 'user');
+    assert.equal(wire.messages.at(-1).content, 'Current tail');
+    assert.equal(wire.messages.at(-2).role, 'assistant');
+    assert.deepEqual(wire.messages.at(-2).content, [{
+        type: 'text',
+        text: 'Locked assistant two',
+        cache_control: { type: 'ephemeral' },
+    }]);
 });
 
 test('OpenAI inbound -> Anthropic non-stream response exposes thinking as reasoning_content', async (t) => {

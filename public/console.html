@@ -209,8 +209,8 @@
           <div class="set-control"><div class="seg" id="autoGenerateCacheBreakpointsSeg" aria-label="自动生成缓存断点模式"><button data-auto-breakpoints="auto">自动</button><button data-auto-breakpoints="on">开启</button><button data-auto-breakpoints="off">关闭</button></div></div>
         </div>
         <div class="set-row">
-          <div class="set-info"><div class="set-title">系统身份消息处理</div><div class="set-desc">“默认”保持 OpenAI-compatible 原始角色与顺序，转为 Anthropic native 时保留开头 SYSTEM、将中途 SYSTEM 原位转为 USER，并合并相邻同角色发言；“关闭Anthropic优化”保持 OpenAI-compatible 原样，但转换 Anthropic 时会把全部 SYSTEM 放到顶部；“统一将系统身份消息放至最顶部”会在两种上游格式中都统一上移 SYSTEM，缓存前缀更稳定，但可能破坏上下文语义。</div></div>
-          <div class="set-control"><div class="seg system-message-seg" id="systemMessageHandlingSeg" aria-label="系统身份消息处理模式"><button data-system-message-mode="default">默认</button><button data-system-message-mode="off">关闭Anthropic优化</button><button data-system-message-mode="top">统一将系统身份消息放至最顶部</button></div></div>
+          <div class="set-info"><div class="set-title system-message-title"><span>系统身份消息处理</span><button class="small ghost" id="openAnthropicOptimizationWhitelist" type="button" aria-haspopup="dialog">忽略Anthropic优化的模型白名单</button></div><div class="set-desc">“默认”保持 OpenAI-compatible 原始角色与顺序，转为 Anthropic native 时保留开头 SYSTEM、将中途 SYSTEM 原位转为 USER，并合并相邻同角色发言；“关闭Anthropic优化”保持 OpenAI-compatible 原样，但转换 Anthropic 时会把全部 SYSTEM 放到顶部；命中旁边白名单的模型在“默认”和“关闭Anthropic优化”下保留跨轮 SYSTEM 与原始消息边界；“统一将系统身份消息放至最顶部”始终统一上移 SYSTEM，可能破坏上下文语义。</div></div>
+          <div class="set-control system-message-control"><div class="seg system-message-seg" id="systemMessageHandlingSeg" aria-label="系统身份消息处理模式"><button data-system-message-mode="default">默认</button><button data-system-message-mode="off">关闭Anthropic优化</button><button data-system-message-mode="top">统一将系统身份消息放至最顶部</button></div></div>
         </div>
         <div class="set-row">
           <div class="set-info"><div class="set-title">缓存有效期 TTL</div><div class="set-desc">自动不发送 ttl；5 分钟和 1 小时统一应用对应的 Claude 原生窗口；手动模式按两种 marker 分别使用 1h / 5m。</div></div>
@@ -503,6 +503,23 @@
       <div class="body-stream" id="prefixBodyStream"></div>
     </div>
     <div class="drawer-actions"><button class="danger-light" id="prefixModalClear">清空重学</button><span class="sidebar-address" id="prefixModalHint">Prefix</span></div>
+  </div>
+</aside>
+
+<aside class="drawer" id="anthropicOptimizationWhitelistModal" aria-hidden="true">
+  <div class="drawer-backdrop" id="anthropicOptimizationWhitelistBackdrop"></div>
+  <div class="drawer-panel">
+    <div class="drawer-head">
+      <div><div class="eyebrow">Anthropic · SYSTEM</div><h2>忽略Anthropic优化的模型白名单</h2></div>
+      <button id="closeAnthropicOptimizationWhitelist" class="ghost" type="button">✕</button>
+    </div>
+    <div class="detail-scroll whitelist-editor-scroll">
+      <p class="note">每行填写一个模型 ID 或 Glob 模式。匹配不区分大小写，并且必须匹配完整模型名；<code>*</code> 匹配任意长度，<code>?</code> 匹配单个字符。留空并保存可清空白名单。</p>
+      <label class="whitelist-editor-label" for="anthropicOptimizationModelWhitelistInput">模型 ID / Glob 模式</label>
+      <textarea id="anthropicOptimizationModelWhitelistInput" spellcheck="false" autocomplete="off" placeholder="claude-fable-5-1&#10;claude-opus-*"></textarea>
+      <div class="whitelist-editor-meta"><span id="anthropicOptimizationWhitelistDraftCount">0 个项目</span><span>示例：<code>claude-opus-*</code></span></div>
+    </div>
+    <div class="drawer-actions"><div class="button-row"><button id="cancelAnthropicOptimizationWhitelist" type="button">取消</button><button id="saveAnthropicOptimizationWhitelist" class="primary" type="button">保存白名单</button></div><span class="sidebar-address" id="anthropicOptimizationWhitelistHint">全局设置</span></div>
   </div>
 </aside>
 

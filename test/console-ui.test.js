@@ -464,6 +464,20 @@ test('system-message handling control exposes all three modes and their tradeoff
     assert.match(script, /\/console\/system-message-handling/);
 });
 
+test('Anthropic optimization whitelist control sits beside the title without a summary count', () => {
+    const html = readFileSync(new URL('../public/console.html', import.meta.url), 'utf8');
+    const script = readFileSync(new URL('../public/console.js', import.meta.url), 'utf8');
+
+    assert.match(html, /<div class="set-title system-message-title">[\s\S]*id="openAnthropicOptimizationWhitelist"/);
+    assert.doesNotMatch(html, /anthropicOptimizationWhitelistCount/);
+    assert.match(html, /anthropicOptimizationWhitelistDraftCount/);
+    assert.match(html, /id="anthropicOptimizationWhitelistModal"/);
+    assert.match(script, /\/console\/anthropic-optimization-whitelist/);
+    assert.match(script, /openAnthropicOptimizationWhitelist/);
+    assert.match(consoleCss, /\.system-message-title\s*\{/);
+    assert.doesNotMatch(consoleCss, /\.setting-count/);
+});
+
 test('system-message handling helpers normalize canonical and legacy runtime state', () => {
     assert.equal(helpers.systemMessageHandlingMode({}), 'default');
     assert.equal(helpers.systemMessageHandlingMode({ moveSystemMessagesToTop: false }), 'default');

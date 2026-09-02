@@ -323,6 +323,9 @@ label { display: grid; gap: 7px; color: var(--text-muted); font-weight: 700; fon
 .set-title { font-size: 14.5px; font-weight: 800; margin-bottom: 3px; }
 .set-desc { font-size: 12.5px; color: var(--text-muted); line-height: 1.5; }
 .set-control { flex-shrink: 0; display: flex; align-items: center; gap: 10px; }
+.system-message-control { flex-wrap: wrap; justify-content: flex-end; }
+.system-message-title { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
+.system-message-title > .small { white-space: nowrap; }
 .anchor-ignore-control { flex-wrap: wrap; justify-content: flex-end; }
 .anchor-ignore-control .compact-field { min-width: 108px; }
 .anchor-ignore-control #ignoreLastAnchorCount { width: 74px; min-width: 74px; }
@@ -442,6 +445,10 @@ tr:hover td { background-color: var(--bg-app); }
 .drawer-head { border-bottom: 1px solid var(--border-strong); padding-bottom: 18px; margin-bottom: 20px; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .drawer-head h2 { font-size: 22px; font-weight: 800; margin: 0; }
 .drawer-actions { margin-top: auto; padding-top: 18px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.whitelist-editor-scroll { display: flex; flex-direction: column; gap: 12px; }
+.whitelist-editor-label { color: var(--text-main); font-size: 13px; font-weight: 800; }
+.whitelist-editor-scroll textarea { min-height: 260px; }
+.whitelist-editor-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text-muted); font-size: 12px; }
 .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
 .detail-tabs { flex: 0 0 auto; z-index: 3; background: var(--bg-panel); padding-top: 4px; }
 .tab { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; box-shadow: none; color: var(--text-muted); padding: 8px 14px; font-size: 13.5px; }
@@ -612,6 +619,8 @@ tr:hover td { background-color: var(--bg-app); }
   .set-control, .compact-field { width: 100%; }
   .set-control > .seg { width: 100%; }
   .set-control > .seg button { min-width: 0; padding-inline: 8px; }
+  .system-message-title { align-items: flex-start; gap: 10px; }
+  .system-message-title > .small { max-width: 100%; white-space: normal; text-align: left; }
   .marker-options { justify-content: flex-start; }
   .compact-field { justify-content: space-between; }
   .compact-field select, .compact-field input { min-width: min(62vw, 230px); }

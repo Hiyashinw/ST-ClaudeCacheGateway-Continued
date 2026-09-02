@@ -46,6 +46,8 @@ const DEFAULT_REQUEST_CACHE_APPEARANCE = {
   blockHashChange: { textColor: '#B25E00', backgroundColor: '#FBF1E6' },
 };
 
+const DEFAULT_ANTHROPIC_OPTIMIZATION_MODEL_WHITELIST = ['claude-fable-5-1'];
+
 const REQUEST_CACHE_APPEARANCE_FIELDS = [
   { key: 'prefixLock', cssKey: 'prefix-lock', label: 'Prefix 锁定' },
   { key: 'cacheAnchor', cssKey: 'cache-anchor', label: '缓存锚点' },
@@ -195,6 +197,34 @@ function systemMessageHandlingLabel(value) {
   if (mode === 'off') return '关闭Anthropic优化';
   if (mode === 'top') return '统一将系统身份消息放至最顶部';
   return '默认';
+}
+
+function normalizeAnthropicOptimizationModelWhitelist(value) {
+  const items = Array.isArray(value)
+    ? value
+    : String(value ?? '').split(/\r?\n|,/);
+  const seen = new Set();
+  const output = [];
+
+  for (const item of items) {
+    if (typeof item !== 'string') continue;
+    const pattern = item.trim();
+    if (!pattern) continue;
+    const key = pattern.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(pattern);
+  }
+
+  return output;
+}
+
+
+function updateAnthropicOptimizationWhitelistDraftCount() {
+  const count = $('anthropicOptimizationWhitelistDraftCount');
+  const input = $('anthropicOptimizationModelWhitelistInput');
+  if (!count || !input) return;
+  count.textContent = `${normalizeAnthropicOptimizationModelWhitelist(input.value).length} 个项目`;
 }
 
 function autoBreakpointCaptureLabel(item) {
@@ -2446,6 +2476,31 @@ function closeGuide() {
   setDrawerOpen('guideModal', false);
 }
 
+function openAnthropicOptimizationWhitelist() {
+  const input = $('anthropicOptimizationModelWhitelistInput');
+  if (!input) return;
+  const models = normalizeAnthropicOptimizationModelWhitelist(
+    state.runtime?.anthropicOptimizationModelWhitelist ?? DEFAULT_ANTHROPIC_OPTIMIZATION_MODEL_WHITELIST,
+  );
+  input.value = models.join('\n');
+  updateAnthropicOptimizationWhitelistDraftCount();
+  setDrawerOpen('anthropicOptimizationWhitelistModal', true);
+  input.focus();
+}
+
+function closeAnthropicOptimizationWhitelist() {
+  setDrawerOpen('anthropicOptimizationWhitelistModal', false);
+}
+
+async function saveAnthropicOptimizationWhitelist() {
+  const input = $('anthropicOptimizationModelWhitelistInput');
+  const models = normalizeAnthropicOptimizationModelWhitelist(input?.value || '');
+  await postJson('/console/anthropic-optimization-whitelist', { models });
+  await refreshAll();
+  closeAnthropicOptimizationWhitelist();
+  setStatus(`忽略Anthropic优化的模型白名单已保存（${models.length} 个项目）`);
+}
+
 async function applyTtl(value) {
   await postJson('/console/cache-ttl', { ttl: value });
   await refreshAll();
@@ -2613,10 +2668,10 @@ function bindEvents() {
       await postJson('/console/system-message-handling', { mode });
       await refreshAll();
       const detail = mode === 'default'
-        ? 'OpenAI 原样传输；转为 Anthropic 时保序映射并合并同角色发言'
+        ? 'OpenAI 原样传输；转为 Anthropic 时保序映射并合并同角色发言（白名单模型保留跨轮 SYSTEM）'
         : mode === 'top'
           ? '所有 OpenAI-compatible 消息链都会把系统身份消息统一移至最前'
-          : 'OpenAI 原样传输；转为 Anthropic 时将系统身份消息统一移至顶部';
+          : 'OpenAI 原样传输；转为 Anthropic 时默认上移 SYSTEM，白名单模型保留原始顺序';
       setStatus(`系统身份消息处理已切换为${systemMessageHandlingLabel(mode)}：${detail}`);
     };
   }
@@ -2810,6 +2865,12 @@ function bindEvents() {
   $('drawerBackdrop').onclick = closeDrawer;
   $('closePrefixModal').onclick = closePrefixModal;
   $('prefixBackdrop').onclick = closePrefixModal;
+  $('openAnthropicOptimizationWhitelist').onclick = openAnthropicOptimizationWhitelist;
+  $('closeAnthropicOptimizationWhitelist').onclick = closeAnthropicOptimizationWhitelist;
+  $('anthropicOptimizationWhitelistBackdrop').onclick = closeAnthropicOptimizationWhitelist;
+  $('cancelAnthropicOptimizationWhitelist').onclick = closeAnthropicOptimizationWhitelist;
+  $('anthropicOptimizationModelWhitelistInput').oninput = updateAnthropicOptimizationWhitelistDraftCount;
+  $('saveAnthropicOptimizationWhitelist').onclick = () => saveAnthropicOptimizationWhitelist().catch((error) => setStatus(error.message));
   $('openGuide').onclick = () => setDrawerOpen('guideModal', true);
   $('closeGuide').onclick = closeGuide;
   $('guideBackdrop').onclick = closeGuide;

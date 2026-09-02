@@ -968,11 +968,39 @@ export function preprocessAutomaticCacheBreaks(body, options = {}) {
         record(path, source, 'added', markerPath);
     }
 
-    if (protocol === 'anthropic' && hasOwn(nextBody, 'system')) {
+    const hasLandableTopLevelSystem = protocol === 'anthropic'
+        && hasOwn(nextBody, 'system')
+        && (typeof nextBody.system === 'string'
+            ? nextBody.system.trim() !== ''
+            : Array.isArray(nextBody.system)
+                && nextBody.system.some((block) => isLandableContentBlock(block, definitions)));
+
+    if (hasLandableTopLevelSystem) {
         appendToContent(nextBody, 'system', 'system', 'anthropic-system');
     }
 
     const messages = Array.isArray(nextBody.messages) ? nextBody.messages : [];
+
+    if (protocol === 'anthropic'
+        && options.anthropicSystemMessagesInMessages === true
+        && !hasLandableTopLevelSystem) {
+        let lastSystemIndex = -1;
+
+        for (let index = 0; index < messages.length; index++) {
+            if (messages[index]?.role === 'system') {
+                lastSystemIndex = index;
+            }
+        }
+
+        if (lastSystemIndex >= 0) {
+            appendToContent(
+                messages[lastSystemIndex],
+                'content',
+                `messages[${lastSystemIndex}].content`,
+                'anthropic-system-message',
+            );
+        }
+    }
 
     if (protocol === 'openai') {
         let lastSystemIndex = -1;

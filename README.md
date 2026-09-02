@@ -32,7 +32,7 @@ API Key: 你的上游供应商 API Key
 
 - 可接收 OpenAI-compatible `v1/chat/completions` 请求；同时也兼容Anthropic native `v1/messages` 请求，并对两者间的转换进行特殊优化。
 - 支持自动生成缓存断点，傻瓜式操作。
-- 系统身份消息处理提供“默认”“关闭Anthropic优化”或“统一将系统身份消息放至最顶部”三种方式；默认对 OpenAI-compatible 上游原样传输，并在转为 Anthropic native 时自动完成保序角色转换与同角色消息合并。
+- 系统身份消息处理提供“默认”“关闭Anthropic优化”或“统一将系统身份消息放至最顶部”三种方式；默认对 OpenAI-compatible 上游原样传输，并在转为 Anthropic native 时自动完成保序角色转换与同角色消息合并；另有全局“忽略 Anthropic 优化的模型白名单”，可让支持跨轮 SYSTEM 的 Anthropic 模型保留原始角色与消息边界。
 - 支持 `[[CACHE_BREAK]]` 与 `[[CACHE_BREAK_SHORT]]` 两种手动标记；在手动 TTL 下可分别指定 1h 长缓存与 5m 短缓存。
 - 支持 Claude `cache_control` 注入，最多 4 个缓存断点。
 - 支持固定头缓存点，以及单锚点 / 滚动锚点保留策略。
@@ -166,16 +166,34 @@ POST http://127.0.0.1:8788/v1/messages/count_tokens
 
 如果使用 Claude 原生入站，请把当前渠道的上游格式保持为 Anthropic native，暂时不支持Anthropic native 上游 -> OpenAI-compatible 请求
 
-## 系统身份消息处理（专为Anthropic  native 上游优化）
+## 系统身份消息处理（专为 Anthropic native 上游优化）
 
 控制台“缓存策略 → 缓存标记与 TTL”提供“系统身份消息处理”选项。它按所选模式处理 **OpenAI-compatible 入站**中的 `system` 消息；Anthropic native 入站本身已经使用顶层 `system`，不参与这一步角色转换。
 
-- **默认**：转发到 OpenAI-compatible 上游时，`system`、`user`、`assistant` 的角色和位置均保持原样；转为 Anthropic native 时，保留请求开头连续出现的 `system` 作为 Anthropic 顶层 `system`，一旦遇到 `user` 或 `assistant`，后续 `system` 会在原位置转换为 `user`，最后按原顺序合并相邻的同角色发言。优点是 OpenAI-compatible 链路完全保真，同时尽量保留 Anthropic 链路的上下文位置，并生成更符合 Anthropic 对话格式的消息结构；缺点是 Anthropic 链路中的中途系统内容会失去系统身份，连续同角色消息的原始边界也会被合并。
+- **默认**：转发到 OpenAI-compatible 上游时，`system`、`user`、`assistant` 的角色和位置均保持原样；转为 Anthropic native 时，保留请求开头连续出现的 `system` 作为 Anthropic 顶层 `system`，一旦遇到 `user` 或 `assistant`，后续 `system` 会在原位置转换为 `user`，最后按原顺序合并相邻的同角色发言。优点是 OpenAI-compatible 链路完全保真，同时尽量保留 Anthropic 链路的上下文位置；缺点是中途系统内容会失去系统身份，连续同角色消息的原始边界也会被合并。
 - **关闭Anthropic优化**：转发到 OpenAI-compatible 上游时仍原样传输；转为 Anthropic native 时，将全部 `system` 集中到 Anthropic 顶层 `system`，不合并相邻的同角色发言。优点是中途系统内容仍以系统身份发送，也不会合并原有的 `user` / `assistant` 消息边界；缺点是会把中途插入的系统消息提前，可能破坏上下文语义，但通常更容易形成稳定的缓存前缀。
-- **统一将系统身份消息放至最顶部**：转发到 OpenAI-compatible 上游时，稳定地把全部 `system` 移到 `messages` 最前面；转为 Anthropic native 时，也将全部 `system` 集中到顶层 `system`，且不合并相邻的同角色发言。优点是所有 OpenAI-compatible 入站链路都能得到更稳定的系统前缀，有利于提高缓存命中率；缺点是所有链路都可能因中途系统消息被提前而改变上下文语义。
+- **统一将系统身份消息放至最顶部**：转发到 OpenAI-compatible 上游时，稳定地把全部 `system` 移到 `messages` 最前面；转为 Anthropic native 时，也将全部 `system` 集中到顶层 `system`，且不合并相邻的同角色发言。该模式是用户明确选择的上移策略，不会被白名单覆盖；它可能因中途系统消息被提前而改变上下文语义。
+
+### 忽略 Anthropic 优化的模型白名单
+
+“系统身份消息处理”标题旁的 **忽略 Anthropic 优化的模型白名单** 按钮打开全局编辑面板。默认白名单只有精确模型名 `claude-fable-5-1`，不会自动匹配其它版本后缀；用户可以按行添加未来模型，例如 `claude-opus-*`，也可以保存空列表。
+
+白名单项目按完整 Glob 模式匹配且不区分大小写：`*` 匹配任意长度的字符，`?` 匹配单个字符，其它字符均按字面量处理，不接受正则表达式。输入会去除首尾空格、忽略空项，并按大小写不敏感规则去重；例如 `claude-opus-*` 可匹配 `claude-opus-4` 和 `CLAUDE-OPUS-2026`，但不会匹配前后带额外字符的模型名。
+
+模式矩阵如下：
+
+| 上游 / 入站 | 默认或关闭Anthropic优化 | 统一放至最顶部 |
+| --- | --- | --- |
+| Anthropic 上游 + OpenAI-compatible 入站 + 命中白名单 | 每个输入 `system` 保留为 `messages` 中独立的 `role: "system"`，保持原始角色、边界和顺序；不把中途 SYSTEM 转为 USER，不集中到顶部，也不合并相邻 USER / ASSISTANT。 | 仍按用户选择将 SYSTEM 统一移动到 Anthropic 顶层 `system`。 |
+| Anthropic 上游 + OpenAI-compatible 入站 + 未命中白名单 | 沿用当前 Anthropic 转译优化。 | 沿用当前统一上移逻辑。 |
+| OpenAI-compatible 上游 | 沿用现有 `default` / `off` / `top` 语义；白名单不改变 OpenAI wire body。 | 同左。 |
+| Anthropic native 入站 | 原样转发该链路的角色结构；白名单不参与。 | 同左。 |
+
+白名单只跳过角色与消息边界优化，不关闭缓存 marker、`cache_control`、缓存锚点或 Prefix Lock。命中判定使用渠道参数合并、排除规则生效后的最终模型名；请求诊断会记录有效处理分支、是否命中以及命中的模式。切换白名单会清空不兼容的缓存锚点和 Prefix Lock 学习状态。
+
+白名单是全局配置，设置会写入 `gateway-settings.json`，并包含在控制台配置导入、导出和恢复默认流程中。配置 schema 当前为 `12`；旧配置缺少该字段时回退到默认项，明确保存的空数组会保持为空。
 
 切换处理方式会清空已学习的缓存锚点和 Prefix Lock 内容，下一次成功请求会按新的提示词结构重新学习。
-
 ## 缓存标记
 
 把缓存 marker 放在大段稳定内容之后。可使用以下任一种：
@@ -291,7 +309,7 @@ A / F / O / P
 
 滚动模式以成功请求为提交边界：上游非 2xx、网络错误、请求取消和 `/count_tokens` 都不会学习、晋升或淘汰锚点。不同渠道、上游协议、模型和 TTL 的学习上下文彼此隔离，内存中最多保留 32 个最近使用的上下文。
 
-策略设置会持久化到 `gateway-settings.json`。旧配置运行时迁移到 `schemaVersion: 11`，缺失的处理顺序、日志上限、预览示例、Prefix/锚点外观和 Prefix 启用状态会自动补齐；渠道 Profile 不会从默认文件覆盖用户渠道。
+策略设置会持久化到 `gateway-settings.json`。旧配置运行时迁移到 `schemaVersion: 12`，缺失的处理顺序、日志上限、预览示例、Prefix/锚点外观、Prefix 启用状态和 Anthropic 优化模型白名单会自动补齐；渠道 Profile 不会从默认文件覆盖用户渠道。
 
 运行学习数据与诊断日志使用两个独立的本地文件：
 
@@ -449,7 +467,7 @@ Usage 外观是全局显示设置；主体参数和请求头处理仍按当前�
 “当前 cache_control / 状态 JSON”面板提供：
 
 - **导出配置**：下载当前可导入的全局及高级配置。
-- **导入配置**：导入 JSON，但始终保留当前 `upstreamMode`、`upstreamBaseUrl`、活动渠道及渠道 Profile，并忽略 `anchorState`、`cacheAnchorState` 等学习状态。
+- **导入配置**：导入 JSON，其中包含 Anthropic 优化模型白名单等全局设置，但始终保留当前 `upstreamMode`、`upstreamBaseUrl`、活动渠道及渠道 Profile，并忽略 `anchorState`、`cacheAnchorState` 等学习状态。
 - **恢复默认配置**：实时读取项目根目录的 `default-gateway-settings.json`；同样不会替换当前上游连接，应用后清空不兼容学习数据。
 
 ### 包含主体参数

@@ -1,7 +1,10 @@
 {
-  "schemaVersion": 11,
+  "schemaVersion": 12,
   "cacheTranslationEnabled": true,
   "systemMessageHandlingMode": "default",
+  "anthropicOptimizationModelWhitelist": [
+    "claude-fable-5-1"
+  ],
   "autoGenerateCacheBreakpointsMode": "auto",
   "captureRequests": true,
   "maxRequestCaptures": 20,

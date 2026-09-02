@@ -24,10 +24,15 @@ import {
 
 const MARKER = '[[CACHE_BREAK]]';
 const MAX_BREAKPOINTS = 4;
-const SETTINGS_SCHEMA_VERSION = 11;
+const SETTINGS_SCHEMA_VERSION = 12;
 const RUNTIME_STATE_SCHEMA_VERSION = 1;
 const REQUEST_LOG_SCHEMA_VERSION = 1;
 const DEFAULT_UPSTREAM_BASE_URL = 'https://api.pioneer.ai';
+const DEFAULT_ANTHROPIC_OPTIMIZATION_MODEL_WHITELIST = Object.freeze([
+    'claude-fable-5-1',
+]);
+const MAX_ANTHROPIC_OPTIMIZATION_MODEL_WHITELIST_ENTRIES = 128;
+const MAX_ANTHROPIC_OPTIMIZATION_MODEL_PATTERN_LENGTH = 200;
 const DEFAULT_USAGE_APPEARANCE = Object.freeze({
     input: Object.freeze({ textColor: '#127852', backgroundColor: null }),
     output: Object.freeze({ textColor: '#7C3AED', backgroundColor: null }),
@@ -81,6 +86,9 @@ let channelProfiles = runtimeSettings.channels;
 let activeChannelId = runtimeSettings.activeChannelId;
 let cacheTranslationEnabled = normalizeBoolean(getRuntimeConfigValue('CACHE_TRANSLATION_ENABLED', runtimeSettings.cacheTranslationEnabled, true), true);
 let systemMessageHandlingMode = normalizeSystemMessageHandlingMode(runtimeSettings.systemMessageHandlingMode);
+let anthropicOptimizationModelWhitelist = normalizeAnthropicOptimizationModelWhitelist(
+    runtimeSettings.anthropicOptimizationModelWhitelist,
+);
 let autoGenerateCacheBreakpointsMode = normalizeAutoGenerateCacheBreakpointsMode(runtimeSettings.autoGenerateCacheBreakpointsMode);
 let fixedHeadBreakpointCount = normalizeFixedHeadBreakpointCount(runtimeSettings.fixedHeadBreakpointCount);
 let cacheAnchorMode = normalizeCacheAnchorMode(runtimeSettings.cacheAnchorMode);
@@ -208,6 +216,7 @@ function getLearningConfigFingerprint() {
     return hashCanonical({
         cacheTranslationEnabled,
         systemMessageHandlingMode,
+        anthropicOptimizationModelWhitelist,
         autoGenerateCacheBreakpointsMode,
         cacheTtl: getCacheTtlLabel(),
         fixedHeadBreakpointCount,
@@ -257,6 +266,9 @@ function normalizePersistedPrefixLock(value) {
         prefixHash: value.prefixHash,
         prefixLength: Math.max(0, Number(value.prefixLength) || 0),
         prefixBlockCount: Math.max(0, Number(value.prefixBlockCount) || 0),
+        prefixGroupPath: typeof value.prefixGroupPath === 'string'
+            ? value.prefixGroupPath
+            : getSegmentGroupPath(value.prefixSegments.at(-1)),
         firstCacheControlPath: typeof value.firstCacheControlPath === 'string'
             ? value.firstCacheControlPath
             : null,
@@ -803,6 +815,9 @@ function migrateRuntimeSettings(rawSettings = {}) {
         schemaVersion: SETTINGS_SCHEMA_VERSION,
         cacheTtl: serializeCacheTtl(normalizeCacheTtl(rawSettings.cacheTtl ?? '1h')),
         systemMessageHandlingMode: migrateSystemMessageHandlingMode(rawSettings),
+        anthropicOptimizationModelWhitelist: normalizeAnthropicOptimizationModelWhitelist(
+            rawSettings.anthropicOptimizationModelWhitelist,
+        ),
         autoGenerateCacheBreakpointsMode: normalizeAutoGenerateCacheBreakpointsMode(
             Object.prototype.hasOwnProperty.call(rawSettings, 'autoGenerateCacheBreakpointsMode')
                 ? rawSettings.autoGenerateCacheBreakpointsMode
@@ -895,6 +910,7 @@ function saveRuntimeSettings() {
         schemaVersion: SETTINGS_SCHEMA_VERSION,
         cacheTranslationEnabled,
         systemMessageHandlingMode,
+        anthropicOptimizationModelWhitelist: [...anthropicOptimizationModelWhitelist],
         autoGenerateCacheBreakpointsMode,
         captureRequests,
         maxRequestCaptures,
@@ -929,6 +945,7 @@ function getExportedConfiguration() {
         upstreamBaseUrl,
         cacheTranslationEnabled,
         systemMessageHandlingMode,
+        anthropicOptimizationModelWhitelist: [...anthropicOptimizationModelWhitelist],
         autoGenerateCacheBreakpointsMode,
         captureRequests,
         maxRequestCaptures,
@@ -977,6 +994,9 @@ function normalizeImportedConfiguration(value) {
         systemMessageHandlingMode: Object.prototype.hasOwnProperty.call(source, 'systemMessageHandlingMode')
             ? normalizeSystemMessageHandlingMode(source.systemMessageHandlingMode, { strict: true })
             : systemMessageHandlingMode,
+        anthropicOptimizationModelWhitelist: Object.prototype.hasOwnProperty.call(source, 'anthropicOptimizationModelWhitelist')
+            ? normalizeAnthropicOptimizationModelWhitelist(source.anthropicOptimizationModelWhitelist, { strict: true })
+            : [...anthropicOptimizationModelWhitelist],
         autoGenerateCacheBreakpointsMode: Object.prototype.hasOwnProperty.call(source, 'autoGenerateCacheBreakpointsMode')
             ? normalizeAutoGenerateCacheBreakpointsMode(source.autoGenerateCacheBreakpointsMode, { strict: true })
             : autoGenerateCacheBreakpointsMode,
@@ -1040,6 +1060,7 @@ function applyImportedConfiguration(value, reason = 'config-imported') {
     const next = normalizeImportedConfiguration(value);
     cacheTranslationEnabled = next.cacheTranslationEnabled;
     systemMessageHandlingMode = next.systemMessageHandlingMode;
+    anthropicOptimizationModelWhitelist = next.anthropicOptimizationModelWhitelist;
     autoGenerateCacheBreakpointsMode = next.autoGenerateCacheBreakpointsMode;
     captureRequests = next.captureRequests;
     maxRequestCaptures = next.maxRequestCaptures;
@@ -1323,6 +1344,102 @@ function migrateSystemMessageHandlingMode(rawSettings = {}) {
     }
 
     return normalizeSystemMessageHandlingMode(rawMode);
+}
+
+function normalizeAnthropicOptimizationModelWhitelist(value, { strict = false } = {}) {
+    if (value === undefined || value === null) {
+        if (strict) {
+            throw new Error('models is required and must be an array of strings.');
+        }
+
+        return [...DEFAULT_ANTHROPIC_OPTIMIZATION_MODEL_WHITELIST];
+    }
+
+    let items;
+
+    if (Array.isArray(value)) {
+        items = value;
+    } else if (!strict && typeof value === 'string') {
+        items = value.split(/\r?\n|,/);
+    } else {
+        throw new Error('models must be an array of strings.');
+    }
+
+    const seen = new Set();
+    const output = [];
+
+    for (const item of items) {
+        if (typeof item !== 'string') {
+            if (strict) {
+                throw new Error('models must contain only strings.');
+            }
+            continue;
+        }
+
+        const pattern = item.trim();
+
+        if (!pattern) {
+            continue;
+        }
+
+        if (/[\r\n]/.test(pattern)) {
+            throw new Error('Each model whitelist entry must be a single line.');
+        }
+
+        if (pattern.length > MAX_ANTHROPIC_OPTIMIZATION_MODEL_PATTERN_LENGTH) {
+            throw new Error(`Model whitelist entries must be ${MAX_ANTHROPIC_OPTIMIZATION_MODEL_PATTERN_LENGTH} characters or fewer.`);
+        }
+
+        const dedupeKey = pattern.toLowerCase();
+
+        if (!seen.has(dedupeKey)) {
+            seen.add(dedupeKey);
+            output.push(pattern);
+        }
+    }
+
+    if (output.length > MAX_ANTHROPIC_OPTIMIZATION_MODEL_WHITELIST_ENTRIES) {
+        throw new Error(`The model whitelist cannot contain more than ${MAX_ANTHROPIC_OPTIMIZATION_MODEL_WHITELIST_ENTRIES} entries.`);
+    }
+
+    return output;
+}
+
+function escapeGlobRegexCharacter(value) {
+    return value.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+}
+
+function compileModelGlob(pattern) {
+    let source = '^';
+
+    for (const character of String(pattern).toLowerCase()) {
+        if (character === '*') {
+            source += '.*';
+        } else if (character === '?') {
+            source += '.';
+        } else {
+            source += escapeGlobRegexCharacter(character);
+        }
+    }
+
+    source += '$';
+    return new RegExp(source, 'iu');
+}
+
+function findAnthropicOptimizationWhitelistMatch(model) {
+    const normalizedModel = String(model ?? '').trim();
+
+    if (!normalizedModel) {
+        return null;
+    }
+
+    for (const pattern of anthropicOptimizationModelWhitelist) {
+        if (compileModelGlob(pattern).test(normalizedModel)) {
+            return pattern;
+        }
+    }
+
+    return null;
 }
 
 function normalizeAutoGenerateCacheBreakpointsMode(value, { strict = false } = {}) {
@@ -1630,6 +1747,18 @@ function getUpstreamExtraJsonKeys() {
     return Object.keys(upstreamExtraJson);
 }
 
+function getEffectiveUpstreamModel(body) {
+    if (upstreamExcludePaths.includes('model')) {
+        return undefined;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(upstreamExtraJson || {}, 'model')) {
+        return upstreamExtraJson.model;
+    }
+
+    return body?.model;
+}
+
 function getCacheTtlLabel() {
     return serializeCacheTtl(cacheTtl);
 }
@@ -1858,12 +1987,13 @@ function getCachePolicyScope(body, protocol) {
     };
 }
 
-function planRequestCache(body, protocol) {
+function planRequestCache(body, protocol, options = {}) {
     const configuredMode = autoGenerateCacheBreakpointsMode;
     const automaticResult = preprocessAutomaticCacheBreaks(body, {
         protocol,
         mode: cacheTranslationEnabled ? configuredMode : 'off',
         marker: MARKER,
+        anthropicSystemMessagesInMessages: options.anthropicSystemMessagesInMessages === true,
     });
     automaticResult.diagnostics.configuredMode = configuredMode;
     automaticResult.diagnostics.effectiveEnabled = Boolean(automaticResult.diagnostics.enabled);
@@ -1943,6 +2073,7 @@ function getRuntimeState() {
         channels: channelProfiles.map(getSafeChannelProfile),
         cacheTranslationEnabled,
         systemMessageHandlingMode,
+        anthropicOptimizationModelWhitelist: [...anthropicOptimizationModelWhitelist],
         // Keep the legacy boolean for older console clients. Both non-default
         // modes hoist system messages during OpenAI -> Anthropic conversion.
         moveSystemMessagesToTop: systemMessageHandlingMode !== 'default',
@@ -2751,6 +2882,7 @@ function splitBodyAtFirstCacheControl(body, mode) {
         prefixHash: getSegmentHash(prefixSegments),
         prefixLength: getSegmentLength(prefixSegments),
         prefixBlockCount: prefixSegments.length,
+        prefixGroupPath: getSegmentGroupPath(prefixSegments.at(-1)),
         suffixHash: getSegmentHash(suffixSegments),
         suffixLength: getSegmentLength(suffixSegments),
         suffixBlockCount: suffixSegments.length,
@@ -2763,6 +2895,44 @@ function buildContentFromValues(values) {
     }
 
     return values.map((value) => (typeof value === 'string' ? { type: 'text', text: value } : safeJsonClone(value)));
+}
+
+function getSegmentGroupPath(segment) {
+    const path = String(segment?.path || '');
+    const match = path.match(/^(system|messages\[\d+\])/);
+    return match?.[1] || (typeof segment?.groupKey === 'string' ? segment.groupKey : null);
+}
+
+function namespaceSegmentGroups(segments, namespace) {
+    return segments.map((segment, index) => ({
+        ...segment,
+        groupKey: namespace + ':' + (segment.groupKey ?? ('segment:' + index)),
+    }));
+}
+
+function shouldJoinPrefixLockMessage(prefixLockValue, split) {
+    const lockedLast = prefixLockValue?.prefixSegments?.at(-1);
+    const currentPrefixLast = split?.prefixSegments?.at(-1);
+    const currentSuffixFirst = split?.suffixSegments?.at(0);
+
+    if (!lockedLast || !currentPrefixLast || !currentSuffixFirst
+        || lockedLast.groupKey === undefined
+        || currentPrefixLast.groupKey === undefined
+        || currentSuffixFirst.groupKey === undefined) {
+        return false;
+    }
+
+    // The suffix can continue the locked final message only when the current
+    // request's first cache boundary is inside that same message. Comparing
+    // the path-derived group as well prevents a message:0/message:0 collision
+    // from joining unrelated messages after the conversation shape changes.
+    if (currentPrefixLast.groupKey !== currentSuffixFirst.groupKey) {
+        return false;
+    }
+
+    const lockedGroupPath = prefixLockValue.prefixGroupPath || getSegmentGroupPath(lockedLast);
+    const currentGroupPath = getSegmentGroupPath(currentPrefixLast);
+    return Boolean(lockedGroupPath && currentGroupPath && lockedGroupPath === currentGroupPath);
 }
 
 function buildAnthropicBodyFromSegments(body, segments) {
@@ -2847,6 +3017,7 @@ function rememberPrefixLock(split, mode) {
         prefixHash: split.prefixHash,
         prefixLength: split.prefixLength,
         prefixBlockCount: split.prefixBlockCount,
+        prefixGroupPath: split.prefixGroupPath,
         firstCacheControlPath: split.firstCacheControlPath,
         createdAt: new Date().toISOString(),
     };
@@ -2935,10 +3106,24 @@ function applyPrefixLock(body, mode) {
         };
     }
 
-    const nextSegments = [
-        ...safeJsonClone(prefixLock.prefixSegments),
-        ...safeJsonClone(split.suffixSegments),
-    ];
+    const lockedSegments = namespaceSegmentGroups(safeJsonClone(prefixLock.prefixSegments), 'locked');
+    const currentSegments = namespaceSegmentGroups(safeJsonClone(split.suffixSegments), 'current');
+
+    if (shouldJoinPrefixLockMessage(prefixLock, split) && lockedSegments.length > 0 && currentSegments.length > 0) {
+        const currentGroupKey = split.suffixSegments[0]?.groupKey;
+        const lockedGroupKey = lockedSegments.at(-1)?.groupKey;
+
+        if (currentGroupKey !== undefined && lockedGroupKey) {
+            for (let index = 0; index < currentSegments.length; index += 1) {
+                if (split.suffixSegments[index]?.groupKey !== currentGroupKey) {
+                    break;
+                }
+                currentSegments[index].groupKey = lockedGroupKey;
+            }
+        }
+    }
+
+    const nextSegments = [...lockedSegments, ...currentSegments];
     const nextBody = buildBodyFromSegments(body, mode, nextSegments);
     const nextSplit = splitBodyAtFirstCacheControl(nextBody, mode);
     updatePrefixLockStats('replaced');
@@ -3686,10 +3871,26 @@ function hoistOpenAiSystemMessages(body) {
     };
 }
 
+function getAnthropicSystemMessageHandlingDecision(model) {
+    const matchedPattern = findAnthropicOptimizationWhitelistMatch(model);
+    const whitelistMatched = Boolean(matchedPattern);
+    const preserveSystemMessages = whitelistMatched
+        && (systemMessageHandlingMode === 'default' || systemMessageHandlingMode === 'off');
+
+    return {
+        configuredMode: systemMessageHandlingMode,
+        effectiveMode: preserveSystemMessages ? 'preserve' : systemMessageHandlingMode,
+        whitelistMatched,
+        matchedPattern,
+        preserveSystemMessages,
+    };
+}
+
 function convertOpenAiToAnthropicBody(body, options = {}) {
     const system = [];
     const messages = [];
     const handlingMode = normalizeSystemMessageHandlingMode(options.systemMessageHandlingMode);
+    const preserveSystemMessages = options.preserveSystemMessages === true;
     const shouldMoveSystemMessagesToTop = handlingMode !== 'default';
     let inLeadingSystemPrefix = true;
 
@@ -3697,7 +3898,9 @@ function convertOpenAiToAnthropicBody(body, options = {}) {
         if (message.role === 'system') {
             const content = normalizeAnthropicContent(message.content);
 
-            if (shouldMoveSystemMessagesToTop || inLeadingSystemPrefix) {
+            if (preserveSystemMessages) {
+                messages.push({ role: 'system', content });
+            } else if (shouldMoveSystemMessagesToTop || inLeadingSystemPrefix) {
                 appendAnthropicSystemContent(system, content);
             } else {
                 const hasContent = typeof content === 'string' ? Boolean(content) : content.length > 0;
@@ -3973,7 +4176,12 @@ function convertAnthropicStreamToOpenAi(stream, model, capture = null) {
 }
 
 async function proxyChatCompletionsAnthropic(request, body) {
-    const baseBody = convertOpenAiToAnthropicBody(safeJsonClone(body), { systemMessageHandlingMode });
+    const modelForSystemHandling = getEffectiveUpstreamModel(body);
+    const systemMessageDecision = getAnthropicSystemMessageHandlingDecision(modelForSystemHandling);
+    const baseBody = convertOpenAiToAnthropicBody(safeJsonClone(body), {
+        systemMessageHandlingMode,
+        preserveSystemMessages: systemMessageDecision.preserveSystemMessages,
+    });
     const extraJsonResult = applyUpstreamExtraJson(baseBody, 'anthropic');
 
     if (!Array.isArray(extraJsonResult.body?.messages)) {
@@ -3983,11 +4191,15 @@ async function proxyChatCompletionsAnthropic(request, body) {
         );
     }
 
-    if (systemMessageHandlingMode === 'default') {
+    const shouldMergeAnthropicMessages = systemMessageDecision.effectiveMode === 'default';
+
+    if (shouldMergeAnthropicMessages) {
         extraJsonResult.body.messages = mergeConsecutiveAnthropicMessages(extraJsonResult.body.messages);
     }
 
-    const cachePlan = planRequestCache(extraJsonResult.body, 'anthropic');
+    const cachePlan = planRequestCache(extraJsonResult.body, 'anthropic', {
+        anthropicSystemMessagesInMessages: systemMessageDecision.preserveSystemMessages,
+    });
     const result = getCachePlanResult(cachePlan);
     const convertedBody = cachePlan.body;
     let anthropicBody = convertedBody;
@@ -3997,7 +4209,7 @@ async function proxyChatCompletionsAnthropic(request, body) {
     // Cache and Prefix Lock post-processing can rebuild message boundaries.
     // Re-apply the default Anthropic invariant to the actual wire body so
     // consecutive user/assistant turns never escape unmerged.
-    if (systemMessageHandlingMode === 'default') {
+    if (shouldMergeAnthropicMessages) {
         anthropicBody.messages = mergeConsecutiveAnthropicMessages(anthropicBody.messages);
     }
 
@@ -4010,6 +4222,10 @@ async function proxyChatCompletionsAnthropic(request, body) {
     cachePlan._capture = capture;
 
     if (capture) {
+        capture.gateway.systemMessageHandlingEffectiveMode = systemMessageDecision.effectiveMode;
+        capture.gateway.systemMessageHandlingModel = modelForSystemHandling ?? null;
+        capture.gateway.anthropicOptimizationWhitelistMatched = systemMessageDecision.whitelistMatched;
+        capture.gateway.anthropicOptimizationWhitelistPattern = systemMessageDecision.matchedPattern;
         capture.gateway.prefixLock = safeJsonClone(prefixLockResult.diagnostics);
         capture.gateway.upstreamExtraJsonApplied = safeJsonClone(extraJsonResult.diagnostics);
     }
@@ -4023,6 +4239,10 @@ async function proxyChatCompletionsAnthropic(request, body) {
         cachePolicyAction: result.action ?? null,
         cacheTtl: getCacheTtlLabel(),
         systemMessageHandlingMode,
+        systemMessageHandlingEffectiveMode: systemMessageDecision.effectiveMode,
+        systemMessageHandlingModel: modelForSystemHandling ?? null,
+        anthropicOptimizationWhitelistMatched: systemMessageDecision.whitelistMatched,
+        anthropicOptimizationWhitelistPattern: systemMessageDecision.matchedPattern,
         captureId: capture?.id ?? null,
     });
 
@@ -4428,6 +4648,13 @@ function getCaptureSummary(capture) {
         autoGenerateCacheBreakpointsEffective: capture.gateway?.autoGenerateCacheBreakpointsEffective ?? false,
         autoGeneratedBreakpointCount: capture.gateway?.cachePolicy?.autoGeneratedBreakpoints?.added ?? 0,
         cacheTtl: capture.gateway?.cacheTtl ?? null,
+        systemMessageHandlingMode: capture.gateway?.systemMessageHandlingMode ?? 'default',
+        systemMessageHandlingModel: capture.gateway?.systemMessageHandlingModel ?? null,
+        systemMessageHandlingEffectiveMode: capture.gateway?.systemMessageHandlingEffectiveMode
+            ?? capture.gateway?.systemMessageHandlingMode
+            ?? 'default',
+        anthropicOptimizationWhitelistMatched: capture.gateway?.anthropicOptimizationWhitelistMatched ?? false,
+        anthropicOptimizationWhitelistPattern: capture.gateway?.anthropicOptimizationWhitelistPattern ?? null,
         inboundMode: capture.inbound?.mode ?? null,
         upstreamMode: capture.gateway?.upstreamMode ?? null,
         channelId: capture.gateway?.channelId ?? null,
@@ -4686,6 +4913,35 @@ async function handleConsoleApi(request, url) {
 
             saveRuntimeSettings();
             log('Updated system message handling from console.', { systemMessageHandlingMode });
+            return jsonResponse(getRuntimeState());
+        } catch (error) {
+            return jsonResponse({ error: error.message }, 400);
+        }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/console/anthropic-optimization-whitelist') {
+        try {
+            const body = await readJsonRequest(request);
+
+            if (!isPlainObject(body) || !Object.prototype.hasOwnProperty.call(body, 'models')) {
+                throw new Error('models is required and must be an array of strings.');
+            }
+
+            const nextWhitelist = normalizeAnthropicOptimizationModelWhitelist(body.models, { strict: true });
+            const changed = JSON.stringify(nextWhitelist) !== JSON.stringify(anthropicOptimizationModelWhitelist);
+
+            anthropicOptimizationModelWhitelist = nextWhitelist;
+
+            if (changed) {
+                clearCacheAnchorState('anthropic-optimization-whitelist-changed');
+                clearPrefixLock();
+            }
+
+            saveRuntimeSettings();
+            log('Updated Anthropic optimization model whitelist from console.', {
+                models: anthropicOptimizationModelWhitelist,
+                changed,
+            });
             return jsonResponse(getRuntimeState());
         } catch (error) {
             return jsonResponse({ error: error.message }, 400);

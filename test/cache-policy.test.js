@@ -347,6 +347,47 @@ function hasOwnCacheControlDeep(value) {
         || Object.values(value).some(hasOwnCacheControlDeep);
 }
 
+test('Anthropic preserved SYSTEM messages receive an idempotent marker without changing boundaries', () => {
+    const input = {
+        model: 'claude-fable-5-1',
+        messages: [
+            { role: 'system', content: 'System first' },
+            { role: 'user', content: 'User first' },
+            { role: 'user', content: 'User adjacent' },
+            { role: 'assistant', content: 'Assistant first' },
+            { role: 'assistant', content: 'Assistant adjacent' },
+            { role: 'system', content: 'System later' },
+            { role: 'user', content: 'User last' },
+        ],
+    };
+    const original = structuredClone(input);
+    const options = {
+        protocol: 'anthropic',
+        mode: 'on',
+        anthropicSystemMessagesInMessages: true,
+    };
+
+    const first = preprocessAutomaticCacheBreaks(input, options);
+
+    assert.equal(first.body.system, undefined);
+    assert.equal(first.diagnostics.added, 3);
+    assert.deepEqual(first.body.messages.map(({ role, content }) => ({ role, content })), [
+        { role: 'system', content: 'System first' },
+        { role: 'user', content: 'User first' },
+        { role: 'user', content: 'User adjacent' },
+        { role: 'assistant', content: 'Assistant first' + MARKER },
+        { role: 'assistant', content: 'Assistant adjacent' + MARKER },
+        { role: 'system', content: 'System later' + MARKER },
+        { role: 'user', content: 'User last' },
+    ]);
+    assert.deepEqual(input, original, 'automatic preprocessing must not mutate the caller body');
+
+    const second = preprocessAutomaticCacheBreaks(first.body, options);
+    assert.equal(second.diagnostics.added, 0);
+    assert.equal(second.diagnostics.alreadyMarked, 3);
+    assert.deepEqual(second.body, first.body, 'repeating preprocessing must preserve all message boundaries');
+});
+
 test('automatic preprocessing diagnoses empty or null targets without adding markers', () => {
     const input = {
         model: 'test-model',
