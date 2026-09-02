@@ -108,6 +108,8 @@ cd ST-ClaudeCacheGateway-Continued
 npm start
 ```
 
+
+
 默认监听：
 
 ```text
@@ -136,7 +138,7 @@ http://127.0.0.1:8788/
 https://api.deepseek.com/anthropic
 ```
 
-建议使用Anthropic接口，当然也能根据实际情况改为OpenAI接口（如果要改回OpenAI接口，记得把base_url换成https://api.deepseek.com）
+建议使用Anthropic接口，当然也能根据实际情况改为OpenAI接口（如果要改回OpenAI接口，记得把base_url换成`https://api.deepseek.com`）
 
 ![第三步](docs/images/step-3.png)
 
