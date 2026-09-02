@@ -4,21 +4,6 @@
 
 本项目主要新增断点保留和轮换策略，目标是在长上下文持续增长时减少稳定缓存边界的无谓移动，从而更容易提高缓存命中率；实际命中情况仍取决于模型、供应商以及缓存点之前的内容是否完全稳定。
 
-默认监听：
-
-```text
-http://127.0.0.1:8788
-```
-
-酒馆 / 客户端需要填写：
-
-```text
-Base URL: http://127.0.0.1:8788/v1
-API Key: 你的上游供应商 API Key
-```
-
-> 不要把 API Key 写进渠道 Profile 或高级配置。Key 应放在客户端请求头，或仅在可信本机环境里通过 `UPSTREAM_API_KEY` 环境变量传入。
-
 ## 快速目录
 
 - [功能概览](#功能概览) · [相对原项目优势](#相对原项目优势) · [效果实测](#效果实测)
@@ -123,11 +108,39 @@ cd ST-ClaudeCacheGateway-Continued
 npm start
 ```
 
-如果 SillyTavern 和网关在同一台 Android / Termux 设备上：
+默认监听：
 
 ```text
-Base URL: http://127.0.0.1:8788/v1
+http://127.0.0.1:8788
 ```
+
+以接入DeepSeek为例
+如图：酒馆 / 客户端需要将自定义端点（基础 URL）修改为：
+
+```text
+http://127.0.0.1:8788/v1
+API Key: 你的上游供应商，在此例中，需要填入的是你的DeepSeek API Key
+```
+
+![第二步](docs/images/step-2.png)
+
+随后打开控制台
+
+```text
+http://127.0.0.1:8788/
+```
+
+在左上角进入渠道配置→自定义配置→填入DeepSeek官方base_url
+
+```text
+https://api.deepseek.com/anthropic
+```
+
+建议使用Anthropic接口，当然也能根据实际情况改为OpenAI接口
+
+![第三步](docs/images/step-3.png)
+
+大功告成！可以回去测试一下是否能正常使用
 
 ## 控制台
 
