@@ -59,7 +59,7 @@
 
 ![GPT-5.6 Sol 缓存效果实测](docs/images/cache-hit-gpt-5-6-sol.png)
 
-## 安装与启动
+## 安装
 
 需要 Node.js 18 或更新版本。
 
@@ -108,7 +108,7 @@ cd ST-ClaudeCacheGateway-Continued
 npm start
 ```
 
-
+## 启动
 
 默认监听：
 
