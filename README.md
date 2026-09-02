@@ -89,6 +89,7 @@ start-gateway.bat
 也可以在终端运行：
 
 ```powershell
+git clone https://github.com/Hiyashinw/ST-ClaudeCacheGateway-Continued.git
 cd ST-ClaudeCacheGateway-Continued
 npm start
 ```
@@ -98,6 +99,7 @@ npm start
 下载并解压本项目后进入 `ST-ClaudeCacheGateway-Continued`。`.bat` 只适用于 Windows，macOS / Linux 不要运行它。
 
 ```sh
+git clone https://github.com/Hiyashinw/ST-ClaudeCacheGateway-Continued.git
 cd ST-ClaudeCacheGateway-Continued
 chmod +x start-gateway.sh
 ./start-gateway.sh
@@ -115,7 +117,8 @@ npm start
 
 ```sh
 pkg update
-pkg install nodejs-lts
+pkg install git nodejs-lts
+git clone https://github.com/Hiyashinw/ST-ClaudeCacheGateway-Continued.git
 cd ST-ClaudeCacheGateway-Continued
 npm start
 ```
