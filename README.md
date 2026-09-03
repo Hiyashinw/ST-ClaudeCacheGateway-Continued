@@ -81,7 +81,9 @@ npm start
 
 ### macOS / Linux
 
-下载并解压本项目后进入 `ST-ClaudeCacheGateway-Continued`。`.bat` 只适用于 Windows，macOS / Linux 不要运行它。
+下载并解压本项目后进入 `ST-ClaudeCacheGateway-Continued`，随后运行`start-gateway.sh`。
+
+或者
 
 ```sh
 git clone https://github.com/Hiyashinw/ST-ClaudeCacheGateway-Continued.git
@@ -97,8 +99,6 @@ npm start
 ```
 
 ### Termux / Android
-
-先下载并解压本项目，再进入 `ST-ClaudeCacheGateway-Continued`。
 
 ```sh
 pkg update
