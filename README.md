@@ -73,17 +73,11 @@ cd ST-ClaudeCacheGateway-Continued
 npm start
 ```
 
-也可以下载并解压本项目后，进入 `ST-ClaudeCacheGateway-Continued` 文件夹。可以双击：
-
-```text
-start-gateway.bat
-```
+也可以下载并解压本项目后，进入 `ST-ClaudeCacheGateway-Continued` 文件夹，随后运行`start-gateway.bat`。
 
 ### macOS / Linux
 
-下载并解压本项目后进入 `ST-ClaudeCacheGateway-Continued`，随后运行`start-gateway.sh`。
-
-或者
+可以在终端运行：
 
 ```sh
 git clone https://github.com/Hiyashinw/ST-ClaudeCacheGateway-Continued.git
@@ -92,11 +86,7 @@ chmod +x start-gateway.sh
 ./start-gateway.sh
 ```
 
-也可以直接运行：
-
-```sh
-npm start
-```
+也可以下载并解压本项目后进入 `ST-ClaudeCacheGateway-Continued`，运行`start-gateway.sh`。
 
 ### Termux / Android
 
