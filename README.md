@@ -90,6 +90,8 @@ chmod +x start-gateway.sh
 
 ### Termux / Android
 
+在终端运行：
+
 ```sh
 pkg update
 pkg install git nodejs-lts
