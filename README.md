@@ -65,18 +65,18 @@
 
 ### Windows
 
-下载并解压本项目后，进入 `ST-ClaudeCacheGateway-Continued` 文件夹。可以双击：
-
-```text
-start-gateway.bat
-```
-
-也可以在终端运行：
+可以在终端运行：
 
 ```powershell
 git clone https://github.com/Hiyashinw/ST-ClaudeCacheGateway-Continued.git
 cd ST-ClaudeCacheGateway-Continued
 npm start
+```
+
+也可以下载并解压本项目后，进入 `ST-ClaudeCacheGateway-Continued` 文件夹。可以双击：
+
+```text
+start-gateway.bat
 ```
 
 ### macOS / Linux
